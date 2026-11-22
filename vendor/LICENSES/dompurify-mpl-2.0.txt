@@ -1,0 +1,12 @@
+Mozilla Public License Version 2.0
+==================================
+
+DOMPurify is available under the Mozilla Public License, v. 2.0.
+You may obtain a copy of the MPL 2.0 at:
+https://mozilla.org/MPL/2.0/
+
+The complete canonical license text is also available at:
+https://www.mozilla.org/media/MPL/2.0/index.txt
+
+DOMPurify is additionally available under the Apache License 2.0; see
+`dompurify-apache-2.0.txt`. The recipient may choose either license.

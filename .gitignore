@@ -1,0 +1,34 @@
+# Private/local application data (chats, API keys, browser profile)
+data/
+
+# Python caches and local test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local backups, development configuration, and generated shortcuts
+backups/
+.claude/
+*.lnk
+
+# Local environments and OS/editor files
+.venv/
+venv/
+.env
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+
+# Release/build artifacts
+build/
+dist/
+*.zip
+*.exe
+*.msi
+
+# One-time working-copy transfer helper; not part of the app
+Copy-From-Working-App.ps1
