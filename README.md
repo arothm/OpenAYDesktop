@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It needs Python 3 (standard library only) and Edge or Chrome. There is no frontend framework, npm installation, or build step.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.1.0
+- **Version:** 1.2.0
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -35,17 +35,33 @@ Folder access is set per chat. Click the folder icon next to the message box and
 
 The server—not the browser—loads folder permissions from the saved chat on every tool operation. It checks canonical paths, including `..`, symbolic links, and files found by recursive searches. Tool requests cannot grant themselves extra folders by supplying a folder list.
 
-Tick **Allow edits** to let the model create or overwrite text files. Every write requires an explicit review:
+Tick **Allow edits** to let the model change text files. It has two tools for this:
+- **`edit_file`** changes part of an existing file by exact find-and-replace. The text to replace must match the file exactly and be unique unless `replace_all` is set. Line endings are preserved. The model is told to prefer this for changes to existing files.
+- **`write_file`** creates a new file or replaces a whole file.
+
+Before any existing file is overwritten or edited, in either review or auto-edit mode, its previous content is kept in the app **Trash**. Every change can be undone from there.
+
+In review mode, every change needs explicit approval:
 - The dialog shows the **complete replacement content**, not a truncated preview.
 - For an existing file, **Show full diff** displays a complete unified diff against the current file.
 - The server issues a random, single-use approval token tied to that chat, canonical path, and exact content.
 - Approval expires after five minutes and is revalidated against saved permissions immediately before writing.
 - Denying, cancelling, or changing an approval does not write the file.
+- If the file changes on disk after you reviewed it, the approved write is refused instead of overwriting the newer content.
+
+## Trash
+The 🗑 button in the sidebar opens the Trash. It holds two kinds of items:
+- **Deleted:** files or folders a session removed with recoverable deletion.
+- **Earlier version:** the content a file had before a session overwrote or edited it.
+
+**Restore** puts an item back. Restoring an earlier version keeps the current file in the Trash too, so a restore can itself be undone. A deleted item is only restored if nothing now exists at its original path. **Delete** and **Empty trash** remove items permanently, after a confirmation. Items are stored in `data/trash/` and stay until you remove them. Files over 20 MB are not versioned.
 
 The number on the folder icon shows how many folders the current chat can access. Tool calling needs a compatible model; small models sometimes say they did something without actually calling the tool.
 
 ## Session settings
 The **Session** button in the header opens settings for the current chat only. The server stores them with the chat and checks them on every tool call.
+
+A chat's folders, permissions and name are **server-owned**. Normal chat saves from the window can't change them, even from an outdated copy. They change only through the validated `/api/session/permissions` and `/api/session/rename` endpoints. A new chat keeps the folders you picked before its first message, but always starts with the default permissions below.
 
 - **Session name:** rename the chat. Its ID and history are kept.
 - **File editing:** *Review every file write* (default) or *Auto-edit*. Auto-edit writes without a review dialog, and only inside folders with **Allow edits**.

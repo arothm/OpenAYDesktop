@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import time
 import uuid
@@ -147,10 +148,115 @@ def move_path(chat, source="", destination="", **_):
     return "Moved/renamed %s to %s" % (src, dst)
 
 
-def trash_dir(chat):
-    path = os.path.realpath(os.path.join(os.path.dirname(chat["_path"]), "..", "trash"))
+# ---------------------------------------------------------------- app trash
+# data/trash holds two kinds of items, each as "<id>.item" plus a "<id>.json" manifest:
+#   "deleted" - something delete_path moved out of a shared folder
+#   "version" - the previous content of a file, kept before every overwrite or edit
+# Nothing here is permanent until the user empties it from the Trash screen.
+
+TRASH_ID = re.compile(r"^\d{1,12}-[0-9a-f]{10}$")
+MAX_VERSION_BYTES = 20_000_000
+
+
+def trash_root(chats_dir):
+    path = os.path.realpath(os.path.join(chats_dir, "..", "trash"))
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def trash_dir(chat):
+    """The app trash for a saved chat, or None for an unsaved/plain policy dict."""
+    return trash_root(os.path.dirname(chat["_path"])) if chat.get("_path") else None
+
+
+def _size(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        return sum(os.path.getsize(os.path.join(b, n)) for b, _, files in os.walk(path) for n in files)
+    return os.path.getsize(path) if os.path.exists(path) else 0
+
+
+def _store(trash, src, kind, chat_id, copy=False):
+    ident = "%s-%s" % (int(time.time()), uuid.uuid4().hex[:10])
+    stored_name = ident + ".item"
+    manifest = {"id": ident, "kind": kind, "originalPath": src, "storedName": stored_name,
+                "deletedAt": int(time.time()), "chatId": chat_id or "", "size": _size(src),
+                "isDir": os.path.isdir(src) and not os.path.islink(src)}
+    target = os.path.join(trash, stored_name)
+    shutil.copy2(src, target) if copy else shutil.move(src, target)
+    with open(os.path.join(trash, ident + ".json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    return ident
+
+
+def keep_version(chat, path):
+    """Copy a file's current content into the trash before it is replaced. Returns the trash ID or None."""
+    trash = trash_dir(chat)
+    if not trash or not os.path.isfile(path) or os.path.islink(path) or os.path.getsize(path) > MAX_VERSION_BYTES:
+        return None
+    return _store(trash, path, "version", chat.get("id"), copy=True)
+
+
+def read_manifest(trash, trash_id):
+    if not isinstance(trash_id, str) or not TRASH_ID.match(trash_id):
+        raise CapabilityError("Invalid trash ID")
+    try:
+        with open(os.path.join(trash, trash_id + ".json"), encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, ValueError) as e:
+        raise CapabilityError("Trash item not found: %s" % trash_id) from e
+    stored = os.path.realpath(os.path.join(trash, str(manifest.get("storedName", ""))))
+    if os.path.dirname(stored) != trash or not os.path.lexists(stored):
+        raise CapabilityError("Invalid trash manifest")
+    manifest["_stored"] = stored
+    manifest.setdefault("kind", "deleted")
+    return manifest
+
+
+def restore_item(trash, trash_id, destination=None):
+    """Put a trash item back. A kept version replaces the current file, whose content is kept in turn."""
+    manifest = read_manifest(trash, trash_id)
+    dst = destination or manifest["originalPath"]
+    try:
+        if manifest["kind"] == "version" and os.path.lexists(dst):
+            if not os.path.isfile(dst):
+                raise CapabilityError("Restore refused: %s is no longer a file." % dst)
+            _store(trash, dst, "version", manifest.get("chatId"), copy=True)
+            os.replace(manifest["_stored"], dst)
+        else:
+            if os.path.lexists(dst):
+                raise CapabilityError("Original destination now exists; restore refused.")
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(manifest["_stored"], dst)
+        os.remove(os.path.join(trash, trash_id + ".json"))
+    except OSError as e:
+        raise CapabilityError("Could not restore trash item: %s" % e)
+    return "Restored to " + dst
+
+
+def list_trash(trash):
+    items = []
+    for name in os.listdir(trash):
+        if name.endswith(".json"):
+            try:
+                m = read_manifest(trash, name[:-5])
+                items.append({k: v for k, v in m.items() if not k.startswith("_") and k != "storedName"})
+            except CapabilityError:
+                continue
+    return sorted(items, key=lambda m: m.get("deletedAt", 0), reverse=True)
+
+
+def purge_trash(trash, ids):
+    """Permanently delete trash items (user action from the Trash screen only)."""
+    removed = 0
+    for trash_id in ids:
+        m = read_manifest(trash, trash_id)
+        if os.path.isdir(m["_stored"]) and not os.path.islink(m["_stored"]):
+            shutil.rmtree(m["_stored"])
+        else:
+            os.remove(m["_stored"])
+        os.remove(os.path.join(trash, trash_id + ".json"))
+        removed += 1
+    return removed
 
 
 def delete_path(chat, path="", **_):
@@ -161,35 +267,62 @@ def delete_path(chat, path="", **_):
     if any(os.path.normcase(src) == os.path.normcase(g["path"]) for g in grants(chat)):
         raise CapabilityError("Cannot delete a shared root itself.")
     trash = trash_dir(chat)
-    ident = "%s-%s" % (int(time.time()), uuid.uuid4().hex[:10])
-    stored_name = ident + ".item"
-    shutil.move(src, os.path.join(trash, stored_name))
-    manifest = {"id": ident, "originalPath": src, "storedName": stored_name, "deletedAt": int(time.time())}
-    with open(os.path.join(trash, ident + ".json"), "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
+    if not trash:
+        raise CapabilityError("Save the chat before deleting files.")
+    ident = _store(trash, src, "deleted", chat.get("id"))
     return "Moved to recoverable app trash. ID: %s\nOriginal: %s" % (ident, src)
 
 
 def restore_path(chat, trash_id="", **_):
     require(chat, "deleteFiles")
-    if not isinstance(trash_id, str) or not trash_id.replace("-", "").isalnum():
-        raise CapabilityError("Invalid trash ID")
     trash = trash_dir(chat)
-    try:
-        with open(os.path.join(trash, trash_id + ".json"), encoding="utf-8") as f:
-            manifest = json.load(f)
-        stored = os.path.join(trash, manifest["storedName"])
-        if os.path.dirname(os.path.realpath(stored)) != trash:
-            raise CapabilityError("Invalid trash manifest")
-        dst = resolve(chat, manifest["originalPath"], write=True)
-        if os.path.lexists(dst):
-            raise CapabilityError("Original destination now exists; restore refused.")
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.move(stored, dst)
-        os.remove(os.path.join(trash, trash_id + ".json"))
-    except (OSError, ValueError, KeyError) as e:
-        raise CapabilityError("Could not restore trash item: %s" % e)
-    return "Restored to " + dst
+    if not trash:
+        raise CapabilityError("Save the chat before restoring files.")
+    manifest = read_manifest(trash, trash_id)
+    dst = resolve(chat, manifest["originalPath"], write=True)  # only back into this session's writable folders
+    return restore_item(trash, trash_id, dst)
+
+
+# ---------------------------------------------------------------- server-owned session settings
+
+MAX_FOLDERS = 50
+
+
+def clean_folders(value):
+    """Validate a folder list coming from the browser: [{"path": str, "write": bool}], no duplicates."""
+    if not isinstance(value, list):
+        raise CapabilityError("folders must be a list")
+    out, seen = [], set()
+    for f in value:
+        if not isinstance(f, dict):
+            raise CapabilityError("Each folder must be an object with a path.")
+        path = str(f.get("path", "")).strip().strip('"')
+        if not path or len(path) > 1024 or any(ord(c) < 32 for c in path):
+            raise CapabilityError("Invalid folder path.")
+        if os.path.normcase(path) in seen:
+            continue
+        seen.add(os.path.normcase(path))
+        out.append({"path": path, "write": bool(f.get("write"))})
+    if len(out) > MAX_FOLDERS:
+        raise CapabilityError("A session can share at most %d folders." % MAX_FOLDERS)
+    return out
+
+
+def clean_capabilities(value):
+    if not isinstance(value, dict):
+        raise CapabilityError("capabilities must be an object")
+    out = {}
+    if "editMode" in value:
+        if value["editMode"] not in EDIT_MODES: raise CapabilityError("Unknown edit mode.")
+        out["editMode"] = value["editMode"]
+    if "modelControl" in value:
+        if value["modelControl"] not in MODEL_MODES: raise CapabilityError("Unknown model control mode.")
+        out["modelControl"] = value["modelControl"]
+    for key in ("fileManage", "deleteFiles"):
+        if key in value:
+            if not isinstance(value[key], bool): raise CapabilityError("%s must be true or false." % key)
+            out[key] = value[key]
+    return out
 
 
 OPERATIONS = {"create_folder": create_folder, "copy_path": copy_path, "move_path": move_path,

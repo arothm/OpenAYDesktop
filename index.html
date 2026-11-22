@@ -13,7 +13,7 @@
 <div class="brand"><svg viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="currentColor"/><path d="M9 22V13a7 7 0 0 1 14 0v9" fill="none" stroke="var(--bg)" stroke-width="2.6" stroke-linecap="round"/><circle cx="13" cy="15" r="1.6" fill="var(--bg)"/><circle cx="19" cy="15" r="1.6" fill="var(--bg)"/></svg>Open AY Desktop</div>
 <button class="btn primary" id="newChat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>New chat <span style="margin-left:auto;opacity:.7;font-size:12px">Ctrl+N</span></button>
 <input id="search" placeholder="Search chats"></div><div id="chatList"></div>
-<div class="side-bottom"><span id="connBadge">Ollama Cloud</span><button class="icon-btn" id="settingsBtn" title="Settings">⚙</button></div></aside>
+<div class="side-bottom"><span id="connBadge">Ollama Cloud</span><button class="icon-btn" id="trashBtn" title="Trash: deleted files and earlier versions">🗑</button><button class="icon-btn" id="settingsBtn" title="Settings">⚙</button></div></aside>
 <main id="main"><header>
 <button class="icon-btn" id="toggleSide" title="Toggle sidebar (Ctrl+B)">☰</button>
 <div class="picker"><button class="btn" id="modelBtn"><span class="name">Choose a model</span><span>▾</span></button><div id="modelMenu"><input id="modelFilter" placeholder="Filter cloud models…"><div id="modelOptions"></div></div></div>
@@ -38,6 +38,9 @@
 <div class="foot"><button class="btn" id="cancelSession">Cancel</button><button class="btn primary" id="saveSession">Save</button></div></div></div>
 
 <div id="previewBack"><div class="preview-modal" role="dialog" aria-modal="true" aria-labelledby="previewTitle"><div class="preview-head"><div><h2 id="previewTitle">Review file write</h2><div class="path" id="previewPath"></div></div><div class="spacer"></div><button class="btn" id="previewDiff">Show full diff</button><button class="btn" id="previewContent">Show full content</button></div><div id="previewInfo"></div><pre id="previewText" tabindex="0"></pre><div class="preview-foot"><div class="note">Complete preview. Approval authorizes only this exact path and content, once, for five minutes.</div><button class="btn" id="previewDeny">Deny</button><button class="btn primary" id="previewAllow">Allow this write</button></div></div></div>
+<div id="trashBack"><div class="modal trash-modal" role="dialog" aria-modal="true" aria-labelledby="trashTitle"><h2 id="trashTitle">Trash</h2>
+<div class="help" id="trashSummary"></div><div id="trashList"></div>
+<div class="foot"><button class="btn danger" id="trashEmpty">Empty trash…</button><span class="spacer"></span><button class="btn" id="trashClose">Close</button></div></div></div>
 <div id="modelApproveBack"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="maTitle"><h2 id="maTitle">Change this session's model?</h2>
 <div class="model-switch"><span id="maFrom"></span><span class="arrow">→</span><span id="maTo"></span></div>
 <div class="field"><label>Reason the model gave</label><div id="maReason" class="ma-reason"></div></div>

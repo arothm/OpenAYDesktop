@@ -104,10 +104,10 @@ async function deleteChat(id) {
 }
 
 // Rendering
-const TOOL_LABEL = { list_directory: "Listed folder", read_file: "Read file", search_files: "Searched files", write_file: "Wrote file", create_folder: "Created folder", copy_path: "Copied item", move_path: "Moved/renamed item", delete_path: "Moved to trash", restore_path: "Restored item", set_session_model: "Changed model" };
+const TOOL_LABEL = { list_directory: "Listed folder", read_file: "Read file", search_files: "Searched files", write_file: "Wrote file", edit_file: "Edited file", create_folder: "Created folder", copy_path: "Copied item", move_path: "Moved/renamed item", delete_path: "Moved to trash", restore_path: "Restored item", set_session_model: "Changed model" };
 function toolHTML(m, idx) {
   if (m._modelApproval) return `<div class="approve" data-idx="${idx}"><div class="q">Switch this session to ${esc(m._modelApproval.model)}?</div><div class="detail">Nothing has changed yet. The model is waiting for your approval.</div><div class="btns"><button class="btn primary" data-model-review="yes">Review change</button><button class="btn" data-model-approve="no">Keep current model</button></div></div>`;
-  if (m._approval) return `<div class="approve" data-idx="${idx}"><div class="q">Review requested write to ${esc(m._approval.path)}</div><div class="detail">Nothing has been written. Review the complete replacement and diff before deciding.</div><div class="btns"><button class="btn primary" data-review="yes">Review write</button><button class="btn" data-approve="no">Deny</button></div></div>`;
+  if (m._approval) return `<div class="approve" data-idx="${idx}"><div class="q">Review requested change to ${esc(m._approval.path)}</div><div class="detail">Nothing has been written. Review the complete change before deciding.</div><div class="btns"><button class="btn primary" data-review="yes">Review change</button><button class="btn" data-approve="no">Deny</button></div></div>`;
   const status = m._running ? "running…" : m.isError ? "failed" : "";
   return `<details class="tool ${m.isError ? "err" : ""}" data-idx="${idx}"><summary><b>${esc(TOOL_LABEL[m.tool_name] || m.tool_name || "Tool")}</b><span class="arg">${esc(m.display || "")}</span><span>${status}</span></summary><div class="out">${esc(m.content || "")}</div></details>`;
 }
@@ -213,7 +213,7 @@ async function runToolCall(chat, call, ctrl, session, rerender) {
   if (name === "search_files" && args.contains) tm.display = `"${args.contains}"` + (args.path ? " in " + args.path : "");
   chat.messages.push(tm); let approvalToken = "";
   try {
-    if (name === "write_file" && (chat.capabilities?.editMode || "review") === "review") {
+    if ((name === "write_file" || name === "edit_file") && (chat.capabilities?.editMode || "review") === "review") {
       const prepared = await api("/api/tool/prepare", { method: "POST", body: JSON.stringify({ chatId: chat.id, name, arguments: args }) }); const a = prepared.approval;
       if (ctrl.signal.aborted) { cancelApprovalOnServer(chat.id, a.token); tm.content = "The write was cancelled."; tm.isError = true; return; }
       tm.display = a.path; tm._approval = { path: a.path }; rerender(); const approved = await requestApproval(a, chat, session, tm); delete tm._approval;
@@ -245,6 +245,7 @@ function requestApproval(approval, chat, session, tm) {
 }
 function openApprovalPreview() {
   const pending = state.approval; if (!pending) return; const a = pending.approval;
+  $("#previewTitle").textContent = a.tool === "edit_file" ? "Review file edit" : a.exists ? "Review file replacement" : "Review new file";
   $("#previewPath").textContent = a.path; $("#previewDiff").disabled = !a.exists;
   $("#previewContent").classList.toggle("primary", pending.mode === "content"); $("#previewDiff").classList.toggle("primary", pending.mode === "diff");
   $("#previewInfo").textContent = a.exists ? `Overwrite · current ${humanBytes(a.currentBytes)} → replacement ${humanBytes(a.newBytes)} · complete unified diff` : `Create new file · ${humanBytes(a.newBytes)}`;
@@ -342,18 +343,66 @@ async function saveSession() {
       const result = await api("/api/session/rename", { method: "POST", body: JSON.stringify({ chatId: state.chat.id, title }) });
       state.chat.title = result.title; $("#title").textContent = result.title;
     }
-    state.chat.capabilities = c; await saveChat(state.chat); await loadChats();
+    await savePermissions(state.chat, { capabilities: c }); await loadChats();
     $("#sessionBack").classList.remove("open"); toast("Session settings saved");
   } catch (e) { toast(e.message); }
 }
+
+// Trash: files the model deleted, and earlier versions kept before every overwrite or edit
+async function openTrash() { $("#trashBack").classList.add("open"); await renderTrash(); }
+async function renderTrash() {
+  let r; try { r = await api("/api/trash"); } catch (e) { $("#trashList").innerHTML = `<div class="menu-note">${esc(e.message)}</div>`; return; }
+  const items = r.items || []; $("#trashEmpty").disabled = !items.length;
+  $("#trashSummary").textContent = items.length
+    ? `${items.length} item${items.length > 1 ? "s" : ""} · ${humanBytes(r.totalBytes || 0)}. Items stay here until you remove them. Restoring an earlier version keeps the current file here too, so a restore can itself be undone.`
+    : "Trash is empty. Files a session deletes, and earlier versions of files it edits, appear here.";
+  $("#trashList").innerHTML = items.map((m) => {
+    const chat = state.chats.find((c) => c.id === m.chatId)?.title;
+    const when = m.deletedAt ? new Date(m.deletedAt * 1000).toLocaleString() : "";
+    const kind = m.kind === "version" ? '<span class="kind version">Earlier version</span>' : `<span class="kind">Deleted${m.isDir ? " folder" : ""}</span>`;
+    return `<div class="trash-row" data-id="${esc(m.id)}">${kind}<div class="info"><div class="p" title="${esc(m.originalPath)}">&lrm;${esc(m.originalPath)}</div>
+      <div class="m">${esc(when)} · ${humanBytes(m.size || 0)}${chat ? " · " + esc(chat) : ""}</div></div>
+      <button class="btn" data-trash="restore">${m.kind === "version" ? "Restore this version" : "Restore"}</button><button class="btn danger" data-trash="purge" title="Delete permanently">Delete</button></div>`;
+  }).join("");
+}
+$("#trashBtn").addEventListener("click", openTrash);
+$("#trashClose").addEventListener("click", () => $("#trashBack").classList.remove("open"));
+$("#trashBack").addEventListener("click", (e) => { if (e.target.id === "trashBack") $("#trashBack").classList.remove("open"); });
+$("#trashList").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-trash]"); if (!b) return; const id = b.closest(".trash-row").dataset.id;
+  const path = b.closest(".trash-row").querySelector(".p").title;
+  try {
+    if (b.dataset.trash === "restore") { const r = await api("/api/trash/restore", { method: "POST", body: JSON.stringify({ id }) }); toast(r.content); }
+    else { if (!confirm(`Permanently delete this trash item?\n\n${path}\n\nThis can't be undone.`)) return; await api("/api/trash/purge", { method: "POST", body: JSON.stringify({ ids: [id] }) }); toast("Deleted permanently"); }
+  } catch (err) { toast(err.message); }
+  renderTrash();
+});
+$("#trashEmpty").addEventListener("click", async () => {
+  if (!confirm("Permanently delete everything in the trash? This can't be undone.")) return;
+  try { const r = await api("/api/trash/purge", { method: "POST", body: JSON.stringify({ all: true }) }); toast(`Removed ${r.removed} item${r.removed === 1 ? "" : "s"}`); } catch (e) { toast(e.message); }
+  renderTrash();
+});
 
 // Folder access
 function chatFolders() { return state.chat ? (state.chat.folders ||= []) : state.draftFolders; }
 function renderFolderList() {
   $("#folderList").innerHTML = chatFolders().map((f, i) => `<div class="folder-row" data-i="${i}"><span class="p" title="${esc(f.path)}">&lrm;${esc(f.path)}</span><label><input type="checkbox" class="fw" ${f.write ? "checked" : ""}> Allow edits</label><button class="icon-btn fdel" title="Remove">${ICON.trash}</button></div>`).join("") || '<div class="help" style="margin:0 0 4px">No folders yet, so this chat can\'t see any of your files.</div>';
 }
+// Folders and permissions are server-owned: normal chat saves can't change them, so they go
+// through /api/session/permissions, and the window shows what the server actually stored.
+async function savePermissions(chat, changes) {
+  await flushChat(chat);
+  const r = await api("/api/session/permissions", { method: "POST", body: JSON.stringify({ chatId: chat.id, ...changes }) });
+  chat.folders = r.folders; chat.capabilities = r.capabilities; return r;
+}
 async function foldersChanged() {
-  renderFolderList(); updateFolderBtn(); if (!state.chat) return; try { await saveChat(state.chat); } catch { toast("Folder permission was not saved; reload this chat before using tools."); }
+  renderFolderList(); updateFolderBtn(); if (!state.chat) return; const chat = state.chat;
+  try { await savePermissions(chat, { folders: chat.folders }); }
+  catch (e) {
+    toast("Folder change was not saved: " + e.message);
+    try { chat.folders = (await api("/api/chats/" + chat.id)).folders || []; } catch {}
+  }
+  if (state.chat === chat) { renderFolderList(); updateFolderBtn(); }
 }
 function addFolder(raw) {
   const p = raw.trim().replace(/^"|"$/g, ""); if (!p) return; const list = chatFolders();
@@ -431,7 +480,7 @@ addEventListener("keydown", (e) => {
   if (e.ctrlKey && e.key.toLowerCase() === "n") { e.preventDefault(); newChat(); }
   else if (e.ctrlKey && e.key.toLowerCase() === "b") { e.preventDefault(); $("#sidebar").classList.toggle("hidden"); }
   else if (e.key === "Escape") {
-    if (state.modelApproval) decideModelApproval(false); else if (state.approval) decideApproval(false); else if ($("#sessionBack").classList.contains("open")) $("#sessionBack").classList.remove("open");
+    if (state.modelApproval) decideModelApproval(false); else if ($("#trashBack").classList.contains("open")) $("#trashBack").classList.remove("open"); else if (state.approval) decideApproval(false); else if ($("#sessionBack").classList.contains("open")) $("#sessionBack").classList.remove("open");
     else if ($("#folderPop").classList.contains("open")) toggleFolderPop(false); else if ($("#modalBack").classList.contains("open")) $("#modalBack").classList.remove("open"); else if (state.streaming) stop();
   }
 });

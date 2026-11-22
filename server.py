@@ -2,6 +2,7 @@
 
 import argparse
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -21,7 +22,7 @@ import capabilities
 import session_actions
 
 APP_NAME = "Open AY Desktop"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_SLUG = "open-ay-desktop"
 REPOSITORY = "arothm/OpenAYDesktop"
 RELEASES_URL = "https://github.com/%s/releases/latest" % REPOSITORY
@@ -138,6 +139,49 @@ def save_chat(chat_id, chat):
     os.makedirs(CHATS_DIR, exist_ok=True)
     with chat_lock(chat_id):
         atomic_write_text(chat_path(chat_id), json.dumps(chat, ensure_ascii=False))
+
+
+SERVER_OWNED = ("folders", "capabilities", "title")
+
+
+def save_browser_chat(chat_id, incoming):
+    """PUT from the browser. Messages and model are the browser's; folders, permissions and
+    title are server-owned and only change through their own validated endpoints."""
+    if not isinstance(incoming, dict):
+        raise ValueError("bad chat")
+    with chat_lock(chat_id):
+        try:
+            existing = load_chat(chat_id)
+        except FileNotFoundError:
+            existing = None
+        if existing is None:  # new chat: folders picked before the first message are accepted, permissions start at defaults
+            try: incoming["folders"] = capabilities.clean_folders(incoming.get("folders") or [])
+            except capabilities.CapabilityError as e: raise ValueError(str(e))
+            incoming["capabilities"] = dict(capabilities.DEFAULT_POLICY)
+            try: incoming["title"] = session_actions.clean_title(incoming.get("title") or "Untitled")
+            except ValueError: incoming["title"] = "Untitled"
+        else:
+            for key in SERVER_OWNED:
+                if key in existing: incoming[key] = existing[key]
+                else: incoming.pop(key, None)
+        save_chat(chat_id, incoming)
+
+
+def update_permissions(chat_id, body):
+    """Change a session's folders and/or capabilities (user action from the window)."""
+    with chat_lock(chat_id):
+        chat = load_chat(chat_id)
+        try:
+            if "folders" in body: chat["folders"] = capabilities.clean_folders(body["folders"])
+            if "capabilities" in body:
+                merged = dict(capabilities.DEFAULT_POLICY)
+                merged.update(capabilities.clean_capabilities(chat.get("capabilities") or {}))  # keep valid saved values
+                merged.update(capabilities.clean_capabilities(body["capabilities"]))
+                chat["capabilities"] = merged
+        except capabilities.CapabilityError as e:
+            raise ValueError(str(e))
+        chat["updated"] = int(time.time() * 1000); save_chat(chat_id, chat)
+    return {"folders": chat["folders"], "capabilities": chat["capabilities"], "policy": capabilities.policy(chat)}
 
 
 def list_chats():
@@ -270,16 +314,60 @@ def tool_search_files(cfg, path="", pattern="*", contains="", **_):
     return "\n".join(hits) or "No matches."
 
 
+def _replace_file(cfg, p, content):
+    """Write text to p, keeping the previous content in the app trash so the change can be undone."""
+    existed = os.path.exists(p)
+    if existed and not os.path.isfile(p): raise ToolError("Not a file: " + p)
+    kept = capabilities.keep_version(cfg, p) if existed else None
+    os.makedirs(os.path.dirname(p), exist_ok=True); atomic_write_text(p, content)
+    note = " Previous version kept in trash (ID: %s); it can be restored from the Trash screen." % kept if kept else ""
+    return existed, note
+
+
 def tool_write_file(cfg, path="", content="", **_):
     p = resolve_path(cfg, path, need_write=True)
     if not isinstance(content, str): raise ToolError("content must be a string")
-    existed = os.path.exists(p)
-    if existed and not os.path.isfile(p): raise ToolError("Not a file: " + p)
-    os.makedirs(os.path.dirname(p), exist_ok=True); atomic_write_text(p, content)
-    return "%s %s (%s)." % ("Overwrote" if existed else "Created", p, _human(len(content.encode("utf-8"))))
+    existed, note = _replace_file(cfg, p, content)
+    return "%s %s (%s).%s" % ("Overwrote" if existed else "Created", p, _human(len(content.encode("utf-8"))), note)
 
 
-TOOLS = {"list_directory": tool_list_directory, "read_file": tool_read_file, "search_files": tool_search_files, "write_file": tool_write_file}
+def read_text_exact(p):
+    """Current text of a file, exactly as stored (line endings preserved)."""
+    if not os.path.isfile(p): raise ToolError("Not a file: " + p)
+    with open(p, "rb") as f: raw = f.read()
+    if b"\x00" in raw[:8192]: raise ToolError("%s is a binary file; it can't be edited as text." % p)
+    return raw.decode("utf-8", errors="replace")
+
+
+def apply_edit(text, old_text, new_text, replace_all=False):
+    """Exact find-and-replace. Returns (new_text, count) or raises ToolError with a helpful reason."""
+    if not isinstance(old_text, str) or not isinstance(new_text, str): raise ToolError("old_text and new_text must be strings")
+    if not old_text: raise ToolError("old_text must not be empty")
+    count = text.count(old_text)
+    if count == 0 and "\r\n" in text and "\r\n" not in old_text:  # model sent LF but file uses CRLF
+        old_text, new_text = old_text.replace("\n", "\r\n"), new_text.replace("\n", "\r\n"); count = text.count(old_text)
+    if count == 0: raise ToolError("old_text was not found. It must match the file exactly, including spaces and indentation; read the file again first.")
+    if count > 1 and not replace_all:
+        raise ToolError("old_text appears %d times. Include more surrounding lines so it is unique, or set replace_all to true." % count)
+    return (text.replace(old_text, new_text) if replace_all else text.replace(old_text, new_text, 1)), (count if replace_all else 1)
+
+
+def tool_edit_file(cfg, path="", old_text="", new_text="", replace_all=False, **_):
+    p = resolve_path(cfg, path, need_write=True)
+    updated, count = apply_edit(read_text_exact(p), old_text, new_text, bool(replace_all))
+    _, note = _replace_file(cfg, p, updated)
+    return "Edited %s: replaced %d occurrence%s.%s" % (p, count, "" if count == 1 else "s", note)
+
+
+def file_fingerprint(p):
+    """sha256 of the file's bytes, or None when it doesn't exist (used to detect changes after review)."""
+    if not os.path.exists(p): return None
+    with open(p, "rb") as f: return hashlib.sha256(f.read()).hexdigest()
+
+
+TOOLS = {"list_directory": tool_list_directory, "read_file": tool_read_file, "search_files": tool_search_files,
+         "write_file": tool_write_file, "edit_file": tool_edit_file}
+REVIEWED_TOOLS = ("write_file", "edit_file")
 
 
 def tool_specs(cfg):
@@ -296,7 +384,15 @@ def tool_specs(cfg):
             fn("search_files", "Find files by name glob and optionally by text. Omit path to search all shared folders.", {"path": path, "pattern": {"type": "string"}, "contains": {"type": "string"}}, []),
         ]
     if any(r["write"] for r in roots):
-        specs.append(fn("write_file", "Create or overwrite a text file in a writable shared folder. User review depends on session edit mode.", {"path": path, "content": {"type": "string"}}, ["path", "content"]))
+        specs.append(fn("edit_file", "Change part of an existing text file by exact find-and-replace. Prefer this over write_file for "
+                                     "changes to existing files. old_text must match the file exactly (read it first) and be unique "
+                                     "unless replace_all is true. User review depends on session edit mode.",
+                        {"path": path, "old_text": {"type": "string", "description": "Exact text to replace, with enough context to be unique"},
+                         "new_text": {"type": "string", "description": "Replacement text"},
+                         "replace_all": {"type": "boolean", "description": "Replace every occurrence (default false)"}},
+                        ["path", "old_text", "new_text"]))
+        specs.append(fn("write_file", "Create a new text file, or replace a whole file, in a writable shared folder. "
+                                      "Use edit_file for small changes. User review depends on session edit mode.", {"path": path, "content": {"type": "string"}}, ["path", "content"]))
     if pol["fileManage"]:
         specs.extend([
             fn("create_folder", "Create a new folder in a writable shared folder. Never overwrites.", {"path": path}, ["path"]),
@@ -340,16 +436,20 @@ def run_tool(cfg, name, args):
 
 
 def prepare_write(chat_id, name, args):
-    if name != "write_file": raise ToolError("Only write_file needs approval.")
-    args = tool_arguments(args); cfg = saved_tool_config(chat_id); content = args.get("content", "")
-    if not isinstance(content, str): raise ToolError("content must be a string")
+    if name not in REVIEWED_TOOLS: raise ToolError("Only write_file and edit_file need approval.")
+    args = tool_arguments(args); cfg = saved_tool_config(chat_id)
     try:
         path = resolve_path(cfg, args.get("path"), need_write=True); exists = os.path.exists(path)
         if exists and not os.path.isfile(path): raise ToolError("Not a file: " + path)
-        old = ""
-        if exists:
-            with open(path, "r", encoding="utf-8", errors="replace", newline="") as f: old = f.read()
+        old = read_text_exact(path) if exists else ""
+        fingerprint = file_fingerprint(path)
     except OSError as e: raise ToolError(str(e))
+    if name == "edit_file":
+        if not exists: raise ToolError("edit_file needs an existing file; use write_file to create one.")
+        content, _ = apply_edit(old, args.get("old_text", ""), args.get("new_text", ""), bool(args.get("replace_all")))
+    else:
+        content = args.get("content", "")
+        if not isinstance(content, str): raise ToolError("content must be a string")
     diff = ""
     if exists:
         diff = "".join(difflib.unified_diff(old.splitlines(keepends=True), content.splitlines(keepends=True), fromfile=path + " (current)", tofile=path + " (replacement)"))
@@ -358,8 +458,9 @@ def prepare_write(chat_id, name, args):
     with _approval_lock:
         for key, record in list(_approvals.items()):
             if record["expires"] <= now or record["chat_id"] == chat_id: _approvals.pop(key, None)
-        _approvals[token] = {"chat_id": chat_id, "path": path, "content": content, "expires": now + APPROVAL_TTL}
-    return {"token": token, "path": path, "content": content, "exists": exists, "diff": diff,
+        _approvals[token] = {"chat_id": chat_id, "path": path, "content": content, "expires": now + APPROVAL_TTL,
+                             "fingerprint": fingerprint, "tool": name}
+    return {"token": token, "tool": name, "path": path, "content": content, "exists": exists, "diff": diff,
             "currentBytes": len(old.encode("utf-8")) if exists else 0, "newBytes": len(content.encode("utf-8")), "expiresIn": APPROVAL_TTL}
 
 
@@ -377,7 +478,10 @@ def run_approved_write(chat_id, token):
         raise ToolError("Write approval is missing, expired, or already used. Please review the write again.")
     cfg = saved_tool_config(chat_id); path = resolve_path(cfg, record["path"], need_write=True)
     if os.path.normcase(path) != os.path.normcase(record["path"]): raise ToolError("The approved path changed. Please review it again.")
-    return run_tool(cfg, "write_file", {"path": path, "content": record["content"]})
+    if file_fingerprint(path) != record.get("fingerprint"):
+        raise ToolError("The file changed after you reviewed it, so nothing was written. Read it again and redo the change.")
+    out = run_tool(cfg, "write_file", {"path": path, "content": record["content"]})
+    return out.replace("Overwrote", "Edited", 1) if record.get("tool") == "edit_file" else out
 
 
 PICK_FOLDER_SCRIPT = ("import tkinter as t, tkinter.filedialog as d\nr=t.Tk(); r.withdraw(); r.attributes('-topmost', True)\n"
@@ -555,7 +659,18 @@ class Handler(BaseHTTPRequestHandler):
         if csp:
             self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
         self.end_headers(); self.wfile.write(data)
-    def do_GET(self):
+    def _guarded(self, handler):
+        """Any unexpected error becomes a JSON 500 instead of a dropped connection."""
+        try:
+            handler()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except Exception as e:  # noqa: BLE001
+            try: self._json({"error": "Internal error: %s" % e}, 500)
+            except OSError: pass
+
+    def do_GET(self): self._guarded(self._do_GET)
+    def _do_GET(self):
         global _last_ping
         if not self._same_origin(): return self._json({"error": "forbidden"}, 403)
         p = self.path.split("?")[0]
@@ -576,19 +691,24 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/models":
             models, errors = get_models(); self._json({"models": models, "errors": errors})
         elif p == "/api/chats": self._json(list_chats())
+        elif p == "/api/trash":
+            items = capabilities.list_trash(capabilities.trash_root(CHATS_DIR))
+            self._json({"items": items, "totalBytes": sum(int(m.get("size") or 0) for m in items)})
         elif p.startswith("/api/chats/"):
             try: self._json(load_chat(p.rsplit("/", 1)[1]))
             except (OSError, ValueError): self._json({"error": "not found"}, 404)
         else: self._json({"error": "not found"}, 404)
-    def do_PUT(self):
+    def do_PUT(self): self._guarded(self._do_PUT)
+    def _do_PUT(self):
         if not self._same_origin(): return self._json({"error": "forbidden"}, 403)
         p = self.path.split("?")[0]
         if p.startswith("/api/chats/"):
-            try: save_chat(p.rsplit("/", 1)[1], self._body()); self._json({"ok": True})
+            try: save_browser_chat(p.rsplit("/", 1)[1], self._body()); self._json({"ok": True})
             except ValueError as e: self._json({"error": str(e) or "bad request"}, 400)
             except OSError as e: self._json({"error": "Could not save chat: %s" % e}, 500)
         else: self._json({"error": "not found"}, 404)
-    def do_DELETE(self):
+    def do_DELETE(self): self._guarded(self._do_DELETE)
+    def _do_DELETE(self):
         if not self._same_origin(): return self._json({"error": "forbidden"}, 403)
         p = self.path.split("?")[0]
         if p.startswith("/api/chats/"):
@@ -600,7 +720,8 @@ class Handler(BaseHTTPRequestHandler):
             except (OSError, ValueError): pass
             self._json({"ok": True})
         else: self._json({"error": "not found"}, 404)
-    def do_POST(self):
+    def do_POST(self): self._guarded(self._do_POST)
+    def _do_POST(self):
         if not self._same_origin(): return self._json({"error": "forbidden"}, 403)
         p = self.path.split("?")[0]
         try: body = self._body()
@@ -630,6 +751,19 @@ class Handler(BaseHTTPRequestHandler):
                     chat = load_chat(chat_id); result = session_actions.rename(chat, body.get("title")); save_chat(chat_id, chat)
                 self._json({"content": result, "title": chat["title"]})
             except (OSError, ValueError) as e: self._json({"error": str(e)}, 400)
+        elif p == "/api/session/permissions":
+            try: self._json(update_permissions(body.get("chatId", ""), body))
+            except (OSError, ValueError) as e: self._json({"error": str(e) or "bad request"}, 400)
+        elif p == "/api/trash/restore":
+            try: self._json({"content": capabilities.restore_item(capabilities.trash_root(CHATS_DIR), body.get("id", ""))})
+            except capabilities.CapabilityError as e: self._json({"error": str(e)}, 400)
+        elif p == "/api/trash/purge":
+            try:
+                trash = capabilities.trash_root(CHATS_DIR)
+                ids = [m["id"] for m in capabilities.list_trash(trash)] if body.get("all") is True else body.get("ids") or []
+                if not isinstance(ids, list): raise capabilities.CapabilityError("ids must be a list")
+                self._json({"removed": capabilities.purge_trash(trash, ids)})
+            except (capabilities.CapabilityError, OSError) as e: self._json({"error": str(e)}, 400)
         elif p == "/api/pick-folder":
             try:
                 exe = sys.executable.replace("python.exe", "pythonw.exe")
@@ -642,7 +776,7 @@ class Handler(BaseHTTPRequestHandler):
         chat_id = body.get("chatId", ""); name = body.get("name"); args = body.get("arguments") or {}
         try:
             if name == "set_session_model": return self._json(self.change_model(chat_id, args, body.get("approvalToken", "")))
-            if name == "write_file":
+            if name in REVIEWED_TOOLS:
                 chat = saved_tool_config(chat_id)
                 out = run_tool(chat, name, args) if capabilities.policy(chat)["editMode"] == "auto" else run_approved_write(chat_id, body.get("approvalToken", ""))
             else: out = run_tool(saved_tool_config(chat_id), name, args)

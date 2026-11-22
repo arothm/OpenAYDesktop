@@ -245,5 +245,127 @@ class HTTPPhase1Tests(TempChatsMixin, unittest.TestCase):
         self.assertNotIn("tools", sent[2])  # model without tool support: retry must carry no tools
 
 
+class EditAndVersionTests(TempChatsMixin, unittest.TestCase):
+    """Phase 1.6: edit_file, kept versions before overwrites, and the trash screen's operations."""
+
+    def trash(self):
+        return capabilities.trash_root(server.CHATS_DIR)
+
+    def test_edit_file_exact_unique_replace(self):
+        chat = self.make_chat(caps=dict(FULL, editMode="auto")); f = self.shared / "a.py"
+        f.write_bytes(b"x = 1\r\ny = 2\r\nx = 1\r\n")  # CRLF file
+        with self.assertRaises(server.ToolError): server.run_tool(chat, "edit_file", {"path": str(f), "old_text": "x = 1", "new_text": "x = 9"})
+        with self.assertRaises(server.ToolError): server.run_tool(chat, "edit_file", {"path": str(f), "old_text": "nope", "new_text": "z"})
+        server.run_tool(chat, "edit_file", {"path": str(f), "old_text": "y = 2\nx = 1", "new_text": "y = 3\nx = 1"})  # LF from the model
+        self.assertEqual(b"x = 1\r\ny = 3\r\nx = 1\r\n", f.read_bytes())
+        server.run_tool(chat, "edit_file", {"path": str(f), "old_text": "x = 1", "new_text": "x = 0", "replace_all": True})
+        self.assertEqual(b"x = 0\r\ny = 3\r\nx = 0\r\n", f.read_bytes())
+        (self.shared / "bin.dat").write_bytes(b"\x00\x01abc")
+        with self.assertRaises(server.ToolError): server.run_tool(chat, "edit_file", {"path": str(self.shared / "bin.dat"), "old_text": "abc", "new_text": "d"})
+        with self.assertRaises(server.ToolError): server.run_tool(chat, "edit_file", {"path": str(self.readonly / "x.txt"), "old_text": "a", "new_text": "b"})
+
+    def test_overwrites_keep_previous_version_and_restore_is_undoable(self):
+        chat = self.make_chat(); f = self.shared / "notes.txt"; f.write_text("v1", encoding="utf-8")
+        out = server.run_tool(chat, "write_file", {"path": str(f), "content": "v2"})
+        self.assertIn("Previous version kept in trash", out)
+        items = capabilities.list_trash(self.trash()); self.assertEqual(1, len(items))
+        self.assertEqual(("version", os.path.realpath(f), "c1"), (items[0]["kind"], os.path.realpath(items[0]["originalPath"]), items[0]["chatId"]))
+        capabilities.restore_item(self.trash(), items[0]["id"])  # user restores v1 from the Trash screen
+        self.assertEqual("v1", f.read_text(encoding="utf-8"))
+        items = capabilities.list_trash(self.trash()); self.assertEqual(1, len(items))  # v2 is now the kept version
+        capabilities.restore_item(self.trash(), items[0]["id"]); self.assertEqual("v2", f.read_text(encoding="utf-8"))
+        server.run_tool(chat, "write_file", {"path": str(self.shared / "new.txt"), "content": "fresh"})
+        self.assertEqual(1, len(capabilities.list_trash(self.trash())))  # creating a new file keeps nothing
+
+    def test_purge_is_permanent_and_validates_ids(self):
+        chat = self.make_chat(); f = self.shared / "gone.txt"; f.write_text("bye", encoding="utf-8")
+        server.run_tool(chat, "delete_path", {"path": str(f)})
+        item = capabilities.list_trash(self.trash())[0]
+        with self.assertRaises(capabilities.CapabilityError): capabilities.purge_trash(self.trash(), ["../../server"])
+        self.assertEqual(1, capabilities.purge_trash(self.trash(), [item["id"]]))
+        self.assertEqual([], capabilities.list_trash(self.trash())); self.assertEqual(["." * 0] * 0, [p.name for p in Path(self.trash()).iterdir()])
+
+    def test_reviewed_edit_shows_diff_and_refuses_if_file_changed_after_review(self):
+        self.make_chat(); f = self.shared / "cfg.ini"; f.write_text("debug=false\nport=80\n", encoding="utf-8")
+        prepared = server.prepare_write("c1", "edit_file", {"path": str(f), "old_text": "port=80", "new_text": "port=8080"})
+        self.assertEqual("edit_file", prepared["tool"]); self.assertIn("-port=80", prepared["diff"]); self.assertIn("+port=8080", prepared["diff"])
+        self.assertEqual("debug=false\nport=80\n", f.read_text(encoding="utf-8"))  # nothing written before approval
+        self.assertIn("Edited", server.run_approved_write("c1", prepared["token"]))
+        self.assertEqual("debug=false\nport=8080\n", f.read_text(encoding="utf-8"))
+        prepared = server.prepare_write("c1", "edit_file", {"path": str(f), "old_text": "debug=false", "new_text": "debug=true"})
+        f.write_text("debug=false\nport=9999\n", encoding="utf-8")  # someone else changes the file meanwhile
+        with self.assertRaises(server.ToolError): server.run_approved_write("c1", prepared["token"])
+        self.assertEqual("debug=false\nport=9999\n", f.read_text(encoding="utf-8"))
+        with self.assertRaises(server.ToolError):  # edit_file can't create files
+            server.prepare_write("c1", "edit_file", {"path": str(self.shared / "missing.txt"), "old_text": "a", "new_text": "b"})
+
+
+class ServerOwnedSettingsHTTPTests(TempChatsMixin, unittest.TestCase):
+    """Phase 1.6: browser saves can't change folders/permissions/title; the dedicated endpoints validate."""
+
+    def setUp(self):
+        super().setUp()
+        self.httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler); self.httpd.daemon_threads = True
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True); self.thread.start()
+
+    def tearDown(self):
+        self.httpd.shutdown(); self.httpd.server_close(); self.thread.join(timeout=3)
+        super().tearDown()
+
+    def call(self, method, path, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request(method, path, None if body is None else json.dumps(body),
+                     {"Host": "127.0.0.1:%d" % self.port, "Content-Type": "application/json", "Origin": "http://127.0.0.1:%d" % self.port})
+        r = conn.getresponse(); data = r.read(); conn.close(); return r.status, json.loads(data or b"{}")
+
+    def test_new_chat_gets_default_permissions_and_keeps_chosen_folders(self):
+        status, _ = self.call("PUT", "/api/chats/n1", {"title": "New", "messages": [], "folders": [{"path": str(self.shared), "write": True}],
+                                                         "capabilities": {"editMode": "auto", "deleteFiles": True, "modelControl": "allowed"}})
+        self.assertEqual(200, status); saved = server.load_chat("n1")
+        self.assertEqual(capabilities.DEFAULT_POLICY, saved["capabilities"])
+        self.assertEqual([{"path": str(self.shared), "write": True}], saved["folders"])
+
+    def test_browser_save_cannot_change_server_owned_fields(self):
+        self.make_chat(caps=dict(FULL, editMode="review"))
+        stale = server.load_chat("c1"); stale.pop("_path")
+        stale.update(title="Hacked", capabilities=dict(FULL, editMode="auto"), folders=[{"path": str(self.outside), "write": True}],
+                     messages=[{"role": "user", "content": "hello"}], model="model-b")
+        self.assertEqual(200, self.call("PUT", "/api/chats/c1", stale)[0])
+        saved = server.load_chat("c1")
+        self.assertEqual("Test", saved["title"]); self.assertEqual("review", saved["capabilities"]["editMode"])
+        self.assertNotIn(str(self.outside), [f["path"] for f in saved["folders"]])
+        self.assertEqual("hello", saved["messages"][0]["content"]); self.assertEqual("model-b", saved["model"])  # browser-owned fields do save
+
+    def test_permissions_endpoint_validates_and_updates(self):
+        self.make_chat(caps={"editMode": "review", "modelControl": "ask"})
+        status, body = self.call("POST", "/api/session/permissions", {"chatId": "c1", "capabilities": {"editMode": "yolo"}})
+        self.assertEqual(400, status)
+        status, body = self.call("POST", "/api/session/permissions", {"chatId": "c1", "folders": [{"path": "bad\x01path"}]})
+        self.assertEqual(400, status)
+        status, body = self.call("POST", "/api/session/permissions", {"chatId": "c1", "capabilities": {"editMode": "auto", "fileManage": True},
+                                                                       "folders": [{"path": str(self.shared), "write": True}, {"path": str(self.shared), "write": False}]})
+        self.assertEqual(200, status); self.assertEqual(1, len(body["folders"]))
+        self.assertTrue(body["policy"]["fileManage"]); self.assertEqual("auto", server.load_chat("c1")["capabilities"]["editMode"])
+        self.assertEqual("ask", server.load_chat("c1")["capabilities"]["modelControl"])  # untouched keys are kept
+        self.assertEqual(400, self.call("POST", "/api/session/permissions", {"chatId": "missing", "folders": []})[0])
+
+    def test_unexpected_errors_return_json_500(self):
+        with mock.patch.object(server, "list_chats", side_effect=RuntimeError("boom")):
+            status, body = self.call("GET", "/api/chats")
+        self.assertEqual(500, status); self.assertIn("boom", body["error"])
+
+    def test_trash_endpoints(self):
+        chat = self.make_chat(); f = self.shared / "t.txt"; f.write_text("one", encoding="utf-8")
+        server.run_tool(chat, "write_file", {"path": str(f), "content": "two"})
+        status, body = self.call("GET", "/api/trash"); self.assertEqual(200, status)
+        self.assertEqual(1, len(body["items"])); self.assertEqual(3, body["totalBytes"]); self.assertNotIn("storedName", body["items"][0])
+        status, body = self.call("POST", "/api/trash/restore", {"id": body["items"][0]["id"]})
+        self.assertEqual(200, status); self.assertEqual("one", f.read_text(encoding="utf-8"))
+        self.assertEqual(400, self.call("POST", "/api/trash/restore", {"id": "..\\..\\x"})[0])
+        status, body = self.call("POST", "/api/trash/purge", {"all": True}); self.assertEqual(1, body["removed"])
+        self.assertEqual([], self.call("GET", "/api/trash")[1]["items"])
+
+
 if __name__ == "__main__":
     unittest.main()

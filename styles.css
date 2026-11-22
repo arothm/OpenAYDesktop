@@ -111,9 +111,22 @@ details.thinking .tbody { white-space: pre-wrap; color: var(--muted); font-size:
 .hint { text-align: center; font-size: 11.5px; color: var(--muted); margin-top: 6px; }
 
 /* Settings */
-#modalBack, #sessionBack, #modelApproveBack { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: none; align-items: center; justify-content: center; z-index: 50; }
+#modalBack, #sessionBack, #trashBack, #modelApproveBack { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: none; align-items: center; justify-content: center; z-index: 50; }
 #modelApproveBack { z-index: 75; background: rgba(0,0,0,.5); }
-#modalBack.open, #sessionBack.open, #modelApproveBack.open { display: flex; }
+#modalBack.open, #sessionBack.open, #trashBack.open, #modelApproveBack.open { display: flex; }
+.trash-modal { width: min(760px, 94vw); }
+#trashSummary { font-size: 12.5px; color: var(--muted); margin-bottom: 12px; }
+#trashList { display: flex; flex-direction: column; gap: 6px; max-height: 55vh; overflow-y: auto; }
+.trash-row { display: flex; align-items: center; gap: 10px; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: var(--panel); }
+.trash-row .info { flex: 1; min-width: 0; }
+.trash-row .p { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+.trash-row .m { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+.trash-row .kind { font-size: 10.5px; border-radius: 4px; padding: 1px 6px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+.trash-row .kind.version { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+.trash-row .btn { padding: 4px 9px; font-size: 12.5px; }
+.modal .foot .spacer { flex: 1; }
+.btn.danger { color: var(--danger); }
+.btn:disabled { opacity: .45; cursor: default; }
 .model-switch { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 18px; font-family: "Cascadia Code", Consolas, monospace; font-size: 13px; }
 .model-switch span:not(.arrow) { border: 1px solid var(--border); background: var(--panel); border-radius: 8px; padding: 5px 9px; overflow-wrap: anywhere; }
 .model-switch .arrow { color: var(--muted); }

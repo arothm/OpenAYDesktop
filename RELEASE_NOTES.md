@@ -1,3 +1,24 @@
+# Open AY Desktop 1.2.0
+
+Undoable edits, a Trash screen and server-owned permissions (Phase 1.6).
+
+## New
+- **`edit_file`:** the model can change part of a file by exact find-and-replace, with the same full-diff review as `write_file`, instead of resending the whole file. Line endings are preserved.
+- **Every overwrite can be undone:** before an existing file is edited or replaced, its previous content is kept in the app Trash, in both review and auto-edit mode.
+- **Trash screen** (🗑 in the sidebar): see deleted files and earlier versions, restore them, delete single items, or empty the trash. Restoring a version keeps the current file, so restores can be undone too.
+
+## Changed
+- A chat's folders, permissions and name are now server-owned. Normal chat saves can't change them, even from an outdated copy in the window. They change only through validated endpoints.
+- A reviewed write is refused if the file changed on disk after you reviewed it, instead of overwriting the newer content.
+
+## Fixes
+- An unexpected server error now returns a readable error instead of dropping the connection.
+
+## Verification
+43 automated tests and `python verify_static.py`.
+
+---
+
 # Open AY Desktop 1.1.0
 
 Session permissions, file management and model switching (Phase 1).
