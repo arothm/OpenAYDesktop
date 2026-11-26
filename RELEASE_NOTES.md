@@ -1,3 +1,20 @@
+# Open AY Desktop 1.5.0
+
+Subtasks, limits and an Activity view (Phase 4).
+
+## New
+- **Subtasks:** with "Allow subtasks" on, the model can start helper chats that run in parallel and report their answers back. Subtasks appear under their parent in the sidebar, never get more permission than the parent, and are stopped and deleted with it.
+- **Limits** in Settings: tokens per day, tokens per chat, and how many replies can run at the same time. They're checked before every model request.
+- **Activity (⚡):** every running reply in every chat, with Open and Stop, plus recently finished replies.
+
+## Fixes
+- A finished reply could briefly count as finished before its final save, so a reply started at that moment could lose the previous reply's last message. It now saves first.
+
+## Verification
+83 automated tests (10 new for subtasks, limits and activity) and `python verify_static.py`.
+
+---
+
 # Open AY Desktop 1.4.0
 
 Web search, skills, and protection against untrusted content (Phase 3).

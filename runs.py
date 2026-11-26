@@ -14,10 +14,16 @@ gets a full "snapshot" first, then live events:
   approval_done {id}                       that question was answered or withdrawn
   context   {...}                          what the context budget did for this request
   usage     {session, today, context}      token counts after a model response
+  untrusted {untrusted}                    the chat read web content (see capabilities.policy)
+
+Subtasks: a reply can start child chats (start_subtask). Each runs as its own Run; the
+parent starts all subtasks requested in one step, then waits for them and returns each
+child's final answer as that tool call's result. Stopping a parent stops its children.
 The engine is created by server.py with the server module as `srv`, which provides
 storage, tools, approvals and the Ollama Cloud connection.
 """
 
+import collections
 import copy
 import json
 import secrets
@@ -40,6 +46,9 @@ APPROVAL_WAIT = 1800          # seconds an approval waits before it counts as de
 EVENT_BUFFER = 5000
 MAX_IMAGES = 10
 MAX_IMAGE_CHARS = 20_000_000  # base64 characters per image
+MAX_SUBTASKS_PER_REPLY = 6
+SUBTASK_RESULT_CHARS = 20_000
+HISTORY = 30                  # finished replies kept for the Activity view
 
 
 class RunError(Exception):
@@ -86,6 +95,7 @@ class Engine:
         self.lock = threading.Lock()
         self.runs = {}
         self.channels = {}
+        self.history = collections.deque(maxlen=HISTORY)
 
     def channel(self, chat_id):
         with self.lock:
@@ -120,14 +130,26 @@ class Engine:
         chat.pop("_path", None)
         return {"type": "snapshot", "chat": chat, "status": "idle", "approval": None}, seq
 
-    def start(self, chat_id, options):
+    def start(self, chat_id, options, parent=None):
+        limit = int(self.srv.load_config().get("maxConcurrentRuns") or 4)
         with self.lock:
             if self.active(chat_id):
                 raise RunError("A reply is already running in this session.")
-            run = Run(self, chat_id, options)  # validates input and saves the user's message
+            running = sum(1 for r in self.runs.values() if r.alive)
+            if running >= limit:
+                raise RunError("%d replies are already running, which is the limit. Wait for one to finish, or raise "
+                               "\"Replies at the same time\" in Settings." % running)
+            run = Run(self, chat_id, options, parent)  # validates input and saves the user's message
             self.runs[chat_id] = run
         run.thread.start()
         return run
+
+    def finished(self, run):
+        self.history.appendleft(run.summary())
+
+    def activity(self):
+        active = [r.summary() for r in list(self.runs.values()) if r.alive]
+        return {"active": sorted(active, key=lambda a: a["started"]), "recent": list(self.history)}
 
     def stop(self, chat_id, wait=0):
         run = self.active(chat_id)
@@ -143,8 +165,15 @@ class Engine:
 
 
 class Run:
-    def __init__(self, engine, chat_id, options):
+    def __init__(self, engine, chat_id, options, parent=None):
         self.engine, self.srv, self.chat_id = engine, engine.srv, chat_id
+        self.parent = parent
+        self.children = []
+        self.started = time.time()
+        self.ended = None
+        self.steps = 0
+        self.tokens = 0
+        self.outcome = None
         self.lock = threading.RLock()
         self.cancelled = threading.Event()
         self.status = "running"
@@ -253,9 +282,19 @@ class Run:
             if context: disk["context"] = context
             srv.save_chat(self.chat_id, disk)
 
+    def summary(self):
+        with self.lock:
+            return {"chatId": self.chat_id, "title": self.chat.get("title", ""), "parentId": self.chat.get("parentId"),
+                    "model": self.chat.get("model", ""), "status": self.status if self.alive else (self.outcome or "done"),
+                    "approval": self.approval["kind"] if self.approval else None, "started": int(self.started * 1000),
+                    "seconds": int((self.ended or time.time()) - self.started), "steps": self.steps, "tokens": self.tokens,
+                    "children": list(self.children)}
+
     # ------------------------------------------------------------ control from other threads
     def cancel(self):
         self.cancelled.set()
+        for child in list(self.children):  # stopping a reply stops its subtasks
+            self.engine.stop(child)
         with self.lock:
             a, r = self.approval, self.response
         if a:
@@ -304,10 +343,19 @@ class Run:
                 reply = self.chat["messages"][idx]
                 if self.cancelled.is_set() or reply.get("error") or not reply.get("tool_calls"):
                     break
+                started = []  # subtasks requested in this step run at the same time
                 for call in reply["tool_calls"]:
                     if self.cancelled.is_set():
                         break
-                    self.run_tool_call(call)
+                    name, args = parse_call(call)
+                    if name == "start_subtask":
+                        launched = self.start_subtask(args)
+                        if launched:
+                            started.append(launched)
+                    else:
+                        self.run_tool_call(call)
+                for idx_child in started:
+                    self.finish_subtask(*idx_child)
                 self.save()
             else:
                 self.add({"role": "assistant", "content": "", "model": self.chat["model"],
@@ -319,10 +367,15 @@ class Run:
                 for m in self.chat["messages"]:
                     for flag in ("_live", "_running", "_approval", "_modelApproval", "_actionApproval"):
                         m.pop(flag, None)
-                self.alive = False
+                last = self.chat["messages"][-1] if self.chat["messages"] else {}
+                self.outcome = "stopped" if self.cancelled.is_set() else "error" if last.get("error") else "done"
+                self.ended = time.time()
             try:
-                self.save()
+                self.save()  # before the run counts as finished, so a new reply can't start from an older file
             finally:
+                with self.lock:
+                    self.alive = False
+                self.engine.finished(self)
                 self.set_status("idle")
 
     def build_request(self, model):
@@ -353,6 +406,12 @@ class Run:
     def stream_step(self, idx):
         srv = self.srv
         model = self.chat["model"]
+        with self.lock:
+            reason = srv.limit_reached(self.chat)
+        if reason:
+            self.update(idx, error=reason, _live=None, thinking=None)
+            return
+        self.steps += 1
         while True:
             body, info = self.build_request(model)
             try:
@@ -426,6 +485,7 @@ class Run:
             u["promptTokens"] += prompt
             u["outputTokens"] += output
             u["requests"] += 1
+            self.tokens += prompt + output
             context = {"used": prompt + output, "limit": info["contextTokens"], "omittedMessages": info["omittedMessages"],
                        "clippedToolResults": info["clippedToolResults"]}
             self.chat["context"] = context
@@ -437,16 +497,80 @@ class Run:
             speed = " · %.1f tok/s" % (output / (final["eval_duration"] / 1e9))
         return "%d tokens%s" % (output, speed) if output else ""
 
+    # ------------------------------------------------------------ subtasks
+    def start_subtask(self, args):
+        """Create and start a child chat. Returns (tool message index, child id), or None if it couldn't start."""
+        srv = self.srv
+        task = str(args.get("task") or "").strip()
+        title = str(args.get("title") or task[:60] or "Subtask").strip()
+        idx = self.add({"role": "tool", "tool_name": "start_subtask", "content": "", "display": title, "_running": True})
+        try:
+            chat = srv.saved_tool_config(self.chat_id)
+            pol = capabilities.policy(chat)
+            if not pol["subtasks"]:
+                raise srv.ToolError("Subtasks are off for this session.")
+            if not task or len(task) > 20_000:
+                raise srv.ToolError("A task of 1-20,000 characters is required.")
+            if len(self.children) >= MAX_SUBTASKS_PER_REPLY:
+                raise srv.ToolError("This reply already started %d subtasks, the most allowed." % MAX_SUBTASKS_PER_REPLY)
+            model = str(args.get("model") or "").strip() or None
+            if model and model != chat.get("model"):
+                if pol["modelControl"] == "fixed":
+                    raise srv.ToolError("This session's model is fixed, so subtasks use %s." % chat.get("model"))
+                if model not in [m["name"] for m in srv.get_models()[0]]:
+                    raise srv.ToolError("Model is not currently available in Ollama Cloud: %s" % model)
+                if pol["modelControl"] == "ask":
+                    self.ask(idx, {"title": "Use a different model for this subtask?", "detail": "Subtask: %s\nModel: %s" % (title, model),
+                                   "why": "This session asks you before changing models."}, "The user didn't allow the other model.")
+            child_id = srv.create_subtask_chat(self.chat_id, title, model)
+            self.update(idx, subtaskId=child_id)
+            try:
+                self.engine.start(child_id, {"text": task, "think": self.think}, parent=self)
+            except RunError:
+                srv.delete_chat(child_id)
+                raise
+            with self.lock:
+                self.children.append(child_id)
+            return idx, child_id
+        except Denied as e:
+            self.update(idx, content=str(e), isError=True, _running=None)
+        except (srv.ToolError, RunError, ValueError, OSError) as e:
+            self.update(idx, content="Error: %s" % e, isError=True, _running=None)
+        return None
+
+    def finish_subtask(self, idx, child_id):
+        """Wait for a child chat's reply and return its final answer as the tool result."""
+        srv = self.srv
+        child = self.engine.runs.get(child_id)
+        while child and child.alive:
+            child.thread.join(0.5)  # Stop cancels the children too, so this always ends
+        try:
+            chat = srv.load_chat(child_id)
+        except (OSError, ValueError):
+            self.update(idx, content="The subtask chat was deleted.", isError=True, _running=None)
+            return
+        answer = next((m for m in reversed(chat.get("messages") or [])
+                       if m.get("role") == "assistant" and (m.get("content") or m.get("error")) and not m.get("tool_calls")), {})
+        title = chat.get("title", "Subtask")
+        if child and child.outcome == "stopped":
+            text, failed = 'Subtask "%s" was stopped before it finished.' % title, True
+        elif answer.get("error") and not answer.get("content"):
+            text, failed = 'Subtask "%s" failed: %s' % (title, answer["error"]), True
+        else:
+            body = answer.get("content") or "(no answer)"
+            if len(body) > SUBTASK_RESULT_CHARS:
+                body = body[:SUBTASK_RESULT_CHARS] + "\n[... %d more characters in the subtask chat]" % (len(body) - SUBTASK_RESULT_CHARS)
+            text, failed = 'Subtask "%s" finished. Its answer:\n\n%s' % (title, body), False
+        if chat.get("untrusted"):  # what it read can carry untrusted content back into this chat
+            flag = srv.mark_untrusted(self.chat_id, "subtask: %s" % title[:120], chat.get("webUrls") or [])
+            with self.lock:
+                self.chat["untrusted"] = flag
+                self.publish({"type": "untrusted", "untrusted": flag})
+        self.update(idx, content=text, isError=True if failed else None, _running=None)
+
     def run_tool_call(self, call):
         srv = self.srv
-        fn = (call or {}).get("function") or {}
-        name = str(fn.get("name") or "")
-        args = fn.get("arguments") or {}
-        if isinstance(args, str):
-            try: args = json.loads(args)
-            except ValueError: args = {}
-        if not isinstance(args, dict):
-            args = {}
+        name, args = parse_call(call)
         display = (args.get("path") or args.get("source") or args.get("model") or args.get("query") or args.get("url")
                    or args.get("pattern") or args.get("contains") or "")
         if name == "search_files" and args.get("contains"):
@@ -531,3 +655,13 @@ class Run:
             self.chat["untrusted"] = flag
             self.publish({"type": "untrusted", "untrusted": flag})
         return out
+
+
+def parse_call(call):
+    """(tool name, arguments dict) from an Ollama tool call, tolerating JSON-string arguments."""
+    fn = (call or {}).get("function") or {}
+    args = fn.get("arguments") or {}
+    if isinstance(args, str):
+        try: args = json.loads(args)
+        except ValueError: args = {}
+    return str(fn.get("name") or ""), (args if isinstance(args, dict) else {})

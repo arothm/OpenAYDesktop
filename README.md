@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It needs Python 3 (standard library only) and Edge or Chrome. There is no frontend framework, npm installation, or build step.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.4.0
+- **Version:** 1.5.0
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -26,7 +26,12 @@ The Settings dialog contains only:
 
 1. **Ollama API Key** — a password field, saved-key indication, and Clear button. Leaving the field blank preserves the key; **Clear saved API key** takes effect when you click Save. Create a key at https://ollama.com/settings/keys. Alternatively, set the `OLLAMA_API_KEY` environment variable.
 2. **Default Model** — populated from Ollama Cloud's available models. It applies to new chats. Existing chats retain their selected model, and the header picker can change the current chat's model.
-3. **Check for Updates** — checks the latest release at https://github.com/arothm/OpenAYDesktop/releases using GitHub's public API. It reports the installed version, update availability, no-published-release state, or a connection error. If an update exists, **Open Latest Release** opens that release page. Nothing is downloaded or installed automatically.
+3. **Limits**:
+   - **Tokens per day** and **Tokens per chat** count tokens sent and generated, as Ollama reports them; 0 turns a limit off. When a limit is reached, replies stop with a message until you raise the limit.
+   - **Replies at the same time** (default 4) caps how many replies, subtasks included, can run at once.
+
+   The usage line under the message box shows today's tokens against the daily limit.
+4. **Check for Updates** — checks the latest release at https://github.com/arothm/OpenAYDesktop/releases using GitHub's public API. It reports the installed version, update availability, no-published-release state, or a connection error. If an update exists, **Open Latest Release** opens that release page. Nothing is downloaded or installed automatically.
 
 The app no longer supports local Ollama, a custom Ollama URL, or local model discovery. The Ollama desktop app is not required. The header still exposes the model picker and thinking/reasoning effort.
 
@@ -75,6 +80,7 @@ A chat's folders, permissions and name are **server-owned**. Normal chat saves f
 
 - **Web search and reading web pages:** off by default. See *Web search* below.
 - **Skills for this chat:** tick the skills this chat should follow. See *Skills* below.
+- **Allow subtasks:** off by default. See *Subtasks* below.
 
   The model is told to switch only when you explicitly ask. Before switching, the server checks that the model exists in Ollama Cloud. It refuses a model without image support if the chat contains images, and warns when the new model doesn't support tools. The new model answers from the next step of the same reply. Your default model in Settings is not changed.
 
@@ -104,6 +110,17 @@ A skill is a set of instructions you write once and turn on per chat, for exampl
 - import a Markdown file. An optional `name:` and `description:` header between `---` lines is read.
 
 Turn skills on for a chat in its Session settings. Enabled skills are added to the chat's system instructions on every request, up to 30,000 characters in total and 20,000 per skill. A skill is only text: it can't run code, call tools by itself, or change what the chat is allowed to do. Skills are stored as Markdown files in `data/skills/`.
+
+## Subtasks
+With **Allow subtasks** on, the model can hand self-contained pieces of work to helper chats with `start_subtask`:
+- **Parallel.** Subtasks requested in the same reply run at the same time. The chat waits for them, then gets each one's final answer and continues.
+- **Visible.** Each subtask is a normal chat, shown under its parent in the sidebar and marked "subtask of …". Its card in the parent chat has an **Open** button, and its approvals appear in its own chat, with an amber dot in the sidebar.
+- **Never more permission than its parent.** A subtask gets the parent's folders and skills and at most its effective permissions. Its model is fixed, and it can't start subtasks of its own. If the parent has read web content, the subtask starts untrusted. If a subtask reads web content, the parent becomes untrusted when the result comes back.
+- **Bounded.** At most 6 subtasks per reply, and they count toward the limits in Settings.
+- **Stopped and deleted with the parent.** Stopping the parent stops its subtasks, and deleting the parent deletes them.
+
+## Activity
+**⚡** in the sidebar lists every running reply across all chats, subtasks included. For each one it shows the status (running, or waiting for you), model, time, steps and tokens, with **Open** and **Stop** buttons. Below that are the most recently finished replies and how they ended (done, stopped, or error).
 
 ## Replies run on the server
 Each reply runs on the app's local server (`runs.py`): the model answers, calls tools, gets their results, and continues, up to 25 steps. The window shows it live through an event stream. As a result:
@@ -142,7 +159,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 
 ## Publishing a release for the updater
 1. Update `APP_VERSION` in `server.py` and the version shown here.
-2. Commit and tag the release as `vX.Y.Z`, for example `v1.4.0`.
+2. Commit and tag the release as `vX.Y.Z`, for example `v1.5.0`.
 3. Publish a non-draft GitHub Release with that tag in `arothm/OpenAYDesktop`.
 4. The app's update check compares numeric semantic versions. A malformed release tag produces a clear error. If no release has been published, GitHub's 404 response is reported as **No published release yet**, not as an update.
 
@@ -157,7 +174,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `index.html` — application and dialog markup.
 - `styles.css` — interface styling and light/dark themes.
 - `app.js` — the window: live event stream, rendering, approvals, sessions, trash, and settings.
-- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`).
+- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`).
 - `verify_static.py` — optional static consistency checks.
 - `backups/pre-approved-changes/` — original source copies from before the first approved change set.
 

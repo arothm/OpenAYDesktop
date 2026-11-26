@@ -10,7 +10,7 @@ const state = {
   clearKey: false, updateUrl: "", sessionDraft: null,
   es: null, runStatus: "idle", runs: {}, editIndex: null, usage: null, today: null,
 };
-const DEFAULT_CAPABILITIES = { editMode: "review", fileManage: false, deleteFiles: false, modelControl: "ask", webSearch: false };
+const DEFAULT_CAPABILITIES = { editMode: "review", fileManage: false, deleteFiles: false, modelControl: "ask", webSearch: false, subtasks: false };
 const api = async (path, opts = {}) => {
   const r = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
   const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.statusText); return j;
@@ -70,12 +70,25 @@ function openModelMenu(open) {
 // Chats. The server owns each chat's messages and runs its replies (runs.py); the window
 // shows them through a live event stream and sends user actions as requests.
 async function loadChats() { state.chats = await api("/api/chats").catch(() => []); renderChatList(); }
+function chatOrder(q) {
+  if (q) return state.chats.filter((c) => c.title.toLowerCase().includes(q));  // flat while searching
+  const ids = new Set(state.chats.map((c) => c.id)); const out = [];
+  for (const c of state.chats) {
+    if (c.parentId && ids.has(c.parentId)) continue;  // shown under its parent
+    out.push(c); for (const k of state.chats) if (k.parentId === c.id) out.push(k);
+  }
+  return out;
+}
 function renderChatList() {
-  const q = $("#search").value.trim().toLowerCase(); const items = state.chats.filter((c) => c.title.toLowerCase().includes(q));
+  const q = $("#search").value.trim().toLowerCase(); const items = chatOrder(q);
   $("#chatList").innerHTML = items.map((c) => {
     const run = state.runs[c.id]; const badge = run === "waiting" ? '<span class="run-dot waiting" title="Waiting for your approval"></span>' : run ? '<span class="run-dot" title="Replying…"></span>' : "";
-    return `<div class="chat-item ${state.chat?.id === c.id ? "active" : ""}" data-id="${c.id}" title="${esc(c.model || "")}">${badge}<span class="t">${esc(c.title)}</span><button class="icon-btn del" title="Delete chat">${ICON.trash}</button></div>`;
+    return `<div class="chat-item ${state.chat?.id === c.id ? "active" : ""} ${c.parentId ? "child" : ""}" data-id="${c.id}" title="${esc(c.model || "")}">${badge}<span class="t">${esc(c.title)}</span><button class="icon-btn del" title="Delete chat">${ICON.trash}</button></div>`;
   }).join("") || `<div style="color:var(--muted);font-size:13px;padding:8px 10px">${q ? "No matches" : "No chats yet"}</div>`;
+}
+function titleFor(chat) {
+  const parent = chat.parentId && state.chats.find((c) => c.id === chat.parentId);
+  return parent ? `${chat.title}  ·  subtask of ${parent.title}` : chat.title;
 }
 function updateChatMeta(chat) {
   const i = state.chats.findIndex((x) => x.id === chat.id); const meta = { id: chat.id, title: chat.title, updated: chat.updated || Date.now(), model: chat.model };
@@ -103,7 +116,7 @@ function applyEvent(id, ev) {
   if (ev.type === "snapshot") {
     if (ev.chat.id !== id) return;
     const first = state.chat?.id !== id; state.chat = ev.chat; state.selectedModel = ev.chat.model;
-    setRunStatus(ev.status); showApproval(ev.approval); updateModelBtn(); updateFolderBtn(); updateUntrustedBadge(); $("#title").textContent = ev.chat.title;
+    setRunStatus(ev.status); showApproval(ev.approval); updateModelBtn(); updateFolderBtn(); updateUntrustedBadge(); $("#title").textContent = titleFor(ev.chat);
     renderMessages(); scrollBottom(first); renderUsage(); return;
   }
   const chat = state.chat; if (!chat || chat.id !== id) return;
@@ -144,10 +157,14 @@ function renderUsage() {
     if (c.omittedMessages) parts.push(`<span class="warn" title="Older messages are left out of requests so the conversation fits">${c.omittedMessages} older message${c.omittedMessages > 1 ? "s" : ""} left out</span>`);
   }
   if (u) parts.push(`<span title="Tokens sent and generated in this chat">This chat ${kTokens(u.promptTokens)} in · ${kTokens(u.outputTokens)} out</span>`);
-  if (t) parts.push(`<span title="All chats today">Today ${kTokens(t.promptTokens + t.outputTokens)} tokens · ${t.requests} requests</span>`);
+  if (t) {
+    const used = t.promptTokens + t.outputTokens; const lim = state.limits?.dailyTokenLimit || 0;
+    const of = lim ? ` / ${kTokens(lim)}` : ""; const warn = lim && used >= lim * 0.8 ? "warn" : "";
+    parts.push(`<span class="${warn}" title="All chats today${lim ? ", against your daily limit" : ""}">Today ${kTokens(used)}${of} tokens · ${t.requests} requests</span>`);
+  }
   $("#usageLine").innerHTML = parts.join('<span class="sep">·</span>');
 }
-async function loadUsage() { try { state.today = (await api("/api/usage")).today; renderUsage(); } catch {} }
+async function loadUsage() { try { const u = await api("/api/usage"); state.today = u.today; state.limits = u.limits; renderUsage(); } catch {} }
 
 function newChat() {
   state.navSeq++; subscribe(null); state.chat = null; state.draftFolders = []; state.editIndex = null; closeApproval(); setRunStatus("idle");
@@ -159,24 +176,27 @@ async function openChat(id) {
   try { chat = await api("/api/chats/" + id); } catch (e) { toast(e.message); return; }
   if (ticket !== state.navSeq) return;
   closeApproval(); state.editIndex = null; state.chat = chat; state.selectedModel = chat.model; setRunStatus(state.runs[id] || "idle");
-  updateModelBtn(); renderMessages(); renderChatList(); updateFolderBtn(); updateUntrustedBadge(); toggleFolderPop(false); renderUsage(); $("#title").textContent = chat.title; scrollBottom(true);
+  updateModelBtn(); renderMessages(); renderChatList(); updateFolderBtn(); updateUntrustedBadge(); toggleFolderPop(false); renderUsage(); $("#title").textContent = titleFor(chat); scrollBottom(true);
   subscribe(id);  // the snapshot that follows brings any live run state
 }
 async function deleteChat(id) {
   const running = state.runs[id] ? "\n\nA reply is running in this chat; it will be stopped." : "";
-  if (!confirm("Delete this chat?" + running)) return;
+  const kids = state.chats.filter((c) => c.parentId === id).length;
+  if (!confirm("Delete this chat?" + running + (kids ? `\n\nIts ${kids} subtask chat${kids > 1 ? "s" : ""} will be deleted too.` : ""))) return;
   try { await api("/api/chats/" + id, { method: "DELETE" }); } catch (e) { toast("Delete failed: " + e.message); return; }
-  delete state.runs[id]; state.chats = state.chats.filter((c) => c.id !== id); if (state.chat?.id === id) newChat(); else renderChatList();
+  const gone = new Set([id, ...state.chats.filter((c) => c.parentId === id).map((c) => c.id)]);
+  gone.forEach((g) => delete state.runs[g]); state.chats = state.chats.filter((c) => !gone.has(c.id)); if (gone.has(state.chat?.id)) newChat(); else renderChatList();
 }
 
 // Rendering
-const TOOL_LABEL = { list_directory: "Listed folder", read_file: "Read file", search_files: "Searched files", write_file: "Wrote file", edit_file: "Edited file", create_folder: "Created folder", copy_path: "Copied item", move_path: "Moved/renamed item", delete_path: "Moved to trash", restore_path: "Restored item", set_session_model: "Changed model", web_search: "Searched the web", web_fetch: "Read web page" };
+const TOOL_LABEL = { list_directory: "Listed folder", read_file: "Read file", search_files: "Searched files", write_file: "Wrote file", edit_file: "Edited file", create_folder: "Created folder", copy_path: "Copied item", move_path: "Moved/renamed item", delete_path: "Moved to trash", restore_path: "Restored item", set_session_model: "Changed model", web_search: "Searched the web", web_fetch: "Read web page", start_subtask: "Subtask" };
 function toolHTML(m, idx) {
   if (m._actionApproval) return `<div class="approve" data-idx="${idx}"><div class="q">${esc(m._actionApproval.title)}</div><div class="detail">Nothing has happened yet. This needs your approval.</div><div class="btns"><button class="btn primary" data-action-review="yes">Review</button><button class="btn" data-action-approve="no">Deny</button></div></div>`;
   if (m._modelApproval) return `<div class="approve" data-idx="${idx}"><div class="q">Switch this session to ${esc(m._modelApproval.model)}?</div><div class="detail">Nothing has changed yet. The model is waiting for your approval.</div><div class="btns"><button class="btn primary" data-model-review="yes">Review change</button><button class="btn" data-model-approve="no">Keep current model</button></div></div>`;
   if (m._approval) return `<div class="approve" data-idx="${idx}"><div class="q">Review requested change to ${esc(m._approval.path)}</div><div class="detail">Nothing has been written. Review the complete change before deciding.</div><div class="btns"><button class="btn primary" data-review="yes">Review change</button><button class="btn" data-approve="no">Deny</button></div></div>`;
   const status = m._running ? "running…" : m.isError ? "failed" : "";
-  return `<details class="tool ${m.isError ? "err" : ""}" data-idx="${idx}"><summary><b>${esc(TOOL_LABEL[m.tool_name] || m.tool_name || "Tool")}</b><span class="arg">${esc(m.display || "")}</span><span>${status}</span></summary><div class="out">${esc(m.content || "")}</div></details>`;
+  const open = m.subtaskId ? `<button class="btn open-sub" data-open-chat="${esc(m.subtaskId)}" type="button">Open</button>` : "";
+  return `<details class="tool ${m.isError ? "err" : ""}" data-idx="${idx}"><summary><b>${esc(TOOL_LABEL[m.tool_name] || m.tool_name || "Tool")}</b><span class="arg">${esc(m.display || "")}</span><span>${status}</span>${open}</summary><div class="out">${esc(m.content || "")}</div></details>`;
 }
 function msgHTML(m, idx, isLast) {
   if (m.role === "system") return ""; if (m.role === "tool") return toolHTML(m, idx);
@@ -303,6 +323,7 @@ function openSettings() {
   $("#apiKey").placeholder = c.hasApiKey ? `Saved ${c.apiKeyHint || "(from OLLAMA_API_KEY)"} - leave blank to keep` : "Paste key…";
   $("#clearKey").disabled = !c.hasApiKey; $("#versionLabel").textContent = `Open AY Desktop ${c.version || ""}`;
   $("#updateStatus").textContent = `Checks github.com/${c.repository || "arothm/OpenAYDesktop"}`; $("#openUpdate").hidden = true;
+  $("#dailyLimit").value = c.dailyTokenLimit || 0; $("#chatLimit").value = c.chatTokenLimit || 0; $("#maxRuns").value = c.maxConcurrentRuns || 4;
   populateDefaultModels(); $("#modalBack").classList.add("open");
 }
 function populateDefaultModels() {
@@ -321,12 +342,14 @@ async function checkUpdates() {
   finally { button.disabled = false; button.textContent = "Check for Updates"; }
 }
 async function saveSettings() {
-  const body = { defaultModel: $("#defaultModel").value }; const key = $("#apiKey").value.trim(); if (key) body.apiKey = key;
+  const body = { defaultModel: $("#defaultModel").value, dailyTokenLimit: Number($("#dailyLimit").value || 0),
+                 chatTokenLimit: Number($("#chatLimit").value || 0), maxConcurrentRuns: Number($("#maxRuns").value || 4) };
+  const key = $("#apiKey").value.trim(); if (key) body.apiKey = key;
   if (state.clearKey && !key) body.clearApiKey = true;
   try {
     const saved = await api("/api/config", { method: "POST", body: JSON.stringify(body) }); const oldDefault = state.config.defaultModel; state.config = saved;
     if (!state.chat && oldDefault !== saved.defaultModel) { state.selectedModel = saved.defaultModel || state.models[0]?.name || ""; renderMessages(); updateModelBtn(); }
-    $("#modalBack").classList.remove("open"); await loadModels(); toast("Settings saved");
+    $("#modalBack").classList.remove("open"); await loadModels(); loadUsage(); toast("Settings saved");
   } catch (e) { toast(e.message); }
 }
 
@@ -340,6 +363,8 @@ function openSession() {
   $("#fileManage").checked = writable && c.fileManage; $("#deleteFiles").checked = writable && c.deleteFiles;
   $("#fileManage").disabled = !writable; $("#deleteFiles").disabled = !writable; $("#modelControl").value = c.modelControl;
   $("#webSearch").checked = Boolean(c.webSearch);
+  const isChild = Boolean(state.chat.parentId); $("#subtasks").checked = !isChild && Boolean(c.subtasks); $("#subtasks").disabled = isChild;
+  if (isChild) $("#subtasksHelp").textContent = "This chat is a subtask. Its permissions come from the chat that started it, and it can't start subtasks of its own.";
   const u = state.chat.untrusted; $("#untrustedBox").hidden = !u;
   if (u) $("#untrustedSources").textContent = "Since " + new Date(u.since).toLocaleString() + ". Read: " + (u.sources || []).join("; ");
   $("#sessionSkills").innerHTML = '<span class="help">Loading skills…</span>';
@@ -359,7 +384,7 @@ async function saveSession() {
   const draft = state.sessionDraft; if (!draft || !state.chat || draft.id !== state.chat.id) return;
   const title = $("#sessionName").value.trim();
   const c = { editMode: $("#editMode").value, fileManage: $("#fileManage").checked,
-              deleteFiles: $("#deleteFiles").checked, modelControl: $("#modelControl").value, webSearch: $("#webSearch").checked };
+              deleteFiles: $("#deleteFiles").checked, modelControl: $("#modelControl").value, webSearch: $("#webSearch").checked, subtasks: $("#subtasks").checked && !$("#subtasks").disabled };
   const skillIds = [...document.querySelectorAll("#sessionSkills [data-skill]")].filter((x) => x.checked).map((x) => x.dataset.skill);
   try {
     if (title !== state.chat.title) {
@@ -405,6 +430,35 @@ $("#trashEmpty").addEventListener("click", async () => {
   if (!confirm("Permanently delete everything in the trash? This can't be undone.")) return;
   try { const r = await api("/api/trash/purge", { method: "POST", body: JSON.stringify({ all: true }) }); toast(`Removed ${r.removed} item${r.removed === 1 ? "" : "s"}`); } catch (e) { toast(e.message); }
   renderTrash();
+});
+
+// Activity: running replies in every chat (subtasks included), plus recently finished ones
+let activityTimer = 0;
+async function openActivity() { $("#activityBack").classList.add("open"); await renderActivity(); clearInterval(activityTimer); activityTimer = setInterval(renderActivity, 2000); }
+function closeActivity() { clearInterval(activityTimer); $("#activityBack").classList.remove("open"); }
+const ago = (s) => s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+function activityRow(a, live) {
+  const parent = a.parentId && state.chats.find((c) => c.id === a.parentId);
+  const label = live ? (a.approval ? "waiting for you" : a.status) : a.status;
+  const cls = live ? (a.approval ? "waiting" : "running") : a.status;
+  const meta = [a.model, ago(a.seconds), `${a.steps} step${a.steps === 1 ? "" : "s"}`, `${kTokens(a.tokens)} tokens`];
+  if (parent) meta.push("subtask of " + parent.title); if (a.children?.length) meta.push(`${a.children.length} subtask${a.children.length > 1 ? "s" : ""}`);
+  return `<div class="act-row" data-chat="${esc(a.chatId)}"><span class="st ${cls}">${esc(label)}</span><div class="info"><div class="n">${esc(a.title || "Untitled")}</div><div class="m">${esc(meta.join(" · "))}</div></div>
+    <button class="btn" data-act="open" type="button">Open</button>${live ? '<button class="btn danger" data-act="stop" type="button">Stop</button>' : ""}</div>`;
+}
+async function renderActivity() {
+  if (!$("#activityBack").classList.contains("open")) { clearInterval(activityTimer); return; }
+  let r; try { r = await api("/api/activity"); } catch (e) { $("#activityList").innerHTML = `<div class="menu-note">${esc(e.message)}</div>`; return; }
+  $("#activityList").innerHTML = r.active.map((a) => activityRow(a, true)).join("") || '<div class="help" style="margin:0">Nothing is running.</div>';
+  $("#activityRecent").innerHTML = r.recent.map((a) => activityRow(a, false)).join("") || '<div class="help" style="margin:0">Nothing yet since the app started.</div>';
+}
+$("#activityBtn").addEventListener("click", openActivity);
+$("#activityClose").addEventListener("click", closeActivity);
+$("#activityBack").addEventListener("click", async (e) => {
+  if (e.target.id === "activityBack") { closeActivity(); return; }
+  const b = e.target.closest("[data-act]"); if (!b) return; const id = b.closest(".act-row").dataset.chat;
+  if (b.dataset.act === "open") { closeActivity(); openChat(id); }
+  else { try { await api("/api/runs/stop", { method: "POST", body: JSON.stringify({ chatId: id }) }); } catch (err) { toast(err.message); } renderActivity(); }
 });
 
 // Skills: Markdown instructions stored in data/skills, turned on per chat in Session settings
@@ -523,6 +577,7 @@ $("#modelOptions").addEventListener("click", (e) => { const o = e.target.closest
 document.addEventListener("click", (e) => { if (!e.target.closest(".picker")) openModelMenu(false); });
 $("#thinkSel").addEventListener("change", (e) => api("/api/config", { method: "POST", body: JSON.stringify({ think: e.target.value }) }).catch(() => {}));
 $("#messages").addEventListener("click", async (e) => {
+  const oc = e.target.closest("[data-open-chat]"); if (oc) { e.preventDefault(); openChat(oc.dataset.openChat); return; }
   if (e.target.closest("[data-action-review]")) { if (state.actionApproval) $("#actionApproveBack").classList.add("open"); return; }
   if (e.target.closest("[data-action-approve]")) { decideActionApproval(false); return; }
   if (e.target.closest("[data-model-review]")) { if (state.modelApproval) $("#modelApproveBack").classList.add("open"); return; }
@@ -554,7 +609,7 @@ addEventListener("keydown", (e) => {
   if (e.ctrlKey && e.key.toLowerCase() === "n") { e.preventDefault(); newChat(); }
   else if (e.ctrlKey && e.key.toLowerCase() === "b") { e.preventDefault(); $("#sidebar").classList.toggle("hidden"); }
   else if (e.key === "Escape") {
-    if ($("#modelApproveBack").classList.contains("open") || $("#previewBack").classList.contains("open") || $("#actionApproveBack").classList.contains("open")) hideApprovalDialogs(); else if ($("#skillsBack").classList.contains("open")) $("#skillsBack").classList.remove("open"); else if ($("#trashBack").classList.contains("open")) $("#trashBack").classList.remove("open"); else if ($("#sessionBack").classList.contains("open")) $("#sessionBack").classList.remove("open");
+    if ($("#modelApproveBack").classList.contains("open") || $("#previewBack").classList.contains("open") || $("#actionApproveBack").classList.contains("open")) hideApprovalDialogs(); else if ($("#activityBack").classList.contains("open")) closeActivity(); else if ($("#skillsBack").classList.contains("open")) $("#skillsBack").classList.remove("open"); else if ($("#trashBack").classList.contains("open")) $("#trashBack").classList.remove("open"); else if ($("#sessionBack").classList.contains("open")) $("#sessionBack").classList.remove("open");
     else if ($("#folderPop").classList.contains("open")) toggleFolderPop(false); else if ($("#modalBack").classList.contains("open")) $("#modalBack").classList.remove("open"); else if (state.editIndex !== null) { state.editIndex = null; updateEditBanner(); } else if (busy()) stop();
   }
 });

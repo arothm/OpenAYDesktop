@@ -55,7 +55,7 @@ class PolicyTests(unittest.TestCase):
     def test_defaults_are_conservative(self):
         p = capabilities.policy({"folders": []})
         self.assertEqual({"editMode": "review", "fileManage": False, "deleteFiles": False, "modelControl": "ask",
-                          "webSearch": False, "untrusted": False}, p)
+                          "webSearch": False, "subtasks": False, "untrusted": False}, p)
 
     def test_invalid_saved_values_fall_back_to_safe_defaults(self):
         p = capabilities.policy({"capabilities": {"editMode": "yolo", "modelControl": "whatever"}})

@@ -10,7 +10,9 @@ import uuid
 # modelControl: "ask" = the user approves each switch (default), "allowed" = switch when the
 # user asks without a confirmation step, "fixed" = the session can't change its model.
 # webSearch: the session may search the web and read pages (off by default).
-DEFAULT_POLICY = {"editMode": "review", "fileManage": False, "deleteFiles": False, "modelControl": "ask", "webSearch": False}
+# subtasks: the session may start helper chats that run in parallel and report back (off by default).
+DEFAULT_POLICY = {"editMode": "review", "fileManage": False, "deleteFiles": False, "modelControl": "ask", "webSearch": False,
+                  "subtasks": False}
 EDIT_MODES = {"review", "auto"}
 # After a session has read untrusted content (web pages), these need the user's approval each time.
 GATED_WHEN_UNTRUSTED = {"create_folder", "copy_path", "move_path", "delete_path", "restore_path"}
@@ -40,6 +42,7 @@ def policy(chat):
     p["fileManage"] = bool(p["fileManage"]) and writable
     p["deleteFiles"] = bool(p["deleteFiles"]) and writable
     p["webSearch"] = bool(p["webSearch"])
+    p["subtasks"] = bool(p["subtasks"]) and not chat.get("parentId")  # one level only: subtasks can't start subtasks
     # Untrusted content (web pages) can carry instructions aimed at the model. Once a session has
     # read some, nothing that changes files or the model happens without the user's approval.
     p["untrusted"] = bool(chat.get("untrusted"))
@@ -48,6 +51,13 @@ def policy(chat):
         if p["modelControl"] == "allowed":
             p["modelControl"] = "ask"
     return p
+
+
+def child_capabilities(parent):
+    """A subtask gets at most its parent's effective permissions, a fixed model, and no subtasks of its own."""
+    p = policy(parent)
+    return {"editMode": p["editMode"], "fileManage": p["fileManage"], "deleteFiles": p["deleteFiles"],
+            "modelControl": "fixed", "webSearch": p["webSearch"], "subtasks": False}
 
 
 def grants(chat):
@@ -329,7 +339,7 @@ def clean_capabilities(value):
     if "modelControl" in value:
         if value["modelControl"] not in MODEL_MODES: raise CapabilityError("Unknown model control mode.")
         out["modelControl"] = value["modelControl"]
-    for key in ("fileManage", "deleteFiles", "webSearch"):
+    for key in ("fileManage", "deleteFiles", "webSearch", "subtasks"):
         if key in value:
             if not isinstance(value[key], bool): raise CapabilityError("%s must be true or false." % key)
             out[key] = value[key]
