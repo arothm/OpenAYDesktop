@@ -54,4 +54,15 @@ assert runs_src.count("saved_tool_config(self.chat_id)") >= 3, "Tool calls must 
 assert "body.get(\"folders\")" not in runs_src
 assert re.search(r'chatId\s*:\s*chat\.id\b', js), "Frontend must send the chat ID"
 print("Server-side runs and server-owned folder grants: OK")
+import json
+pkg = json.loads((root / "package.json").read_text(encoding="utf-8"))
+version = re.search(r'APP_VERSION = "([^"]+)"', source).group(1)
+assert pkg["version"] == version, "package.json version %s != APP_VERSION %s" % (pkg["version"], version)
+main_js = (root / "electron" / "main.js").read_text(encoding="utf-8")
+for flag in ("contextIsolation: true", "sandbox: true", "nodeIntegration: false", "setWindowOpenHandler", "will-navigate", "--exit-with-stdin"):
+    assert flag in main_js, "Electron window is missing: " + flag
+for name in pkg["build"]["extraResources"][0]["filter"]:
+    assert name.endswith("/**") or (root / name).exists(), "Packaged file is missing: " + name
+assert set(pkg["build"]["extraResources"][0]["filter"]) >= {"server.py", "runs.py", "context_budget.py", "capabilities.py", "session_actions.py", "skills.py", "web.py"}
+print("Electron shell: version %s, locked-down window, packaged server files: OK" % version)
 print("Static checks passed. Run the regression suite separately; this script does not launch a browser or test GitHub.")

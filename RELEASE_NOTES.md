@@ -1,3 +1,22 @@
+# Open AY Desktop 1.7.0
+
+Electron desktop app.
+
+## New
+- **Electron app:**
+  - Start with `npm start` or `Open AY Desktop (Electron).cmd`. Electron runs the local Python server and shows the app in its own window.
+  - Closing the window while replies run lets you keep them running from the system tray, or stop them and quit.
+  - Only one copy runs at a time.
+  - **Browse…** uses Windows' native folder picker.
+- **Locked-down window:** the page has no access to Node, navigation stays inside the app, and https links open in your browser.
+- **Windows installer:** `npm run dist`. The installed app keeps its data in `%APPDATA%\Open AY Desktop\data`. It still needs Python 3.9+ on the PC.
+- The server stops by itself if the Electron app quits or crashes.
+
+## Verification
+90 automated tests, `python verify_static.py` (now also checking the Electron window settings and the packaged files), `npm run smoke`, and a smoke run of the built app.
+
+---
+
 # Open AY Desktop 1.6.0
 
 Balance guard.

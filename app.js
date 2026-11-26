@@ -554,7 +554,11 @@ $("#addFolder").addEventListener("click", () => addFolder($("#folderPath").value
 $("#folderPath").addEventListener("keydown", (e) => { if (e.key === "Enter") addFolder($("#folderPath").value); else if (e.key === "Escape") { e.stopPropagation(); toggleFolderPop(false); $("#input").focus(); } });
 $("#browseFolder").addEventListener("click", async () => {
   const b = $("#browseFolder"); b.disabled = true; b.textContent = "Choosing…";
-  try { const r = await api("/api/pick-folder", { method: "POST" }); if (r.path) addFolder(r.path); } catch (e) { toast(e.message); }
+  try {
+    // In the Electron app this is the native Windows folder dialog; in a browser window the server opens one.
+    const picked = window.openay?.pickFolder ? await window.openay.pickFolder() : (await api("/api/pick-folder", { method: "POST" })).path;
+    if (picked) addFolder(picked);
+  } catch (e) { toast(e.message); }
   finally { b.disabled = false; b.textContent = "Browse…"; }
 });
 $("#folderList").addEventListener("click", (e) => {

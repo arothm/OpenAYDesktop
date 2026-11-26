@@ -1,15 +1,34 @@
 # Open AY Desktop
 
-A lightweight desktop chat app for **Ollama Cloud**. It needs Python 3 (standard library only) and Edge or Chrome. There is no frontend framework, npm installation, or build step.
+A lightweight desktop chat app for **Ollama Cloud**. It runs as an **Electron** desktop app, with a local Python 3 server (standard library only) doing the work. It can also still open in an Edge or Chrome app window without Electron. There is no frontend framework or build step for the interface itself.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.6.0
+- **Version:** 1.7.0
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
 The application was previously named Ollama Desk. Existing chats, folder grants, cached browser data, and API keys remain in the existing `data/` directory. The first time configuration is read, the former last-selected model is preserved as the explicit default model. Legacy local-mode, system-prompt, and temperature options are ignored and removed when settings are next saved.
 
 ## Run
+### Electron app (recommended)
+- **First time:** open a terminal in this folder and run `npm install`.
+  - On npm 11 or newer, Electron's binary isn't downloaded automatically. If `node_modules\electron\dist\electron.exe` is missing afterwards, run `node node_modules\electron\install.js` once.
+- **Start:** double-click **`Open AY Desktop (Electron).cmd`**, or run `npm start`. It uses this folder's `data/`, so your existing chats and settings carry over.
+- **Closing the window:**
+  - with no replies running, it quits;
+  - with replies running, it asks whether to **keep them running in the background**, from a system-tray icon, or **stop them and quit**.
+- **Shutdown:** quitting shuts the local server down. If Electron itself crashes, the server notices and stops within a second.
+- **One copy at a time:** starting the app again brings up the open window. In development it also reuses a server already running from this folder, so two servers never write to the same `data/`.
+- **Locked-down window:** the page has no access to Node or the file system. Only Windows' own folder picker (Browse…) is exposed. Navigation stays inside the app, and https links open in your normal browser.
+- **Startup check:** `npm run smoke` starts the app hidden, checks the window and server, and quits.
+
+### Installer
+`npm run dist` builds `dist\Open AY Desktop Setup <version>.exe`, an unsigned NSIS installer of about 120 MB.
+- **Data:** the installed app keeps its data in `%APPDATA%\Open AY Desktop\data`, not in Program Files. To bring existing chats and settings over, copy this folder's `data\config.json` and `data\chats\` into it.
+- **Python:** the installer doesn't include Python yet. The PC needs Python 3.9 or newer on its PATH, or the `OPENAY_PYTHON` environment variable set to a `python.exe`.
+- **Signing:** Windows SmartScreen may warn about the unsigned installer.
+
+### Without Electron
 - Double-click **`Open AY Desktop.cmd`**. The app opens in its own window. The background server stops about 3 minutes after the last window closes.
 - The old **`Ollama Desk.cmd`** remains as a compatibility launcher.
 - To create or migrate Desktop and Start-menu shortcuts, run:
@@ -171,7 +190,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 
 ## Publishing a release for the updater
 1. Update `APP_VERSION` in `server.py` and the version shown here.
-2. Commit and tag the release as `vX.Y.Z`, for example `v1.6.0`.
+2. Commit and tag the release as `vX.Y.Z`, for example `v1.7.0`. Keep `version` in `package.json` the same (`verify_static.py` checks it).
 3. Publish a non-draft GitHub Release with that tag in `arothm/OpenAYDesktop`.
 4. The app's update check compares numeric semantic versions. A malformed release tag produces a clear error. If no release has been published, GitHub's 404 response is reported as **No published release yet**, not as an update.
 
@@ -186,6 +205,8 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `index.html` — application and dialog markup.
 - `styles.css` — interface styling and light/dark themes.
 - `app.js` — the window: live event stream, rendering, approvals, sessions, trash, and settings.
+- `electron/` — the Electron shell: `main.js` (server lifecycle, window, tray, quit), `preload.js` (folder picker only), `icon.png`.
+- `package.json` — Electron and electron-builder setup (`npm start`, `npm run smoke`, `npm run dist`).
 - `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`).
 - `verify_static.py` — optional static consistency checks.
 - `backups/pre-approved-changes/` — original source copies from before the first approved change set.
@@ -201,4 +222,4 @@ python verify_static.py
 The tests use temporary folders and a temporary local HTTP server. They do not use the app's real chats or configuration. Some symbolic-link tests may be skipped on Windows when the current account cannot create symbolic links.
 
 ## Data
-Chats and settings, including the API key, are saved under `data/` next to `server.py`. The server listens only on 127.0.0.1, checks request origins, sets a restrictive content-security policy, and rejects requests from other websites.
+Chats and settings, including the API key, are saved under `data/` next to `server.py`, or in `%APPDATA%\Open AY Desktop\data` for the installed app. The `OPENAY_DATA_DIR` environment variable overrides the location. The server listens only on 127.0.0.1, checks request origins, sets a restrictive content-security policy, and rejects requests from other websites.

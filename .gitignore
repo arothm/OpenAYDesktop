@@ -23,6 +23,9 @@ Desktop.ini
 .vscode/
 .idea/
 
+# Electron dependencies and build output
+node_modules/
+
 # Release/build artifacts
 build/
 dist/

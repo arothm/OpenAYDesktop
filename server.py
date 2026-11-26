@@ -25,13 +25,14 @@ import skills
 import web
 
 APP_NAME = "Open AY Desktop"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 APP_SLUG = "open-ay-desktop"
 REPOSITORY = "arothm/OpenAYDesktop"
 RELEASES_URL = "https://github.com/%s/releases/latest" % REPOSITORY
 UPDATE_API_URL = "https://api.github.com/repos/%s/releases/latest" % REPOSITORY
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(APP_DIR, "data")
+# OPENAY_DATA_DIR lets the installed Electron app keep data in the user's profile (Program Files isn't writable).
+DATA_DIR = os.path.abspath(os.environ.get("OPENAY_DATA_DIR") or os.path.join(APP_DIR, "data"))
 CHATS_DIR = os.path.join(DATA_DIR, "chats")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 VENDOR_DIR = os.path.join(APP_DIR, "vendor")
@@ -57,6 +58,7 @@ MODEL_INFO_TTL = 3600
 _model_info_cache = {}
 _usage_lock = threading.Lock()
 _last_ping = time.time()
+_httpd = None
 _lock = threading.Lock()
 _chat_locks = {}
 _chat_locks_guard = threading.Lock()
@@ -1085,6 +1087,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(ids, list): raise capabilities.CapabilityError("ids must be a list")
                 self._json({"removed": capabilities.purge_trash(trash, ids)})
             except (capabilities.CapabilityError, OSError) as e: self._json({"error": str(e)}, 400)
+        elif p == "/api/shutdown":  # used by the Electron shell when you quit
+            stopped = [cid for cid in list(ENGINE.statuses()) if ENGINE.stop(cid, wait=5)]
+            self._json({"ok": True, "stopped": len(stopped)})
+            if _httpd: threading.Thread(target=_httpd.shutdown, daemon=True).start()
         elif p == "/api/pick-folder":
             try:
                 exe = sys.executable.replace("python.exe", "pythonw.exe")
@@ -1146,9 +1152,22 @@ def watchdog(httpd, idle_seconds):
         if time.time() - _last_ping > idle_seconds and not ENGINE.any_active(): httpd.shutdown(); return
 
 
+def exit_with_stdin(httpd):
+    """Electron keeps our stdin open; when it closes (Electron quit or crashed), stop the server."""
+    try:
+        while sys.stdin and sys.stdin.read(1):
+            pass
+    except (OSError, ValueError):
+        pass
+    for cid in list(ENGINE.statuses()): ENGINE.stop(cid, wait=5)
+    httpd.shutdown()
+
+
 def main():
+    global _httpd
     ap = argparse.ArgumentParser(description=APP_NAME)
-    ap.add_argument("--port", type=int, default=8765); ap.add_argument("--no-window", action="store_true"); ap.add_argument("--stay", action="store_true"); args = ap.parse_args()
+    ap.add_argument("--port", type=int, default=8765); ap.add_argument("--no-window", action="store_true"); ap.add_argument("--stay", action="store_true")
+    ap.add_argument("--exit-with-stdin", action="store_true", help="stop when stdin closes (used by the Electron shell)"); args = ap.parse_args()
     port = args.port
     while port_in_use(port):
         if running_dir(port) == os.path.normcase(APP_DIR):
@@ -1156,13 +1175,14 @@ def main():
             return
         port += 1
     url = "http://127.0.0.1:%d/" % port; os.makedirs(CHATS_DIR, exist_ok=True)
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler); httpd.daemon_threads = True
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler); httpd.daemon_threads = True; _httpd = httpd
+    if args.exit_with_stdin: threading.Thread(target=exit_with_stdin, args=(httpd,), daemon=True).start()
     if not args.no_window:
         open_window(url)
         if not args.stay:
             global _last_ping
             _last_ping = time.time() + 30; threading.Thread(target=watchdog, args=(httpd, 180), daemon=True).start()
-    if sys.stdout: print("%s %s running at %s" % (APP_NAME, APP_VERSION, url))
+    if sys.stdout: print("%s %s running at %s" % (APP_NAME, APP_VERSION, url), flush=True)
     httpd.serve_forever()
 
 
