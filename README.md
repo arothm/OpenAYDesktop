@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It runs as an **Electron** desktop app, with a local Python 3 server (standard library only) doing the work. It can also still open in an Edge or Chrome app window without Electron. There is no frontend framework or build step for the interface itself.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.8.0
+- **Version:** 1.9.0
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -106,6 +106,7 @@ A chat's folders, permissions and name are **server-owned**. Normal chat saves f
 
 - **Web search and reading web pages:** off by default. See *Web search* below.
 - **Skills for this chat:** tick the skills this chat should follow. See *Skills* below.
+- **Git and GitHub:** off by default. See *Git and GitHub* below.
 - **Allow subtasks:** off by default. See *Subtasks* below.
 
   The model is told to switch only when you explicitly ask. Before switching, the server checks that the model exists in Ollama Cloud. It refuses a model without image support if the chat contains images, and warns when the new model doesn't support tools. The new model answers from the next step of the same reply. Your default model in Settings is not changed.
@@ -136,6 +137,27 @@ A skill is a set of instructions you write once and turn on per chat, for exampl
 - import a Markdown file. An optional `name:` and `description:` header between `---` lines is read.
 
 Turn skills on for a chat in its Session settings. Enabled skills are added to the chat's system instructions on every request, up to 30,000 characters in total and 20,000 per skill. A skill is only text: it can't run code, call tools by itself, or change what the chat is allowed to do. Skills are stored as Markdown files in `data/skills/`.
+
+## Git and GitHub
+The **Git and GitHub** session setting gives the model Git tools for repositories in the chat's shared folders. It has four levels:
+
+| Level | Tools | Your involvement |
+|---|---|---|
+| Off (default) | none | |
+| Read only | `git_status`, `git_diff`, `git_log`, `git_show`, `git_branches`, `gh_pr_list` | none |
+| Read and commit | adds `git_commit` | You review every commit: message, files and full diff. |
+| Read, commit, push and pull requests | adds `git_push` and `gh_pr_create` | You approve every push (remote, branch and commits) and every pull request (title, branches and description). |
+
+Safety rules, enforced by the server (`gittools.py`):
+- **Whole repositories only.** A repository is usable only if its **top folder** is inside a shared folder, so sharing a subfolder doesn't open up the whole repository. Committing needs **Allow edits** on that folder.
+- **No smuggled options.** Git runs without a shell. Branch, remote and commit names are checked so they can't be read as options, and file paths are passed after `--` and must stay inside the repository.
+- **No hidden programs.** External diff programs, text conversion filters and `core.fsmonitor` are switched off, and Git and GitHub CLI prompts are disabled, so nothing can hang waiting for input.
+- **Nothing changes after review.** If the files change after you've reviewed a commit, or the branch moves after you've reviewed a push or pull request, it's refused and nothing happens.
+- **No force-push.** It isn't offered at all, and the model is told never to rewrite history.
+- **Your credentials stay with Git.** Commits use your Git identity, and pushes and pull requests use your existing Git and GitHub CLI (`gh`) sign-in. The app never sees them.
+- **Subtasks** get read-only Git at most.
+
+Pull requests need the [GitHub CLI](https://cli.github.com) installed and signed in (`gh auth login`), and the branch pushed first.
 
 ## Subtasks
 With **Allow subtasks** on, the model can hand self-contained pieces of work to helper chats with `start_subtask`:
@@ -195,7 +217,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 
 ## Publishing a release for the updater
 1. Update `APP_VERSION` in `server.py` and the version shown here.
-2. Commit and tag the release as `vX.Y.Z`, for example `v1.8.0`. Keep `version` in `package.json` the same (`verify_static.py` checks it).
+2. Commit and tag the release as `vX.Y.Z`, for example `v1.9.0`. Keep `version` in `package.json` the same (`verify_static.py` checks it).
 3. Publish a non-draft GitHub Release with that tag in `arothm/OpenAYDesktop`.
 4. The app's update check compares numeric semantic versions. A malformed release tag produces a clear error. If no release has been published, GitHub's 404 response is reported as **No published release yet**, not as an update.
 
@@ -206,6 +228,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `capabilities.py` — session permission policy, file management, trash and versions.
 - `session_actions.py` — session renaming.
 - `web.py` — web search and page reading, with untrusted-content markers.
+- `gittools.py` — Git and GitHub tools: repository checks, the safe command runner, and commit, push and pull request reviews.
 - `skills.py` — skill files: storage, validation and the per-chat prompt.
 - `index.html` — application and dialog markup.
 - `styles.css` — interface styling and light/dark themes.
@@ -213,7 +236,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `electron/` — the Electron shell: `main.js` (server lifecycle, window, tray, quit), `preload.js` (folder picker only), `icon.png`.
 - `package.json` — Electron and electron-builder setup (`npm start`, `npm run smoke`, `npm run dist`).
 - `scripts/fetch-python.js` — downloads and verifies the embeddable Python that the installer bundles.
-- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`).
+- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`, `test_git.py`).
 - `verify_static.py` — optional static consistency checks.
 - `backups/pre-approved-changes/` — original source copies from before the first approved change set.
 

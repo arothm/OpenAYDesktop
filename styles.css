@@ -152,7 +152,7 @@ details.thinking .tbody { white-space: pre-wrap; color: var(--muted); font-size:
 .skill-editor .field { margin-bottom: 12px; }
 .skill-editor-foot { display: flex; gap: 8px; }
 .skill-editor-foot .spacer { flex: 1; }
-.aa-detail { background: var(--code); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 200px; overflow-y: auto; margin: 0 0 12px; }
+.aa-detail { background: var(--code); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 50vh; overflow-y: auto; margin: 0 0 12px; }
 @media (max-width: 720px) { .skills-layout { grid-template-columns: 1fr; } }
 /* Runs, usage and editing */
 .run-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-right: 2px; animation: runpulse 1.2s ease-in-out infinite; }

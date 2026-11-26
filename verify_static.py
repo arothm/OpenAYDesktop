@@ -5,7 +5,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 root = Path(__file__).resolve().parent
-for name in ("server.py", "runs.py", "context_budget.py", "capabilities.py", "session_actions.py", "skills.py", "web.py"):
+for name in ("server.py", "runs.py", "context_budget.py", "capabilities.py", "session_actions.py", "skills.py", "web.py", "gittools.py"):
     ast.parse((root / name).read_text(encoding="utf-8"))
 for test in (root / "tests").glob("test_*.py"):
     ast.parse(test.read_text(encoding="utf-8"))
@@ -63,7 +63,9 @@ for flag in ("contextIsolation: true", "sandbox: true", "nodeIntegration: false"
     assert flag in main_js, "Electron window is missing: " + flag
 for name in pkg["build"]["extraResources"][0]["filter"]:
     assert name.endswith("/**") or (root / name).exists(), "Packaged file is missing: " + name
-assert set(pkg["build"]["extraResources"][0]["filter"]) >= {"server.py", "runs.py", "context_budget.py", "capabilities.py", "session_actions.py", "skills.py", "web.py"}
+packaged = set(pkg["build"]["extraResources"][0]["filter"])
+for module in root.glob("*.py"):  # every app module must ship in the installer
+    assert module.name == "verify_static.py" or module.name in packaged, "Not packaged in the installer: " + module.name
 fetch = (root / "scripts" / "fetch-python.js").read_text(encoding="utf-8")
 assert re.search(r'const SHA256 = "[0-9a-f]{64}"', fetch), "The bundled Python download must be pinned to a SHA-256"
 assert any(e.get("to") == "python" for e in pkg["build"]["extraResources"]), "The installer must bundle Python"

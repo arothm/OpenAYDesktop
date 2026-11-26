@@ -40,6 +40,7 @@ import urllib.error
 
 import capabilities
 import context_budget
+import gittools
 import skills
 import web
 
@@ -642,7 +643,7 @@ class Run:
         srv = self.srv
         name, args = parse_call(call)
         display = (args.get("path") or args.get("source") or args.get("model") or args.get("query") or args.get("url")
-                   or args.get("pattern") or args.get("contains") or "")
+                   or args.get("pattern") or args.get("contains") or args.get("title") or args.get("message") or args.get("repo") or "")
         if name == "search_files" and args.get("contains"):
             display = '"%s"%s' % (args["contains"], (" in " + args["path"]) if args.get("path") else "")
         idx = self.add({"role": "tool", "tool_name": name, "content": "", "display": str(display), "_running": True})
@@ -679,6 +680,10 @@ class Run:
                     self.set_status(self.status)  # tells windows about the new model
             elif name in ("web_search", "web_fetch"):
                 out = self.run_web_tool(idx, name, args)
+            elif name in gittools.REVIEWED:  # commit / push / pull request: the user approves each one
+                data, record = gittools.prepare(srv.saved_tool_config(self.chat_id), name, args)
+                self.ask(idx, data, "The user didn't approve this.")
+                out = gittools.execute(srv.saved_tool_config(self.chat_id), name, args, record)
             else:
                 chat = srv.saved_tool_config(self.chat_id)
                 if name in capabilities.GATED_WHEN_UNTRUSTED and capabilities.policy(chat)["untrusted"]:
@@ -690,7 +695,7 @@ class Run:
             self.update(idx, content=out, _running=None)
         except Denied as e:
             self.update(idx, content=str(e), isError=True, _running=None)
-        except (srv.ToolError, web.WebError, ValueError, OSError) as e:
+        except (srv.ToolError, web.WebError, gittools.GitError, ValueError, OSError) as e:
             self.update(idx, content="Error: %s" % e, isError=True, _running=None)
 
     def ask(self, idx, data, denied_text):

@@ -1,3 +1,26 @@
+# Open AY Desktop 1.9.0
+
+Git and GitHub tools (Phase 5).
+
+## New
+- **Git and GitHub** session setting with four levels: Off, Read only, Read and commit, and Read, commit, push and pull requests.
+  - **Reading** (status, diff, log, show, branches, open pull requests) runs automatically.
+  - **Every commit** opens a review with the message, files and full diff.
+  - **Every push and pull request** needs your approval, and force-push is never offered.
+- **Safety:**
+  - Git works only on repositories whose top folder is shared with the chat.
+  - Git runs without a shell, and names can't be read as extra options.
+  - External diff programs and filesystem-monitor hooks are disabled.
+  - Commits and pushes are refused if anything changed after you reviewed them.
+  - Subtasks get read-only Git at most.
+- Your Git identity and Git and GitHub CLI sign-in are used as they are, and the app never sees credentials.
+
+## Verification
+- 101 automated tests (11 new, on real temporary repositories with a local bare repository as the remote), on Python 3.12 and on the bundled 3.15.2.
+- `python verify_static.py`, which now also checks that every app module ships in the installer.
+
+---
+
 # Open AY Desktop 1.8.0
 
 The installer includes Python.
