@@ -15,6 +15,13 @@ gets a full "snapshot" first, then live events:
   context   {...}                          what the context budget did for this request
   usage     {session, today, context}      token counts after a model response
   untrusted {untrusted}                    the chat read web content (see capabilities.policy)
+  balance_wait {balance, minimumUsd}       the reply paused because the Ollama balance is too low
+
+Balance guard: before every model request a reply checks the Ollama balance (cached, shared).
+At or below the minimum in Settings, a reply that has already worked makes one last request
+without tools to summarize its progress ("wrap-up"), then pauses with status "paused". It
+re-checks about once a minute (or at once on "Check now") and continues when the balance is
+above the minimum again. If the balance can't be read, replies keep working.
 
 Subtasks: a reply can start child chats (start_subtask). Each runs as its own Run; the
 parent starts all subtasks requested in one step, then waits for them and returns each
@@ -49,6 +56,10 @@ MAX_IMAGE_CHARS = 20_000_000  # base64 characters per image
 MAX_SUBTASKS_PER_REPLY = 6
 SUBTASK_RESULT_CHARS = 20_000
 HISTORY = 30                  # finished replies kept for the Activity view
+BALANCE_RECHECK = 60          # seconds between balance checks while paused
+WRAP_UP_NOTE = ("The user's Ollama balance is nearly used up, so this work must pause now. Do not call any tools. "
+                "Write a short summary: what you have done so far, what is left to do, and anything the user should know. "
+                "The work will continue later from this point.")
 
 
 class RunError(Exception):
@@ -96,6 +107,7 @@ class Engine:
         self.runs = {}
         self.channels = {}
         self.history = collections.deque(maxlen=HISTORY)
+        self.balance_event = threading.Event()
 
     def channel(self, chat_id):
         with self.lock:
@@ -144,6 +156,11 @@ class Engine:
         run.thread.start()
         return run
 
+    def balance_changed(self):
+        """Wake paused replies so they re-check the balance now."""
+        self.balance_event.set()
+        self.balance_event = threading.Event()
+
     def finished(self, run):
         self.history.appendleft(run.summary())
 
@@ -174,6 +191,8 @@ class Run:
         self.steps = 0
         self.tokens = 0
         self.outcome = None
+        self.pause = None          # {"balance", "minimumUsd"} while waiting for the balance
+        self.wrapping_up = False
         self.lock = threading.RLock()
         self.cancelled = threading.Event()
         self.status = "running"
@@ -231,7 +250,8 @@ class Run:
         return {"id": a["id"], "kind": a["kind"], "data": a["data"]} if a else None
 
     def snapshot_event(self):
-        return {"type": "snapshot", "chat": copy.deepcopy(self.chat), "status": self.status, "approval": self.public_approval()}
+        return {"type": "snapshot", "chat": copy.deepcopy(self.chat), "status": self.status, "approval": self.public_approval(),
+                "pause": copy.deepcopy(self.pause)}
 
     def publish(self, event):
         self.engine.channel(self.chat_id).publish(event)
@@ -287,6 +307,7 @@ class Run:
             return {"chatId": self.chat_id, "title": self.chat.get("title", ""), "parentId": self.chat.get("parentId"),
                     "model": self.chat.get("model", ""), "status": self.status if self.alive else (self.outcome or "done"),
                     "approval": self.approval["kind"] if self.approval else None, "started": int(self.started * 1000),
+                    "pause": copy.deepcopy(self.pause),
                     "seconds": int((self.ended or time.time()) - self.started), "steps": self.steps, "tokens": self.tokens,
                     "children": list(self.children)}
 
@@ -299,6 +320,7 @@ class Run:
             a, r = self.approval, self.response
         if a:
             a["event"].set()  # result stays False -> denied
+        self.engine.balance_changed()  # a paused reply notices the stop at once (others just re-check once)
         if r is not None:
             try: r.close()  # unblocks the streaming read
             except Exception: pass  # noqa: BLE001
@@ -336,7 +358,7 @@ class Run:
                           "error": "Add your Ollama API key in Settings to use Ollama Cloud."})
                 return
             for step in range(MAX_STEPS):
-                if self.cancelled.is_set():
+                if self.cancelled.is_set() or not self.balance_gate():
                     break
                 idx = self.add({"role": "assistant", "content": "", "thinking": "", "model": self.chat["model"], "_live": True})
                 self.stream_step(idx)
@@ -394,6 +416,8 @@ class Run:
             if specs:
                 body["tools"] = specs
                 system.append(srv.tool_system_note(fcfg, specs, where))
+        if self.wrapping_up:
+            system.append(WRAP_UP_NOTE)
         note = "\n\n".join(x for x in system if x)
         if note:
             if msgs and msgs[0]["role"] == "system":
@@ -496,6 +520,52 @@ class Run:
         if output and final.get("eval_duration"):
             speed = " · %.1f tok/s" % (output / (final["eval_duration"] / 1e9))
         return "%d tokens%s" % (output, speed) if output else ""
+
+    # ------------------------------------------------------------ balance guard
+    def balance_gate(self):
+        """Pause while the Ollama balance is at or below the minimum. False if the reply was stopped meanwhile."""
+        srv = self.srv
+        low, info, minimum = srv.balance_low()
+        if not low:
+            return True
+        if self.steps:  # it has done some work: one last request, without tools, to summarize progress
+            self.wrap_up()
+            if self.cancelled.is_set():
+                return False
+        with self.lock:
+            self.pause = {"balance": info, "minimumUsd": minimum}
+            self.publish({"type": "balance_wait", "balance": info, "minimumUsd": minimum})
+        self.save()
+        self.set_status("paused")
+        while not self.cancelled.is_set():
+            self.engine.balance_event.wait(BALANCE_RECHECK)
+            if self.cancelled.is_set():
+                break
+            low, info, minimum = srv.balance_low(max_age=BALANCE_RECHECK - 10)
+            with self.lock:
+                self.pause = {"balance": info, "minimumUsd": minimum}
+                self.publish({"type": "balance_wait", "balance": info, "minimumUsd": minimum})
+            if not low:
+                break
+        with self.lock:
+            self.pause = None
+            self.publish({"type": "balance_wait", "balance": None, "minimumUsd": minimum})
+        if self.cancelled.is_set():
+            return False
+        if self.steps:  # tell the model why it's continuing after its summary
+            self.add({"role": "user", "auto": True, "content": "[Automatic message] The Ollama balance is above $%.2f again. "
+                      "Continue the work from where you stopped." % minimum})
+        self.set_status("running")
+        return True
+
+    def wrap_up(self):
+        idx = self.add({"role": "assistant", "content": "", "thinking": "", "model": self.chat["model"], "_live": True, "wrapUp": True})
+        tools, self.use_tools, self.wrapping_up = self.use_tools, False, True
+        try:
+            self.stream_step(idx)
+        finally:
+            self.use_tools, self.wrapping_up = tools, False
+        self.save()
 
     # ------------------------------------------------------------ subtasks
     def start_subtask(self, args):

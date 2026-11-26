@@ -82,7 +82,9 @@ function chatOrder(q) {
 function renderChatList() {
   const q = $("#search").value.trim().toLowerCase(); const items = chatOrder(q);
   $("#chatList").innerHTML = items.map((c) => {
-    const run = state.runs[c.id]; const badge = run === "waiting" ? '<span class="run-dot waiting" title="Waiting for your approval"></span>' : run ? '<span class="run-dot" title="Replying…"></span>' : "";
+    const run = state.runs[c.id];
+    const badge = run === "waiting" ? '<span class="run-dot waiting" title="Waiting for your approval"></span>'
+      : run === "paused" ? '<span class="run-dot paused" title="Paused: low Ollama balance"></span>' : run ? '<span class="run-dot" title="Replying…"></span>' : "";
     return `<div class="chat-item ${state.chat?.id === c.id ? "active" : ""} ${c.parentId ? "child" : ""}" data-id="${c.id}" title="${esc(c.model || "")}">${badge}<span class="t">${esc(c.title)}</span><button class="icon-btn del" title="Delete chat">${ICON.trash}</button></div>`;
   }).join("") || `<div style="color:var(--muted);font-size:13px;padding:8px 10px">${q ? "No matches" : "No chats yet"}</div>`;
 }
@@ -94,7 +96,7 @@ function updateChatMeta(chat) {
   const i = state.chats.findIndex((x) => x.id === chat.id); const meta = { id: chat.id, title: chat.title, updated: chat.updated || Date.now(), model: chat.model };
   if (i >= 0) state.chats.splice(i, 1); state.chats.unshift(meta); state.chats.sort((a, b) => b.updated - a.updated); renderChatList();
 }
-const busy = () => state.runStatus === "running" || state.runStatus === "waiting";
+const busy = () => ["running", "waiting", "paused"].includes(state.runStatus);
 async function pollRuns() {
   try {
     const r = await api("/api/runs"); const before = JSON.stringify(state.runs); state.runs = r.runs || {};
@@ -116,6 +118,7 @@ function applyEvent(id, ev) {
   if (ev.type === "snapshot") {
     if (ev.chat.id !== id) return;
     const first = state.chat?.id !== id; state.chat = ev.chat; state.selectedModel = ev.chat.model;
+    state.pause = ev.pause || null; renderPause();
     setRunStatus(ev.status); showApproval(ev.approval); updateModelBtn(); updateFolderBtn(); updateUntrustedBadge(); $("#title").textContent = titleFor(ev.chat);
     renderMessages(); scrollBottom(first); renderUsage(); return;
   }
@@ -138,6 +141,7 @@ function applyEvent(id, ev) {
     case "approval": showApproval(ev.approval); break;
     case "approval_done": closeApproval(ev.id); break;
     case "untrusted": chat.untrusted = ev.untrusted; updateUntrustedBadge(); break;
+    case "balance_wait": state.pause = ev.balance ? { balance: ev.balance, minimumUsd: ev.minimumUsd } : null; if (ev.balance) state.balance = { balance: ev.balance, minimumUsd: ev.minimumUsd }; renderPause(); renderUsage(); break;
     case "context": state.contextInfo = ev; break;
     case "usage": chat.usage = ev.session; chat.context = ev.context; state.today = ev.today; renderUsage(); break;
   }
@@ -151,6 +155,12 @@ function setRunStatus(status) {
 const kTokens = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n || 0);
 function renderUsage() {
   const parts = []; const c = state.chat?.context; const u = state.chat?.usage; const t = state.today;
+  const b = state.balance?.balance; const min = state.balance?.minimumUsd || 0;
+  if (b && "totalUsd" in b) {
+    const cls = min && b.totalUsd <= min ? "low" : min && b.totalUsd <= min + 0.5 ? "warn" : "";
+    const tip = `Ollama balance: $${b.purchasedUsd.toFixed(2)} purchased + $${b.includedUsd.toFixed(2)} plan allowance` + (min ? `. Replies pause at $${min.toFixed(2)}.` : ".");
+    parts.push(`<span class="${cls}" title="${esc(tip)}">Balance $${b.totalUsd.toFixed(2)}</span>`);
+  } else if (b && b.error && min) parts.push(`<span class="warn" title="${esc(b.error)}">Balance unavailable</span>`);
   if (c && c.limit) {
     const pct = Math.round((c.used / c.limit) * 100);
     parts.push(`<span class="${pct >= 80 ? "warn" : ""}" title="Tokens in the last request, out of this model's context window">Context ${kTokens(c.used)} / ${kTokens(c.limit)} (${pct}%)</span>`);
@@ -167,7 +177,7 @@ function renderUsage() {
 async function loadUsage() { try { const u = await api("/api/usage"); state.today = u.today; state.limits = u.limits; renderUsage(); } catch {} }
 
 function newChat() {
-  state.navSeq++; subscribe(null); state.chat = null; state.draftFolders = []; state.editIndex = null; closeApproval(); setRunStatus("idle");
+  state.navSeq++; subscribe(null); state.chat = null; state.pause = null; renderPause(); state.draftFolders = []; state.editIndex = null; closeApproval(); setRunStatus("idle");
   state.selectedModel = state.config.defaultModel || state.models[0]?.name || "";
   renderMessages(); renderChatList(); updateModelBtn(); updateFolderBtn(); updateUntrustedBadge(); toggleFolderPop(false); renderUsage(); $("#title").textContent = ""; $("#input").focus();
 }
@@ -175,7 +185,7 @@ async function openChat(id) {
   const ticket = ++state.navSeq; let chat;
   try { chat = await api("/api/chats/" + id); } catch (e) { toast(e.message); return; }
   if (ticket !== state.navSeq) return;
-  closeApproval(); state.editIndex = null; state.chat = chat; state.selectedModel = chat.model; setRunStatus(state.runs[id] || "idle");
+  closeApproval(); state.pause = null; renderPause(); state.editIndex = null; state.chat = chat; state.selectedModel = chat.model; setRunStatus(state.runs[id] || "idle");
   updateModelBtn(); renderMessages(); renderChatList(); updateFolderBtn(); updateUntrustedBadge(); toggleFolderPop(false); renderUsage(); $("#title").textContent = titleFor(chat); scrollBottom(true);
   subscribe(id);  // the snapshot that follows brings any live run state
 }
@@ -200,6 +210,7 @@ function toolHTML(m, idx) {
 }
 function msgHTML(m, idx, isLast) {
   if (m.role === "system") return ""; if (m.role === "tool") return toolHTML(m, idx);
+  if (m.role === "user" && m.auto) return `<div class="msg user auto" data-idx="${idx}"><div class="bubble">${esc(m.content)}</div></div>`;
   if (m.role === "user") {
     const imgs = (m.images || []).map((b) => `<img src="data:image/*;base64,${b}">`).join("");
     return `<div class="msg user" data-idx="${idx}">${imgs ? `<div class="imgs">${imgs}</div>` : ""}<div class="bubble">${esc(m.content)}</div><div class="actions"><button class="icon-btn act-copy" title="Copy">${ICON.copy}</button><button class="icon-btn act-edit" title="Edit & resend">${ICON.edit}</button></div></div>`;
@@ -207,7 +218,7 @@ function msgHTML(m, idx, isLast) {
   const thinking = m.thinking ? `<details class="thinking" ${m._live && !m.content ? "open" : ""}><summary>${m._live && !m.content ? "Thinking…" : "Thought process"}</summary><div class="tbody">${esc(m.thinking)}</div></details>` : "";
   const stats = m.stats ? `<span>· ${m.stats}</span>` : ""; const body = m.content ? renderMarkdown(m.content) : "";
   if (m.tool_calls?.length && !m._live) return `<div class="msg assistant step" data-idx="${idx}" style="margin-bottom:4px">${thinking}${body ? `<div class="content">${body}</div>` : ""}</div>`;
-  return `<div class="msg assistant ${isLast ? "last" : ""}" data-idx="${idx}"><div class="meta"><span>${esc(m.model || "")}</span>${stats}</div>${thinking}<div class="content ${m._live ? "cursor" : ""}">${body}</div>${m.notice ? `<div class="notice">${esc(m.notice)}</div>` : ""}${m.error ? `<div class="err">${linkify(m.error)}</div>` : ""}${m._live ? "" : `<div class="actions"><button class="icon-btn act-copy" title="Copy">${ICON.copy}</button>${isLast ? `<button class="icon-btn act-regen" title="Regenerate">${ICON.redo}</button>` : ""}</div>`}</div>`;
+  return `<div class="msg assistant ${isLast ? "last" : ""}" data-idx="${idx}"><div class="meta"><span>${esc(m.model || "")}</span>${stats}${m.wrapUp ? '<span class="wrapup-tag" title="Low balance: the model summarized its progress before pausing">wrap-up</span>' : ""}</div>${thinking}<div class="content ${m._live ? "cursor" : ""}">${body}</div>${m.notice ? `<div class="notice">${esc(m.notice)}</div>` : ""}${m.error ? `<div class="err">${linkify(m.error)}</div>` : ""}${m._live ? "" : `<div class="actions"><button class="icon-btn act-copy" title="Copy">${ICON.copy}</button>${isLast ? `<button class="icon-btn act-regen" title="Regenerate">${ICON.redo}</button>` : ""}</div>`}</div>`;
 }
 function renderMessages() {
   const box = $("#messages"); const msgs = state.chat?.messages || [];
@@ -323,7 +334,7 @@ function openSettings() {
   $("#apiKey").placeholder = c.hasApiKey ? `Saved ${c.apiKeyHint || "(from OLLAMA_API_KEY)"} - leave blank to keep` : "Paste key…";
   $("#clearKey").disabled = !c.hasApiKey; $("#versionLabel").textContent = `Open AY Desktop ${c.version || ""}`;
   $("#updateStatus").textContent = `Checks github.com/${c.repository || "arothm/OpenAYDesktop"}`; $("#openUpdate").hidden = true;
-  $("#dailyLimit").value = c.dailyTokenLimit || 0; $("#chatLimit").value = c.chatTokenLimit || 0; $("#maxRuns").value = c.maxConcurrentRuns || 4;
+  $("#dailyLimit").value = c.dailyTokenLimit || 0; $("#chatLimit").value = c.chatTokenLimit || 0; $("#maxRuns").value = c.maxConcurrentRuns || 4; $("#minBalance").value = c.minBalanceUsd ?? 1;
   populateDefaultModels(); $("#modalBack").classList.add("open");
 }
 function populateDefaultModels() {
@@ -343,7 +354,7 @@ async function checkUpdates() {
 }
 async function saveSettings() {
   const body = { defaultModel: $("#defaultModel").value, dailyTokenLimit: Number($("#dailyLimit").value || 0),
-                 chatTokenLimit: Number($("#chatLimit").value || 0), maxConcurrentRuns: Number($("#maxRuns").value || 4) };
+                 chatTokenLimit: Number($("#chatLimit").value || 0), maxConcurrentRuns: Number($("#maxRuns").value || 4), minBalanceUsd: Number($("#minBalance").value || 0) };
   const key = $("#apiKey").value.trim(); if (key) body.apiKey = key;
   if (state.clearKey && !key) body.clearApiKey = true;
   try {
@@ -439,8 +450,8 @@ function closeActivity() { clearInterval(activityTimer); $("#activityBack").clas
 const ago = (s) => s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
 function activityRow(a, live) {
   const parent = a.parentId && state.chats.find((c) => c.id === a.parentId);
-  const label = live ? (a.approval ? "waiting for you" : a.status) : a.status;
-  const cls = live ? (a.approval ? "waiting" : "running") : a.status;
+  const label = live ? (a.approval ? "waiting for you" : a.status === "paused" ? "paused: low balance" : a.status) : a.status;
+  const cls = live ? (a.approval ? "waiting" : a.status === "paused" ? "paused" : "running") : a.status;
   const meta = [a.model, ago(a.seconds), `${a.steps} step${a.steps === 1 ? "" : "s"}`, `${kTokens(a.tokens)} tokens`];
   if (parent) meta.push("subtask of " + parent.title); if (a.children?.length) meta.push(`${a.children.length} subtask${a.children.length > 1 ? "s" : ""}`);
   return `<div class="act-row" data-chat="${esc(a.chatId)}"><span class="st ${cls}">${esc(label)}</span><div class="info"><div class="n">${esc(a.title || "Untitled")}</div><div class="m">${esc(meta.join(" · "))}</div></div>
@@ -615,8 +626,22 @@ addEventListener("keydown", (e) => {
 });
 setInterval(() => fetch("/api/ping").catch(() => {}), 5000); fetch("/api/ping").catch(() => {});
 setInterval(pollRuns, 3000);
+async function loadBalance(force) {
+  try { state.balance = await api(force ? "/api/balance/check" : "/api/balance", force ? { method: "POST", body: "{}" } : undefined); renderUsage(); renderPause(); } catch {}
+}
+setInterval(() => loadBalance(false), 60000);
+function renderPause() {
+  const p = state.pause; $("#pauseBanner").hidden = !p; if (!p) return;
+  const b = p.balance || {}; const min = (p.minimumUsd || 0).toFixed(2);
+  $("#pauseText").textContent = "totalUsd" in b
+    ? `Your balance is $${b.totalUsd.toFixed(2)}, at or below the $${min} you set. Recharge on ollama.com and this reply continues by itself (it checks about once a minute).`
+    : `Waiting for the balance to be above $${min}. ${b.error || ""}`;
+}
+$("#pauseCheck").addEventListener("click", () => loadBalance(true));
+$("#pauseStop").addEventListener("click", stop);
+$("#pauseRecharge").addEventListener("click", () => window.open("https://ollama.com/settings", "_blank", "noopener"));
 $("#editCancel").addEventListener("click", () => { state.editIndex = null; updateEditBanner(); $("#input").value = ""; state.attachments = []; renderAttachments(); autoGrow(); });
 (async function init() {
-  updateSendBtn(); await loadConfig().catch((e) => toast(e.message)); await Promise.all([loadModels(), loadChats(), pollRuns(), loadUsage()]); renderMessages();
+  updateSendBtn(); await loadConfig().catch((e) => toast(e.message)); await Promise.all([loadModels(), loadChats(), pollRuns(), loadUsage(), loadBalance(false)]); renderMessages();
   if (document.activeElement === document.body) $("#input").focus();
 })();

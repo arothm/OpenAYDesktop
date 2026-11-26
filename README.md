@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It needs Python 3 (standard library only) and Edge or Chrome. There is no frontend framework, npm installation, or build step.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.5.0
+- **Version:** 1.6.0
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -30,7 +30,9 @@ The Settings dialog contains only:
    - **Tokens per day** and **Tokens per chat** count tokens sent and generated, as Ollama reports them; 0 turns a limit off. When a limit is reached, replies stop with a message until you raise the limit.
    - **Replies at the same time** (default 4) caps how many replies, subtasks included, can run at once.
 
-   The usage line under the message box shows today's tokens against the daily limit.
+   - **Pause at balance ($)** (default 1, 0 = off): see *Balance guard* below.
+
+   The usage line under the message box shows your Ollama balance and today's tokens against the daily limit.
 4. **Check for Updates** — checks the latest release at https://github.com/arothm/OpenAYDesktop/releases using GitHub's public API. It reports the installed version, update availability, no-published-release state, or a connection error. If an update exists, **Open Latest Release** opens that release page. Nothing is downloaded or installed automatically.
 
 The app no longer supports local Ollama, a custom Ollama URL, or local model discovery. The Ollama desktop app is not required. The header still exposes the model picker and thinking/reasoning effort.
@@ -119,6 +121,16 @@ With **Allow subtasks** on, the model can hand self-contained pieces of work to 
 - **Bounded.** At most 6 subtasks per reply, and they count toward the limits in Settings.
 - **Stopped and deleted with the parent.** Stopping the parent stops its subtasks, and deleting the parent deletes them.
 
+## Balance guard
+The app reads your Ollama account balance from `GET https://ollama.com/api/balance`, using your API key. The balance is your remaining plan allowance plus purchased credits, and it's shown in the usage line under the message box, in amber when it's within $0.50 of your pause amount and in red at or below it. The server re-checks it before every model request. The value is cached for 30 seconds and shared by all replies, because Ollama allows about 10 balance checks a minute.
+
+When the balance is **at or below the pause amount** set in Settings (default $1):
+- **Every running reply wraps up.** It finishes the step it's on. A reply that has already done some work then makes **one last short request without tools**, asking the model to summarise what it did and what's left. That summary is marked *wrap-up*. A reply that hasn't started yet doesn't spend anything.
+- **The reply pauses.** The chat shows a banner with **Recharge…**, **Check now** and **Stop**, the sidebar shows a red dot, and Activity lists it as *paused: low balance*. New messages also pause until the balance is back up.
+- **It continues by itself.** It re-checks about once a minute, or at once when you click **Check now**. When the balance is above the pause amount again, it adds an automatic note ("continue the work from where you stopped") and carries on.
+
+If the balance can't be read, for example because Ollama changes its API, replies keep working and the usage line says *Balance unavailable*. The wrap-up request itself costs a little, so the pause amount works as a reserve, not a hard cap.
+
 ## Activity
 **⚡** in the sidebar lists every running reply across all chats, subtasks included. For each one it shows the status (running, or waiting for you), model, time, steps and tokens, with **Open** and **Stop** buttons. Below that are the most recently finished replies and how they ended (done, stopped, or error).
 
@@ -159,7 +171,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 
 ## Publishing a release for the updater
 1. Update `APP_VERSION` in `server.py` and the version shown here.
-2. Commit and tag the release as `vX.Y.Z`, for example `v1.5.0`.
+2. Commit and tag the release as `vX.Y.Z`, for example `v1.6.0`.
 3. Publish a non-draft GitHub Release with that tag in `arothm/OpenAYDesktop`.
 4. The app's update check compares numeric semantic versions. A malformed release tag produces a clear error. If no release has been published, GitHub's 404 response is reported as **No published release yet**, not as an update.
 
@@ -174,7 +186,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `index.html` — application and dialog markup.
 - `styles.css` — interface styling and light/dark themes.
 - `app.js` — the window: live event stream, rendering, approvals, sessions, trash, and settings.
-- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`).
+- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`).
 - `verify_static.py` — optional static consistency checks.
 - `backups/pre-approved-changes/` — original source copies from before the first approved change set.
 

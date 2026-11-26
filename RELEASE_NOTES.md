@@ -1,3 +1,17 @@
+# Open AY Desktop 1.6.0
+
+Balance guard.
+
+## New
+- **Your Ollama balance** (plan allowance plus purchased credits) shows under the message box, read from Ollama's balance API.
+- **Pause at balance** (Settings, default $1): at or below it, every running reply finishes its current step, writes a short wrap-up of what it did and what's left, and pauses. New messages also pause. Replies continue by themselves once the balance is above the pause amount again. **Check now** re-checks at once.
+- Paused chats show a banner, a red sidebar dot, and "paused: low balance" in Activity.
+
+## Verification
+90 automated tests (7 new for reading the balance, wrap-up, pause, resume and stop) and `python verify_static.py`.
+
+---
+
 # Open AY Desktop 1.5.0
 
 Subtasks, limits and an Activity view (Phase 4).

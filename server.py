@@ -25,7 +25,7 @@ import skills
 import web
 
 APP_NAME = "Open AY Desktop"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 APP_SLUG = "open-ay-desktop"
 REPOSITORY = "arothm/OpenAYDesktop"
 RELEASES_URL = "https://github.com/%s/releases/latest" % REPOSITORY
@@ -37,8 +37,9 @@ CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 VENDOR_DIR = os.path.join(APP_DIR, "vendor")
 CLOUD_URL = "https://ollama.com"
 # Limits: 0 turns a token limit off. maxConcurrentRuns counts every running reply, subtasks included.
+# minBalanceUsd: replies wrap up and pause when the Ollama balance is at or below this (0 = off).
 DEFAULT_CONFIG = {"apiKey": "", "defaultModel": "", "think": "default",
-                  "dailyTokenLimit": 0, "chatTokenLimit": 0, "maxConcurrentRuns": 4}
+                  "dailyTokenLimit": 0, "chatTokenLimit": 0, "maxConcurrentRuns": 4, "minBalanceUsd": 1.0}
 LIMIT_RANGES = {"dailyTokenLimit": (0, 10_000_000_000), "chatTokenLimit": (0, 10_000_000_000), "maxConcurrentRuns": (1, 20)}
 VENDOR_FILES = {
     "marked.min.js": {"url": "https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js", "type": "application/javascript; charset=utf-8"},
@@ -711,6 +712,57 @@ def tool_system_note(fcfg, specs, where):
     return note
 
 
+# Balance (Ollama account credits)
+
+BALANCE_TTL = 30          # Ollama allows about 10 balance requests a minute; all replies share one cached value
+_balance = {"at": 0.0, "info": None}
+_balance_lock = threading.Lock()
+
+
+def _usd(value):
+    try: return round(float(value), 4)
+    except (TypeError, ValueError): return 0.0
+
+
+def fetch_balance():
+    """GET https://ollama.com/api/balance -> remaining plan allowance plus purchased credits, in USD."""
+    with upstream("/api/balance", None, timeout=20) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    included, purchased = data.get("included") or {}, data.get("purchased") or {}
+    info = {"includedUsd": _usd(included.get("balance_usd")), "allowanceUsd": _usd(included.get("allowance_usd")),
+            "purchasedUsd": _usd(purchased.get("balance_usd")), "periodUntil": (included.get("period") or {}).get("until")}
+    info["totalUsd"] = round(info["includedUsd"] + info["purchasedUsd"], 4)
+    return info
+
+
+def balance(max_age=BALANCE_TTL, force=False):
+    """Cached balance info; {"error": ...} (with the last known total, if any) when it can't be read."""
+    now = time.time()
+    with _balance_lock:
+        cached = _balance["info"]
+        if cached and not force and now - _balance["at"] < max_age:
+            return dict(cached)
+        if not api_key(load_config()):
+            return {"error": "No API key"}
+        try:
+            info = fetch_balance()
+        except Exception as e:  # noqa: BLE001 - shown in the window; replies keep working (see balance_low)
+            info = {"error": "Couldn't read the Ollama balance: %s" % (http_error_text(e) if isinstance(e, urllib.error.HTTPError) else e)}
+            if cached and "totalUsd" in cached: info["lastTotalUsd"] = cached["totalUsd"]
+        info["checkedAt"] = int(now * 1000)
+        _balance["at"], _balance["info"] = now, info
+        return dict(info)
+
+
+def balance_low(max_age=BALANCE_TTL, force=False):
+    """(low, info, minimum). Low only when the guard is on and the balance was read and is at or below the minimum."""
+    minimum = float(load_config().get("minBalanceUsd") or 0)
+    if minimum <= 0:
+        return False, None, minimum
+    info = balance(max_age, force)
+    return ("totalUsd" in info and info["totalUsd"] <= minimum), info, minimum
+
+
 # Usage
 
 def usage_path():
@@ -918,6 +970,9 @@ class Handler(BaseHTTPRequestHandler):
             cfg = load_config(); out = usage_summary()
             out["limits"] = {k: cfg.get(k, DEFAULT_CONFIG[k]) for k in LIMIT_RANGES}; self._json(out)
         elif p == "/api/activity": self._json(ENGINE.activity())
+        elif p == "/api/balance":
+            low, info, minimum = balance_low()
+            self._json({"balance": info or balance(), "minimumUsd": minimum, "low": low})
         elif p == "/api/skills": self._json({"skills": skills.list_all(skills_root())})
         elif p.startswith("/api/skills/"):
             try: self._json(skills.get(skills_root(), p[len("/api/skills/"):]))
@@ -971,6 +1026,11 @@ class Handler(BaseHTTPRequestHandler):
                         except (TypeError, ValueError): return self._json({"error": "%s must be a whole number." % k}, 400)
                         if not low <= value <= high: return self._json({"error": "%s must be between %d and %d." % (k, low, high)}, 400)
                         cfg[k] = value
+                if "minBalanceUsd" in body:
+                    try: value = round(float(body["minBalanceUsd"]), 2)
+                    except (TypeError, ValueError): return self._json({"error": "The minimum balance must be a number."}, 400)
+                    if not 0 <= value <= 1000: return self._json({"error": "The minimum balance must be between 0 and 1000."}, 400)
+                    cfg["minBalanceUsd"] = value
                 if body.get("clearApiKey"): cfg["apiKey"] = ""
                 save_config(cfg)
             self._json(public_config(load_config()))
@@ -981,6 +1041,9 @@ class Handler(BaseHTTPRequestHandler):
             try: ENGINE.start(body.get("chatId", ""), body); self._json({"ok": True})
             except runs.RunError as e: self._json({"error": str(e)}, 409 if "already running" in str(e) else 400)
             except (OSError, ValueError) as e: self._json({"error": str(e) or "bad request"}, 400)
+        elif p == "/api/balance/check":  # "Check now": refresh and wake paused replies
+            low, info, minimum = balance_low(force=True); ENGINE.balance_changed()
+            self._json({"balance": info or balance(), "minimumUsd": minimum, "low": low})
         elif p == "/api/runs/stop":
             self._json({"stopped": ENGINE.stop(body.get("chatId", ""))})
         elif p == "/api/runs/approve":
