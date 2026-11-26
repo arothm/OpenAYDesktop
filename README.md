@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It runs as an **Electron** desktop app, with a local Python 3 server (standard library only) doing the work. It can also still open in an Edge or Chrome app window without Electron. There is no frontend framework or build step for the interface itself.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.7.0
+- **Version:** 1.8.0
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -23,9 +23,14 @@ The application was previously named Ollama Desk. Existing chats, folder grants,
 - **Startup check:** `npm run smoke` starts the app hidden, checks the window and server, and quits.
 
 ### Installer
-`npm run dist` builds `dist\Open AY Desktop Setup <version>.exe`, an unsigned NSIS installer of about 120 MB.
+`npm run dist` builds `dist\Open AY Desktop Setup <version>.exe`, an unsigned NSIS installer of about 127 MB. **It includes its own Python**, so the PC doesn't need Python installed:
+- **Download:** `scripts/fetch-python.js` downloads the official Windows embeddable Python (currently 3.15.2) from python.org, about 14 MB. It caches it in `build/`.
+- **Check:** it verifies the download against the SHA-256 pinned in the script, then unpacks it into the installer. To update Python, change `VERSION` and `SHA256` there.
+- **Choice of Python:** the installed app uses its bundled Python first. You can point `OPENAY_PYTHON` at a different `python.exe` to override it, and a system Python is used only if the bundled one is missing.
+- **Tested:** the full test suite also passes on the bundled Python (`build\python\python.exe -m unittest discover -s tests`).
+- **Running from source:** `npm start` still uses the Python installed on your PC.
+
 - **Data:** the installed app keeps its data in `%APPDATA%\Open AY Desktop\data`, not in Program Files. To bring existing chats and settings over, copy this folder's `data\config.json` and `data\chats\` into it.
-- **Python:** the installer doesn't include Python yet. The PC needs Python 3.9 or newer on its PATH, or the `OPENAY_PYTHON` environment variable set to a `python.exe`.
 - **Signing:** Windows SmartScreen may warn about the unsigned installer.
 
 ### Without Electron
@@ -190,7 +195,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 
 ## Publishing a release for the updater
 1. Update `APP_VERSION` in `server.py` and the version shown here.
-2. Commit and tag the release as `vX.Y.Z`, for example `v1.7.0`. Keep `version` in `package.json` the same (`verify_static.py` checks it).
+2. Commit and tag the release as `vX.Y.Z`, for example `v1.8.0`. Keep `version` in `package.json` the same (`verify_static.py` checks it).
 3. Publish a non-draft GitHub Release with that tag in `arothm/OpenAYDesktop`.
 4. The app's update check compares numeric semantic versions. A malformed release tag produces a clear error. If no release has been published, GitHub's 404 response is reported as **No published release yet**, not as an update.
 
@@ -207,6 +212,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `app.js` — the window: live event stream, rendering, approvals, sessions, trash, and settings.
 - `electron/` — the Electron shell: `main.js` (server lifecycle, window, tray, quit), `preload.js` (folder picker only), `icon.png`.
 - `package.json` — Electron and electron-builder setup (`npm start`, `npm run smoke`, `npm run dist`).
+- `scripts/fetch-python.js` — downloads and verifies the embeddable Python that the installer bundles.
 - `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`).
 - `verify_static.py` — optional static consistency checks.
 - `backups/pre-approved-changes/` — original source copies from before the first approved change set.

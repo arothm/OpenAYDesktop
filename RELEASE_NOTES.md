@@ -1,3 +1,22 @@
+# Open AY Desktop 1.8.0
+
+The installer includes Python.
+
+## New
+- **No Python needed on the PC:** the Windows installer bundles the official embeddable Python 3.15.2 from python.org. The build downloads it once, verifies it against a pinned SHA-256, and the installed app uses it automatically. `OPENAY_PYTHON` can still point at a different Python.
+- `npm run dist` fetches Python as part of the build, and `npm run fetch-python` fetches it on its own.
+
+## Fixes
+- `server.py` now adds its own folder to Python's import path, which the embeddable Python doesn't do.
+
+## Verification
+- 90 automated tests on Python 3.12 and on the bundled Python 3.15.2.
+- HTTPS to ollama.com from the bundled Python.
+- A smoke run of the packaged app with no Python on the PATH.
+- `python verify_static.py`, which also checks that the Python download is pinned and bundled.
+
+---
+
 # Open AY Desktop 1.7.0
 
 Electron desktop app.

@@ -10,6 +10,7 @@
 //     because it watches its stdin (--exit-with-stdin).
 const { app, BrowserWindow, Tray, Menu, dialog, shell, ipcMain, nativeImage, session } = require("electron");
 const { spawn, spawnSync } = require("child_process");
+const fs = require("fs");
 const net = require("net");
 const path = require("path");
 
@@ -25,6 +26,7 @@ let win = null;
 let tray = null;
 let quitting = false;
 let serverLog = "";
+let pythonUsed = "";
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -50,8 +52,10 @@ async function start() {
 
 // ---------------------------------------------------------------- the Python server
 function findPython() {
-  // pythonw avoids a console window; OPENAY_PYTHON can point at a specific interpreter.
-  const candidates = [process.env.OPENAY_PYTHON, "pythonw", "python", "py"].filter(Boolean);
+  // Order: OPENAY_PYTHON (if set), the Python bundled with the installer (scripts/fetch-python.js),
+  // then a system install. pythonw avoids a console window.
+  const bundled = DEV ? null : path.join(process.resourcesPath, "python", "pythonw.exe");
+  const candidates = [process.env.OPENAY_PYTHON, bundled && fs.existsSync(bundled) ? bundled : null, "pythonw", "python", "py"].filter(Boolean);
   for (const cmd of candidates) {
     const pre = cmd === "py" ? ["-3"] : [];
     const r = spawnSync(cmd, [...pre, "-c", "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)"], { windowsHide: true });
@@ -82,7 +86,9 @@ async function findRunningServer() {
 
 async function startServer() {
   const py = findPython();
-  if (!py) throw new Error("Python 3.9 or newer was not found.\n\nInstall it from python.org and tick \"Add python.exe to PATH\", or set OPENAY_PYTHON to a python.exe path.");
+  if (!py) throw new Error("Python 3.9 or newer was not found.\n\nInstall it from python.org and tick \"Add python.exe to PATH\", or set OPENAY_PYTHON to a python.exe path."
+    + (DEV ? "" : "\n\nThe installer normally includes Python; reinstalling Open AY Desktop may fix this."));
+  pythonUsed = py.cmd;
   const port = await freePort();
   const env = { ...process.env, PYTHONDONTWRITEBYTECODE: "1", PYTHONIOENCODING: "utf-8" };
   if (!DEV) env.OPENAY_DATA_DIR = path.join(app.getPath("userData"), "data");  // Program Files isn't writable
@@ -179,6 +185,6 @@ async function smokeReport() {
   const page = await win.webContents.executeJavaScript(
     "JSON.stringify({ title: document.title, bridge: Boolean(window.openay && window.openay.isElectron), node: typeof require })");
   const apiInfo = await info(origin);
-  process.stdout.write(`SMOKE ${JSON.stringify({ origin, ownServer: Boolean(server), page: JSON.parse(page), server: apiInfo })}\n`);
+  process.stdout.write(`SMOKE ${JSON.stringify({ origin, ownServer: Boolean(server), python: pythonUsed, page: JSON.parse(page), server: apiInfo })}\n`);
   quit();
 }

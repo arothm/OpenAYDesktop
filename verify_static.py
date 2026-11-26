@@ -64,5 +64,9 @@ for flag in ("contextIsolation: true", "sandbox: true", "nodeIntegration: false"
 for name in pkg["build"]["extraResources"][0]["filter"]:
     assert name.endswith("/**") or (root / name).exists(), "Packaged file is missing: " + name
 assert set(pkg["build"]["extraResources"][0]["filter"]) >= {"server.py", "runs.py", "context_budget.py", "capabilities.py", "session_actions.py", "skills.py", "web.py"}
-print("Electron shell: version %s, locked-down window, packaged server files: OK" % version)
+fetch = (root / "scripts" / "fetch-python.js").read_text(encoding="utf-8")
+assert re.search(r'const SHA256 = "[0-9a-f]{64}"', fetch), "The bundled Python download must be pinned to a SHA-256"
+assert any(e.get("to") == "python" for e in pkg["build"]["extraResources"]), "The installer must bundle Python"
+assert "fetch-python.js" in pkg["scripts"]["dist"]
+print("Electron shell: version %s, locked-down window, packaged server files and pinned Python: OK" % version)
 print("Static checks passed. Run the regression suite separately; this script does not launch a browser or test GitHub.")
