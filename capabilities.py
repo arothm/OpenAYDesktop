@@ -13,7 +13,7 @@ import uuid
 # subtasks: the session may start helper chats that run in parallel and report back (off by default).
 # git: "off" | "read" | "commit" | "push" (see gittools.py).
 DEFAULT_POLICY = {"editMode": "review", "fileManage": False, "deleteFiles": False, "modelControl": "ask", "webSearch": False,
-                  "subtasks": False, "git": "off"}
+                  "subtasks": False, "git": "off", "commands": False}
 GIT_MODES = ("off", "read", "commit", "push")
 EDIT_MODES = {"review", "auto"}
 # After a session has read untrusted content (web pages), these need the user's approval each time.
@@ -44,6 +44,7 @@ def policy(chat):
     p["fileManage"] = bool(p["fileManage"]) and writable
     p["deleteFiles"] = bool(p["deleteFiles"]) and writable
     p["webSearch"] = bool(p["webSearch"])
+    p["commands"] = bool(p["commands"]) and writable and not chat.get("parentId")  # needs a writable folder; never in subtasks
     if p["git"] not in GIT_MODES:
         p["git"] = "off"
     p["subtasks"] = bool(p["subtasks"]) and not chat.get("parentId")  # one level only: subtasks can't start subtasks
@@ -62,7 +63,7 @@ def child_capabilities(parent):
     p = policy(parent)
     return {"editMode": p["editMode"], "fileManage": p["fileManage"], "deleteFiles": p["deleteFiles"],
             "modelControl": "fixed", "webSearch": p["webSearch"], "subtasks": False,
-            "git": "read" if p["git"] != "off" else "off"}  # subtasks never commit or push
+            "git": "read" if p["git"] != "off" else "off", "commands": False}  # subtasks never commit, push or run commands
 
 
 def grants(chat):
@@ -347,7 +348,7 @@ def clean_capabilities(value):
     if "git" in value:
         if value["git"] not in GIT_MODES: raise CapabilityError("Unknown Git mode.")
         out["git"] = value["git"]
-    for key in ("fileManage", "deleteFiles", "webSearch", "subtasks"):
+    for key in ("fileManage", "deleteFiles", "webSearch", "subtasks", "commands"):
         if key in value:
             if not isinstance(value[key], bool): raise CapabilityError("%s must be true or false." % key)
             out[key] = value[key]

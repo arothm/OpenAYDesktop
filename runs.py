@@ -39,6 +39,7 @@ import time
 import urllib.error
 
 import capabilities
+import commands
 import context_budget
 import gittools
 import skills
@@ -680,6 +681,16 @@ class Run:
                     self.set_status(self.status)  # tells windows about the new model
             elif name in ("web_search", "web_fetch"):
                 out = self.run_web_tool(idx, name, args)
+            elif name == "run_command":
+                chat = srv.saved_tool_config(self.chat_id)
+                plan = commands.prepare(chat, args, srv.load_config().get("allowedCommands") or [])
+                self.update(idx, display=plan["line"])
+                if not plan["allowedBy"] or capabilities.policy(chat)["untrusted"]:
+                    why = ("This chat has read web content, so every command needs your approval." if plan["allowedBy"] else
+                           "This command isn't on your allowed list (Settings). It runs with your Windows account and can reach anything you can.")
+                    self.ask(idx, {"title": "Run this command?", "detail": "Folder: %s\nCommand: %s\nTime limit: %ds" % (plan["cwd"], plan["line"], plan["timeout"]),
+                                   "why": why}, "The user didn't allow this command.")
+                out = commands.execute(plan, self.cancelled)
             elif name in gittools.REVIEWED:  # commit / push / pull request: the user approves each one
                 data, record = gittools.prepare(srv.saved_tool_config(self.chat_id), name, args)
                 self.ask(idx, data, "The user didn't approve this.")
@@ -695,7 +706,7 @@ class Run:
             self.update(idx, content=out, _running=None)
         except Denied as e:
             self.update(idx, content=str(e), isError=True, _running=None)
-        except (srv.ToolError, web.WebError, gittools.GitError, ValueError, OSError) as e:
+        except (srv.ToolError, web.WebError, gittools.GitError, commands.CommandError, ValueError, OSError) as e:
             self.update(idx, content="Error: %s" % e, isError=True, _running=None)
 
     def ask(self, idx, data, denied_text):

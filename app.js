@@ -10,7 +10,7 @@ const state = {
   clearKey: false, updateUrl: "", sessionDraft: null,
   es: null, runStatus: "idle", runs: {}, editIndex: null, usage: null, today: null,
 };
-const DEFAULT_CAPABILITIES = { editMode: "review", fileManage: false, deleteFiles: false, modelControl: "ask", webSearch: false, subtasks: false, git: "off" };
+const DEFAULT_CAPABILITIES = { editMode: "review", fileManage: false, deleteFiles: false, modelControl: "ask", webSearch: false, subtasks: false, git: "off", commands: false };
 const api = async (path, opts = {}) => {
   const r = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
   const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.statusText); return j;
@@ -199,7 +199,7 @@ async function deleteChat(id) {
 }
 
 // Rendering
-const TOOL_LABEL = { list_directory: "Listed folder", read_file: "Read file", search_files: "Searched files", write_file: "Wrote file", edit_file: "Edited file", create_folder: "Created folder", copy_path: "Copied item", move_path: "Moved/renamed item", delete_path: "Moved to trash", restore_path: "Restored item", set_session_model: "Changed model", web_search: "Searched the web", web_fetch: "Read web page", start_subtask: "Subtask", git_status: "Git status", git_diff: "Git diff", git_log: "Git log", git_show: "Git show", git_branches: "Git branches", git_commit: "Git commit", git_push: "Git push", gh_pr_list: "Pull requests", gh_pr_create: "Opened pull request" };
+const TOOL_LABEL = { list_directory: "Listed folder", read_file: "Read file", search_files: "Searched files", write_file: "Wrote file", edit_file: "Edited file", create_folder: "Created folder", copy_path: "Copied item", move_path: "Moved/renamed item", delete_path: "Moved to trash", restore_path: "Restored item", set_session_model: "Changed model", web_search: "Searched the web", web_fetch: "Read web page", start_subtask: "Subtask", git_status: "Git status", git_diff: "Git diff", git_log: "Git log", git_show: "Git show", git_branches: "Git branches", git_commit: "Git commit", git_push: "Git push", gh_pr_list: "Pull requests", gh_pr_create: "Opened pull request", run_command: "Ran command" };
 function toolHTML(m, idx) {
   if (m._actionApproval) return `<div class="approve" data-idx="${idx}"><div class="q">${esc(m._actionApproval.title)}</div><div class="detail">Nothing has happened yet. This needs your approval.</div><div class="btns"><button class="btn primary" data-action-review="yes">Review</button><button class="btn" data-action-approve="no">Deny</button></div></div>`;
   if (m._modelApproval) return `<div class="approve" data-idx="${idx}"><div class="q">Switch this session to ${esc(m._modelApproval.model)}?</div><div class="detail">Nothing has changed yet. The model is waiting for your approval.</div><div class="btns"><button class="btn primary" data-model-review="yes">Review change</button><button class="btn" data-model-approve="no">Keep current model</button></div></div>`;
@@ -334,7 +334,7 @@ function openSettings() {
   $("#apiKey").placeholder = c.hasApiKey ? `Saved ${c.apiKeyHint || "(from OLLAMA_API_KEY)"} - leave blank to keep` : "Paste key…";
   $("#clearKey").disabled = !c.hasApiKey; $("#versionLabel").textContent = `Open AY Desktop ${c.version || ""}`;
   $("#updateStatus").textContent = `Checks github.com/${c.repository || "arothm/OpenAYDesktop"}`; $("#openUpdate").hidden = true;
-  $("#dailyLimit").value = c.dailyTokenLimit || 0; $("#chatLimit").value = c.chatTokenLimit || 0; $("#maxRuns").value = c.maxConcurrentRuns || 4; $("#minBalance").value = c.minBalanceUsd ?? 1;
+  $("#dailyLimit").value = c.dailyTokenLimit || 0; $("#chatLimit").value = c.chatTokenLimit || 0; $("#maxRuns").value = c.maxConcurrentRuns || 4; $("#allowedCommands").value = (c.allowedCommands || []).join("\n"); $("#minBalance").value = c.minBalanceUsd ?? 1;
   populateDefaultModels(); $("#modalBack").classList.add("open");
 }
 function populateDefaultModels() {
@@ -354,7 +354,8 @@ async function checkUpdates() {
 }
 async function saveSettings() {
   const body = { defaultModel: $("#defaultModel").value, dailyTokenLimit: Number($("#dailyLimit").value || 0),
-                 chatTokenLimit: Number($("#chatLimit").value || 0), maxConcurrentRuns: Number($("#maxRuns").value || 4), minBalanceUsd: Number($("#minBalance").value || 0) };
+                 chatTokenLimit: Number($("#chatLimit").value || 0), maxConcurrentRuns: Number($("#maxRuns").value || 4), minBalanceUsd: Number($("#minBalance").value || 0),
+                 allowedCommands: $("#allowedCommands").value.split(/\r?\n/).map((l) => l.trim()).filter(Boolean) };
   const key = $("#apiKey").value.trim(); if (key) body.apiKey = key;
   if (state.clearKey && !key) body.clearApiKey = true;
   try {
@@ -375,6 +376,7 @@ function openSession() {
   $("#fileManage").disabled = !writable; $("#deleteFiles").disabled = !writable; $("#modelControl").value = c.modelControl;
   $("#webSearch").checked = Boolean(c.webSearch); $("#gitMode").value = c.git || "off";
   $("#gitMode").disabled = Boolean(state.chat.parentId);
+  $("#commandsOn").checked = Boolean(c.commands) && writable && !state.chat.parentId; $("#commandsOn").disabled = !writable || Boolean(state.chat.parentId);
   const isChild = Boolean(state.chat.parentId); $("#subtasks").checked = !isChild && Boolean(c.subtasks); $("#subtasks").disabled = isChild;
   if (isChild) $("#subtasksHelp").textContent = "This chat is a subtask. Its permissions come from the chat that started it, and it can't start subtasks of its own.";
   const u = state.chat.untrusted; $("#untrustedBox").hidden = !u;
@@ -396,7 +398,7 @@ async function saveSession() {
   const draft = state.sessionDraft; if (!draft || !state.chat || draft.id !== state.chat.id) return;
   const title = $("#sessionName").value.trim();
   const c = { editMode: $("#editMode").value, fileManage: $("#fileManage").checked,
-              deleteFiles: $("#deleteFiles").checked, modelControl: $("#modelControl").value, webSearch: $("#webSearch").checked, git: $("#gitMode").value, subtasks: $("#subtasks").checked && !$("#subtasks").disabled };
+              deleteFiles: $("#deleteFiles").checked, modelControl: $("#modelControl").value, webSearch: $("#webSearch").checked, git: $("#gitMode").value, commands: $("#commandsOn").checked && !$("#commandsOn").disabled, subtasks: $("#subtasks").checked && !$("#subtasks").disabled };
   const skillIds = [...document.querySelectorAll("#sessionSkills [data-skill]")].filter((x) => x.checked).map((x) => x.dataset.skill);
   try {
     if (title !== state.chat.title) {

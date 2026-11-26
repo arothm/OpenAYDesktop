@@ -1,3 +1,24 @@
+# Open AY Desktop 1.10.0
+
+Running commands (completes Phase 5).
+
+## New
+- **Allow running commands** session permission (off by default). The model can run one command at a time in a shared folder with Allow edits and read its output.
+- **Allowed commands** in Settings: entries match exactly, or with extra arguments when they end in ` *`. These run without asking. Anything else needs your approval, and so does every command in a chat that has read web content.
+- **Safety:**
+  - Commands run without a shell, and arguments that are shell operators are refused.
+  - `.cmd`/`.bat` programs refuse cmd.exe special characters in their arguments.
+  - The Ollama API key is removed from the command's environment.
+  - The time limit and Stop end the whole process tree.
+  - Subtasks never get commands.
+
+## Verification
+- 112 automated tests (11 new, running real processes) on Python 3.12 and the bundled 3.15.2.
+- `python verify_static.py`.
+- A live run of an allowed command in the app.
+
+---
+
 # Open AY Desktop 1.9.0
 
 Git and GitHub tools (Phase 5).

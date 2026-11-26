@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It runs as an **Electron** desktop app, with a local Python 3 server (standard library only) doing the work. It can also still open in an Edge or Chrome app window without Electron. There is no frontend framework or build step for the interface itself.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.9.0
+- **Version:** 1.10.0
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -54,6 +54,7 @@ The Settings dialog contains only:
    - **Tokens per day** and **Tokens per chat** count tokens sent and generated, as Ollama reports them; 0 turns a limit off. When a limit is reached, replies stop with a message until you raise the limit.
    - **Replies at the same time** (default 4) caps how many replies, subtasks included, can run at once.
 
+   - **Allowed commands**: see *Running commands* below.
    - **Pause at balance ($)** (default 1, 0 = off): see *Balance guard* below.
 
    The usage line under the message box shows your Ollama balance and today's tokens against the daily limit.
@@ -107,6 +108,7 @@ A chat's folders, permissions and name are **server-owned**. Normal chat saves f
 - **Web search and reading web pages:** off by default. See *Web search* below.
 - **Skills for this chat:** tick the skills this chat should follow. See *Skills* below.
 - **Git and GitHub:** off by default. See *Git and GitHub* below.
+- **Allow running commands:** off by default. See *Running commands* below.
 - **Allow subtasks:** off by default. See *Subtasks* below.
 
   The model is told to switch only when you explicitly ask. Before switching, the server checks that the model exists in Ollama Cloud. It refuses a model without image support if the chat contains images, and warns when the new model doesn't support tools. The new model answers from the next step of the same reply. Your default model in Settings is not changed.
@@ -158,6 +160,25 @@ Safety rules, enforced by the server (`gittools.py`):
 - **Subtasks** get read-only Git at most.
 
 Pull requests need the [GitHub CLI](https://cli.github.com) installed and signed in (`gh auth login`), and the branch pushed first.
+
+## Running commands
+With **Allow running commands** on, the model gets `run_command`: one command at a time, run in a shared folder with **Allow edits**, with its output returned.
+
+**Allowed commands** (Settings) are one per line:
+- `npm test` matches exactly `npm test`. The program name is compared without path or extension, so `npm.cmd test` also matches.
+- `python -m pytest *` matches `python -m pytest` followed by any extra arguments.
+
+A command on the list runs without asking. **Anything else needs your approval**, in a dialog showing the folder, the exact command and the time limit. **In a chat that has read web content, every command needs approval**, even ones on the list.
+
+How commands run (`commands.py`):
+- **No shell.** The line is split the way Windows splits it. Arguments that are shell operators (`&&`, `|`, `;`, `>`, `<`, …) are refused with a clear message, so the model can't expect pipes or chaining to work.
+- **Batch-file guard.** Programs that are `.cmd`/`.bat` files, such as `npm`, are run by cmd.exe. Arguments containing characters cmd.exe treats specially (`& | < > ^ % ! "`) are refused for them.
+- **Your API key stays out.** The Ollama API key is removed from the command's environment.
+- **Time limit.** It defaults to 2 minutes, and the model can ask for up to 10. **Stop** or the time limit ends the command *and everything it started*.
+- **Output.** The start and end are kept (about 60,000 characters), along with the exit code and duration.
+- **Subtasks never get commands.**
+
+**Important:** a command runs with your Windows account, so it can read or change anything you can, not just the shared folders. Keep the allowed list to commands you'd be happy to run without looking, such as tests, builds and linters.
 
 ## Subtasks
 With **Allow subtasks** on, the model can hand self-contained pieces of work to helper chats with `start_subtask`:
@@ -217,7 +238,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 
 ## Publishing a release for the updater
 1. Update `APP_VERSION` in `server.py` and the version shown here.
-2. Commit and tag the release as `vX.Y.Z`, for example `v1.9.0`. Keep `version` in `package.json` the same (`verify_static.py` checks it).
+2. Commit and tag the release as `vX.Y.Z`, for example `v1.10.0`. Keep `version` in `package.json` the same (`verify_static.py` checks it).
 3. Publish a non-draft GitHub Release with that tag in `arothm/OpenAYDesktop`.
 4. The app's update check compares numeric semantic versions. A malformed release tag produces a clear error. If no release has been published, GitHub's 404 response is reported as **No published release yet**, not as an update.
 
@@ -228,6 +249,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `capabilities.py` — session permission policy, file management, trash and versions.
 - `session_actions.py` — session renaming.
 - `web.py` — web search and page reading, with untrusted-content markers.
+- `commands.py` — running commands: parsing, the allowed list, the batch-file guard, time limits and Stop.
 - `gittools.py` — Git and GitHub tools: repository checks, the safe command runner, and commit, push and pull request reviews.
 - `skills.py` — skill files: storage, validation and the per-chat prompt.
 - `index.html` — application and dialog markup.
@@ -236,7 +258,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `electron/` — the Electron shell: `main.js` (server lifecycle, window, tray, quit), `preload.js` (folder picker only), `icon.png`.
 - `package.json` — Electron and electron-builder setup (`npm start`, `npm run smoke`, `npm run dist`).
 - `scripts/fetch-python.js` — downloads and verifies the embeddable Python that the installer bundles.
-- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`, `test_git.py`).
+- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`, `test_git.py`, `test_commands.py`).
 - `verify_static.py` — optional static consistency checks.
 - `backups/pre-approved-changes/` — original source copies from before the first approved change set.
 
