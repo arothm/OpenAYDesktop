@@ -192,44 +192,11 @@ class HTTPTests(unittest.TestCase):
             status, _, data = self.request("GET", path); self.assertEqual(200, status); self.assertIn(marker, data)
         status, _, _ = self.request("GET", "/vendor/%2e%2e/server.py"); self.assertEqual(404, status)
 
-    def test_api_ignores_forged_folder_list_and_enforces_tokens(self):
-        self.create_chat("security-http", write=False); target = self.shared / "approved.txt"
-        status, _, data = self.request("POST", "/api/tool", {"chatId": "security-http", "name": "read_file", "arguments": {"path": str(target)}, "folders": [{"path": str(self.temp.name), "write": True}]})
-        self.assertEqual(200, status); self.assertTrue(json.loads(data)["error"])
-        status, _, data = self.request("POST", "/api/tool", {"chatId": "security-http", "name": "write_file", "arguments": {"path": str(target), "content": "not approved"}})
-        self.assertTrue(json.loads(data)["error"]); self.assertFalse(target.exists())
-
-    def test_http_full_write_flow_and_cancellation(self):
-        self.create_chat("write-http", write=True); target = self.shared / "new.txt"; content = "complete\n" + ("z" * 5000)
-        status, _, data = self.request("POST", "/api/tool/prepare", {"chatId": "write-http", "name": "write_file", "arguments": {"path": str(target), "content": content}})
-        self.assertEqual(200, status); approval = json.loads(data)["approval"]; self.assertEqual(content, approval["content"])
-        status, _, data = self.request("POST", "/api/tool", {"chatId": "write-http", "name": "write_file", "approvalToken": approval["token"]})
-        self.assertEqual(200, status); self.assertFalse(json.loads(data).get("error")); self.assertEqual(content, target.read_text(encoding="utf-8"))
-        status, _, data = self.request("POST", "/api/tool/prepare", {"chatId": "write-http", "name": "write_file", "arguments": {"path": str(target), "content": "cancel me"}})
-        token = json.loads(data)["approval"]["token"]; self.request("POST", "/api/tool/cancel", {"chatId": "write-http", "approvalToken": token})
-        _, _, data = self.request("POST", "/api/tool", {"chatId": "write-http", "name": "write_file", "approvalToken": token})
-        self.assertTrue(json.loads(data)["error"]); self.assertEqual(content, target.read_text(encoding="utf-8"))
-
     def test_cross_origin_requests_are_rejected(self):
         status, _, _ = self.request("GET", "/api/chats", origin=False); self.assertEqual(200, status)
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         conn.request("GET", "/api/chats", headers={"Host": "127.0.0.1:%d" % self.port, "Origin": "https://example.com"})
         response = conn.getresponse(); response.read(); conn.close(); self.assertEqual(403, response.status)
-
-    def test_tools_disabled_does_not_inject_tools(self):
-        """A real HTTP request must remove internal fields and upstream tools."""
-        captured = {}
-        response = io.BytesIO(b'{"done": true}\n')
-        with mock.patch.object(server, "load_config", return_value={"apiKey": "test-key"}), \
-             mock.patch.object(server, "upstream", side_effect=lambda path, body: captured.update(body) or response):
-            status, _, data = self.request("POST", "/api/chat", {
-                "chatId": "does-not-need-to-exist", "toolsEnabled": False,
-                "model": "example:cloud", "messages": [{"role": "user", "content": "hello"}],
-            })
-        self.assertEqual(200, status); self.assertIn(b'"done": true', data)
-        self.assertTrue(captured["stream"]); self.assertNotIn("tools", captured)
-        self.assertNotIn("chatId", captured); self.assertNotIn("toolsEnabled", captured)
-
 
 if __name__ == "__main__":
     unittest.main()

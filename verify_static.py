@@ -5,8 +5,10 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 root = Path(__file__).resolve().parent
-ast.parse((root / "server.py").read_text(encoding="utf-8"))
-ast.parse((root / "tests" / "test_server.py").read_text(encoding="utf-8"))
+for name in ("server.py", "runs.py", "context_budget.py", "capabilities.py", "session_actions.py"):
+    ast.parse((root / name).read_text(encoding="utf-8"))
+for test in (root / "tests").glob("test_*.py"):
+    ast.parse(test.read_text(encoding="utf-8"))
 print("Python syntax: OK")
 
 html = (root / "index.html").read_text(encoding="utf-8")
@@ -41,9 +43,15 @@ used = set(re.findall(r'\$\("#([A-Za-z0-9_-]+)"\)', js))
 missing = used - set(p.ids)
 assert not missing, "JS references missing IDs: %r" % missing
 print("JavaScript selector IDs: OK (%d checked)" % len(used))
-assert "body.get(\"folders\")" not in source
-assert 'out = run_tool({"folders": body.get' not in source
-assert re.search(r'chatId\s*:\s*chat\.id\b', js), "Frontend must send the chat ID for saved folder grants"
-assert re.search(r'chat_id\s*=\s*req\.pop\("chatId",\s*""\)', source), "Server must remove the chat ID unconditionally"
-print("Server-owned folder grants and internal-field removal: OK")
+runs_src = (root / "runs.py").read_text(encoding="utf-8")
+# Replies run on the server; the window has no way to call tools or the model directly.
+for gone in ('"/api/tool"', '"/api/tool/prepare"', '"/api/chat"', "_proxy_chat", "_proxy_stream"):
+    assert gone not in source, gone
+for gone in ('"/api/tool', '"/api/chat"', "runAssistant", "streamReply"):
+    assert gone not in js, gone
+# Every tool call re-reads permissions from the saved chat, never from a request.
+assert runs_src.count("saved_tool_config(self.chat_id)") >= 3, "Tool calls must load the saved chat's permissions"
+assert "body.get(\"folders\")" not in runs_src
+assert re.search(r'chatId\s*:\s*chat\.id\b', js), "Frontend must send the chat ID"
+print("Server-side runs and server-owned folder grants: OK")
 print("Static checks passed. Run the regression suite separately; this script does not launch a browser or test GitHub.")

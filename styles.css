@@ -114,6 +114,19 @@ details.thinking .tbody { white-space: pre-wrap; color: var(--muted); font-size:
 #modalBack, #sessionBack, #trashBack, #modelApproveBack { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: none; align-items: center; justify-content: center; z-index: 50; }
 #modelApproveBack { z-index: 75; background: rgba(0,0,0,.5); }
 #modalBack.open, #sessionBack.open, #trashBack.open, #modelApproveBack.open { display: flex; }
+/* Runs, usage and editing */
+.run-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-right: 2px; animation: runpulse 1.2s ease-in-out infinite; }
+.run-dot.waiting { background: #e0a100; animation: none; }
+@keyframes runpulse { 50% { opacity: .35; } }
+.usage-line { max-width: 820px; margin: 6px auto 0; font-size: 11.5px; color: var(--muted); text-align: center; display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 8px; }
+.usage-line:empty { display: none; }
+.usage-line .warn { color: #c77c00; }
+.usage-line .sep { opacity: .5; }
+.edit-banner { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--muted); padding: 2px 0 8px; }
+.edit-banner[hidden] { display: none; }
+.edit-banner span { flex: 1; }
+.edit-banner .btn { padding: 3px 9px; font-size: 12px; }
+.notice { font-size: 12.5px; color: var(--muted); border-left: 3px solid var(--border); padding: 2px 10px; margin: 4px 0; }
 .trash-modal { width: min(760px, 94vw); }
 #trashSummary { font-size: 12.5px; color: var(--muted); margin-bottom: 12px; }
 #trashList { display: flex; flex-direction: column; gap: 6px; max-height: 55vh; overflow-y: auto; }

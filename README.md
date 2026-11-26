@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It needs Python 3 (standard library only) and Edge or Chrome. There is no frontend framework, npm installation, or build step.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.2.0
+- **Version:** 1.3.0
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -45,7 +45,8 @@ In review mode, every change needs explicit approval:
 - The dialog shows the **complete replacement content**, not a truncated preview.
 - For an existing file, **Show full diff** displays a complete unified diff against the current file.
 - The server issues a random, single-use approval token tied to that chat, canonical path, and exact content.
-- Approval expires after five minutes and is revalidated against saved permissions immediately before writing.
+- The reply waits on the server for your answer, for up to 30 minutes, after which it counts as denied. Permissions are checked again immediately before writing.
+- **Later** (or Escape) closes the dialog without answering. The card in the chat, and the amber dot in the sidebar, show that a reply is waiting, and **Review change** reopens the dialog. You can answer from any open window.
 - Denying, cancelling, or changing an approval does not write the file.
 - If the file changes on disk after you reviewed it, the approved write is refused instead of overwriting the newer content.
 
@@ -76,14 +77,35 @@ A chat's folders, permissions and name are **server-owned**. Normal chat saves f
 
 Chats saved before these settings existed get the defaults above. A folder with **Allow edits** still allows reviewed writes, but file management and deletion stay off until you enable them.
 
+## Replies run on the server
+Each reply runs on the app's local server (`runs.py`): the model answers, calls tools, gets their results, and continues, up to 25 steps. The window shows it live through an event stream. As a result:
+- **Switching chats or closing the window doesn't stop a reply.** Reopen the chat to see where it got to. The background server keeps running while any reply is in progress.
+- **Several chats can reply at the same time.** A pulsing dot in the sidebar marks chats that are replying, and an amber dot marks chats waiting for your approval.
+- **Stop** (the ■ button, or Escape) ends the current chat's reply, including one that's waiting for approval.
+- **Edit and resend** shows a banner. The earlier message and everything after it are replaced only when you send.
+- While a reply runs, its chat's messages and model can't be changed from elsewhere. Folders and permissions can still change, and they take effect at the next tool call.
+
+## Context and usage
+Before each request, the server fits the conversation into the model's context window. It learns the window size from Ollama Cloud and assumes 64k tokens if Ollama Cloud doesn't report it.
+- Tool results from earlier turns are shortened, and the model can call the tool again if it needs them.
+- If the conversation still doesn't fit, the oldest whole turns are left out of the request and a note tells the model. The full history stays saved in the chat.
+
+The line under the message box shows:
+- how full the context was in the last request, from Ollama's real token counts;
+- how many older messages were left out;
+- this chat's total tokens;
+- today's tokens and requests across all chats. Daily totals are kept in `data/usage.json` for 90 days.
+
 ## Features
 Streaming replies, Markdown and code highlighting, collapsible thinking/reasoning panels, image attachments for vision models (paste, drop, or paperclip), stop, regenerate, edit-and-resend, searchable chat history, and server-approved folder tools.
 
 ## Persistence and reliability
 - Chats and configuration are written atomically with unique temporary files.
 - Per-chat server locks protect reads, writes, and deletion.
-- Browser saves are ordered and coalesced per chat so older queued snapshots do not overwrite newer ones.
-- Opening or deleting the currently streaming chat stops it and waits for its final save first.
+- The server owns each chat's messages. A running reply saves after every tool step and when it ends, keeping folders, permissions and name as stored on disk.
+- Live-only state, such as a message still streaming or a pending approval, is never written to disk.
+- Deleting a chat stops its reply first.
+- An unexpected server error returns a readable error instead of dropping the connection.
 
 ## Local interface libraries
 The browser loads Marked, DOMPurify, Highlight.js, and both syntax themes from this app's own `/vendor/` routes, not from CDN script tags. The server permits only five fixed, versioned assets: Marked 12.0.2, DOMPurify 3.1.6, Highlight.js 11.9.0, and its two 11.9.0 themes.
@@ -92,16 +114,20 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 
 ## Publishing a release for the updater
 1. Update `APP_VERSION` in `server.py` and the version shown here.
-2. Commit and tag the release as `vX.Y.Z`, for example `v1.1.0`.
+2. Commit and tag the release as `vX.Y.Z`, for example `v1.3.0`.
 3. Publish a non-draft GitHub Release with that tag in `arothm/OpenAYDesktop`.
 4. The app's update check compares numeric semantic versions. A malformed release tag produces a clear error. If no release has been published, GitHub's 404 response is reported as **No published release yet**, not as an update.
 
 ## Source layout
-- `server.py` — cloud proxy, storage, update checker, folder tools, write authorization, local assets, and launcher.
+- `server.py` — HTTP API, storage, folder tools, write approvals, model info, usage totals, update checker, local assets, and launcher.
+- `runs.py` — server-side replies: the model/tool loop, live events, approvals, stop, and per-chat usage.
+- `context_budget.py` — fits the history into the model's context window.
+- `capabilities.py` — session permission policy, file management, trash and versions.
+- `session_actions.py` — session renaming.
 - `index.html` — application and dialog markup.
 - `styles.css` — interface styling and light/dark themes.
-- `app.js` — chat state, streaming, tools, ordered saves, settings, and update UI.
-- `tests/test_server.py` — isolated standard-library regression tests.
+- `app.js` — the window: live event stream, rendering, approvals, sessions, trash, and settings.
+- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`).
 - `verify_static.py` — optional static consistency checks.
 - `backups/pre-approved-changes/` — original source copies from before the first approved change set.
 

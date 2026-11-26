@@ -19,10 +19,11 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import capabilities
+import runs
 import session_actions
 
 APP_NAME = "Open AY Desktop"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 APP_SLUG = "open-ay-desktop"
 REPOSITORY = "arothm/OpenAYDesktop"
 RELEASES_URL = "https://github.com/%s/releases/latest" % REPOSITORY
@@ -44,7 +45,11 @@ VENDOR_FILES = {
 LOCAL_FILES = {"/app.js": ("app.js", "application/javascript; charset=utf-8"), "/styles.css": ("styles.css", "text/css; charset=utf-8")}
 MAX_VENDOR_BYTES = 2_000_000
 MAX_REQUEST_BYTES = 100_000_000
-APPROVAL_TTL = 300
+APPROVAL_TTL = 1800  # matches how long a server-side run waits for an answer
+USAGE_DAYS_KEPT = 90
+MODEL_INFO_TTL = 3600
+_model_info_cache = {}
+_usage_lock = threading.Lock()
 _last_ping = time.time()
 _lock = threading.Lock()
 _chat_locks = {}
@@ -134,6 +139,9 @@ def save_chat(chat_id, chat):
     if not isinstance(chat, dict):
         raise ValueError("bad chat")
     chat = {k: v for k, v in chat.items() if not k.startswith("_")}
+    if isinstance(chat.get("messages"), list):  # live-only flags (_live, _running, _approval...) are never stored
+        chat["messages"] = [{k: v for k, v in m.items() if not k.startswith("_")} if isinstance(m, dict) else m
+                            for m in chat["messages"]]
     chat["id"] = chat_id
     chat.setdefault("capabilities", dict(capabilities.DEFAULT_POLICY))
     os.makedirs(CHATS_DIR, exist_ok=True)
@@ -182,6 +190,29 @@ def update_permissions(chat_id, body):
             raise ValueError(str(e))
         chat["updated"] = int(time.time() * 1000); save_chat(chat_id, chat)
     return {"folders": chat["folders"], "capabilities": chat["capabilities"], "policy": capabilities.policy(chat)}
+
+
+def create_chat(body):
+    """New chat from the window: model, folders picked before the first message, default permissions."""
+    model = str(body.get("model") or "").strip()
+    if not model or len(model) > 200: raise ValueError("Pick a cloud model first.")
+    try: folders = capabilities.clean_folders(body.get("folders") or [])
+    except capabilities.CapabilityError as e: raise ValueError(str(e))
+    try: title = session_actions.clean_title(body.get("title") or "New chat")
+    except ValueError: title = "New chat"
+    chat_id = "c" + secrets.token_hex(7); now = int(time.time() * 1000)
+    save_chat(chat_id, {"title": title, "model": model, "created": now, "updated": now, "messages": [],
+                        "folders": folders, "capabilities": dict(capabilities.DEFAULT_POLICY)})
+    chat = load_chat(chat_id); chat.pop("_path", None); return chat
+
+
+def set_chat_model(chat_id, model):
+    """The user picked a model in the header for an existing chat."""
+    model = str(model or "").strip()
+    if not model or len(model) > 200: raise ValueError("Pick a cloud model.")
+    with chat_lock(chat_id):
+        chat = load_chat(chat_id); chat["model"] = model; chat["updated"] = int(time.time() * 1000); save_chat(chat_id, chat)
+    return {"model": model}
 
 
 def list_chats():
@@ -512,14 +543,78 @@ def get_models():
     return models, errors
 
 
-def model_capabilities(name):
-    """Capabilities Ollama Cloud reports for a model (e.g. tools, vision), or None if unknown."""
+def model_info(name):
+    """What Ollama Cloud reports for a model: {"capabilities": [...] or None, "context_length": int or None}.
+
+    Cached for an hour; a failed lookup is cached for a minute so a run never waits on it repeatedly.
+    """
+    now = time.monotonic(); cached = _model_info_cache.get(name)
+    if cached and cached[0] > now: return cached[1]
+    info, ttl = {"capabilities": None, "context_length": None}, 60
     try:
         with upstream("/api/show", {"model": name}, timeout=20) as r:
-            caps = json.loads(r.read().decode("utf-8")).get("capabilities")
-        return [str(c) for c in caps] if isinstance(caps, list) else None
-    except Exception:  # noqa: BLE001 - capability lookup is advisory when the service can't answer
-        return None
+            data = json.loads(r.read().decode("utf-8"))
+        caps = data.get("capabilities")
+        info["capabilities"] = [str(c) for c in caps] if isinstance(caps, list) else None
+        for key, value in (data.get("model_info") or {}).items():
+            if key.endswith(".context_length") and isinstance(value, int) and value > 0:
+                info["context_length"] = value; break
+        ttl = MODEL_INFO_TTL
+    except Exception:  # noqa: BLE001 - advisory: the context budget falls back to a default size
+        pass
+    _model_info_cache[name] = (now + ttl, info)
+    return info
+
+
+def model_capabilities(name):
+    """Capabilities Ollama Cloud reports for a model (e.g. tools, vision), or None if unknown."""
+    return model_info(name)["capabilities"]
+
+
+def tool_system_note(fcfg, specs, where):
+    """System instructions sent alongside the session's tools."""
+    note = "You may use only the tools supplied for this session. Use absolute paths and never guess file contents."
+    if folder_roots(fcfg):
+        note += (" Shared folders: %s. File operations are limited by the saved session policy. "
+                 "Deletion is recoverable app trash, not permanent deletion." % where)
+    if any(s["function"]["name"] == "set_session_model" for s in specs):
+        note += (" Call set_session_model only when the user explicitly asks to change or switch this session's model;"
+                 " never switch on your own initiative. After calling it, stop and write nothing more:"
+                 " the new model will continue this reply and handle the rest of the user's request.")
+    return note
+
+
+# Usage
+
+def usage_path():
+    return os.path.join(os.path.dirname(CHATS_DIR), "usage.json")  # data/usage.json, next to chats/ and trash/
+
+
+def _read_usage():
+    try:
+        with open(usage_path(), encoding="utf-8") as f: data = json.load(f)
+        return data if isinstance(data, dict) and isinstance(data.get("days"), dict) else {"days": {}}
+    except (OSError, ValueError):
+        return {"days": {}}
+
+
+def record_daily_usage(prompt_tokens, output_tokens):
+    """Add one model response to today's totals; returns today's totals."""
+    today = time.strftime("%Y-%m-%d")
+    with _usage_lock:
+        data = _read_usage(); days = data["days"]
+        day = days.setdefault(today, {"promptTokens": 0, "outputTokens": 0, "requests": 0})
+        day["promptTokens"] += int(prompt_tokens); day["outputTokens"] += int(output_tokens); day["requests"] += 1
+        for old in sorted(days)[:-USAGE_DAYS_KEPT]: days.pop(old, None)
+        os.makedirs(os.path.dirname(usage_path()), exist_ok=True); atomic_write_text(usage_path(), json.dumps(data, indent=1))
+        return dict(day)
+
+
+def usage_summary(days=30):
+    with _usage_lock: data = _read_usage()
+    today = time.strftime("%Y-%m-%d"); recent = sorted(data["days"].items())[-days:]
+    return {"today": data["days"].get(today, {"promptTokens": 0, "outputTokens": 0, "requests": 0}),
+            "days": [dict(v, date=k) for k, v in recent]}
 
 
 def check_model_switch(chat, requested, lookup=None):
@@ -691,6 +786,9 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/models":
             models, errors = get_models(); self._json({"models": models, "errors": errors})
         elif p == "/api/chats": self._json(list_chats())
+        elif p == "/api/runs": _last_ping = time.time(); self._json({"runs": ENGINE.statuses()})
+        elif p == "/api/usage": self._json(usage_summary())
+        elif p.startswith("/api/chats/") and p.endswith("/events"): self._events(p[len("/api/chats/"):-len("/events")])
         elif p == "/api/trash":
             items = capabilities.list_trash(capabilities.trash_root(CHATS_DIR))
             self._json({"items": items, "totalBytes": sum(int(m.get("size") or 0) for m in items)})
@@ -703,7 +801,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self._same_origin(): return self._json({"error": "forbidden"}, 403)
         p = self.path.split("?")[0]
         if p.startswith("/api/chats/"):
-            try: save_browser_chat(p.rsplit("/", 1)[1], self._body()); self._json({"ok": True})
+            chat_id = p.rsplit("/", 1)[1]
+            if ENGINE.busy(chat_id): return self._json({"error": "A reply is running in this chat."}, 409)
+            try: save_browser_chat(chat_id, self._body()); self._json({"ok": True})
             except ValueError as e: self._json({"error": str(e) or "bad request"}, 400)
             except OSError as e: self._json({"error": "Could not save chat: %s" % e}, 500)
         else: self._json({"error": "not found"}, 404)
@@ -713,7 +813,8 @@ class Handler(BaseHTTPRequestHandler):
         p = self.path.split("?")[0]
         if p.startswith("/api/chats/"):
             try:
-                chat_id = p.rsplit("/", 1)[1]
+                chat_id = p.rsplit("/", 1)[1]; chat_path(chat_id)
+                ENGINE.stop(chat_id, wait=10)
                 with chat_lock(chat_id):
                     try: os.remove(chat_path(chat_id))
                     except FileNotFoundError: pass
@@ -734,16 +835,26 @@ class Handler(BaseHTTPRequestHandler):
                 if body.get("clearApiKey"): cfg["apiKey"] = ""
                 save_config(cfg)
             self._json(public_config(load_config()))
-        elif p == "/api/chat": self._proxy_chat(body)
+        elif p == "/api/chats":
+            try: self._json(create_chat(body))
+            except (OSError, ValueError) as e: self._json({"error": str(e)}, 400)
+        elif p == "/api/runs":
+            try: ENGINE.start(body.get("chatId", ""), body); self._json({"ok": True})
+            except runs.RunError as e: self._json({"error": str(e)}, 409 if "already running" in str(e) else 400)
+            except (OSError, ValueError) as e: self._json({"error": str(e) or "bad request"}, 400)
+        elif p == "/api/runs/stop":
+            self._json({"stopped": ENGINE.stop(body.get("chatId", ""))})
+        elif p == "/api/runs/approve":
+            ok = ENGINE.decide(body.get("chatId", ""), body.get("approvalId", ""), body.get("approve") is True)
+            self._json({"ok": ok} if ok else {"error": "That question was already answered or withdrawn."}, 200 if ok else 409)
+        elif p == "/api/session/model":
+            chat_id = body.get("chatId", "")
+            if ENGINE.busy(chat_id): return self._json({"error": "Wait for the reply to finish before changing the model."}, 409)
+            try: self._json(set_chat_model(chat_id, body.get("model")))
+            except (OSError, ValueError) as e: self._json({"error": str(e)}, 400)
         elif p == "/api/updates/check":
             try: self._json(check_for_updates())
             except RuntimeError as e: self._json({"error": str(e)}, 502)
-        elif p == "/api/tool/prepare":
-            try: self._json({"approval": prepare_write(body.get("chatId", ""), body.get("name"), body.get("arguments") or {})})
-            except ToolError as e: self._json({"error": str(e)}, 400)
-        elif p == "/api/tool/cancel":
-            cancel_write(body.get("chatId", ""), body.get("approvalToken", "")); self._json({"ok": True})
-        elif p == "/api/tool": self._tool(body)
         elif p == "/api/session/rename":
             try:
                 chat_id = body.get("chatId", "")
@@ -772,59 +883,27 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e: self._json({"error": "Folder picker failed: %s" % e}, 500)
         else: self._json({"error": "not found"}, 404)
 
-    def _tool(self, body):
-        chat_id = body.get("chatId", ""); name = body.get("name"); args = body.get("arguments") or {}
-        try:
-            if name == "set_session_model": return self._json(self.change_model(chat_id, args, body.get("approvalToken", "")))
-            if name in REVIEWED_TOOLS:
-                chat = saved_tool_config(chat_id)
-                out = run_tool(chat, name, args) if capabilities.policy(chat)["editMode"] == "auto" else run_approved_write(chat_id, body.get("approvalToken", ""))
-            else: out = run_tool(saved_tool_config(chat_id), name, args)
-            self._json({"content": out})
-        except (ToolError, ValueError) as e: self._json({"content": "Error: %s" % e, "error": True})
+    def _events(self, chat_id):
+        """Server-Sent Events for one chat: a snapshot, then live run events (see runs.py)."""
+        try: chat_path(chat_id)
+        except ValueError: return self._json({"error": "not found"}, 404)
+        self.send_response(200); self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store"); self.send_header("X-Content-Type-Options", "nosniff"); self.end_headers()
+        def send(event, seq):
+            self.wfile.write(("id: %d\ndata: %s\n\n" % (seq, json.dumps(event))).encode("utf-8")); self.wfile.flush()
+        self.wfile.write(b"retry: 2000\n\n")
+        snap, seq = ENGINE.snapshot(chat_id); send(snap, seq)
+        channel = ENGINE.channel(chat_id)
+        while True:  # ends when the window disconnects (the write fails)
+            events, gap = channel.since(seq, 15)
+            if gap:
+                snap, seq = ENGINE.snapshot(chat_id); send(snap, seq); continue
+            if not events:
+                self.wfile.write(b": keepalive\n\n"); self.wfile.flush(); continue
+            for seq, event in events: send(event, seq)
 
-    def change_model(self, chat_id, args, approval_token=""):
-        return change_session_model(chat_id, args, approval_token)
 
-    def _proxy_chat(self, req):
-        chat_id = req.pop("chatId", ""); use_tools = req.pop("toolsEnabled", True); req.pop("folders", None); req["stream"] = True
-        if not SAFE_ID.match(chat_id): return self._json({"error": "A valid saved chat ID is required."}, 400)
-        if not use_tools:  # model without tool support (or tools switched off): send no tools at all
-            return self._proxy_stream("/api/chat", req)
-        try: fcfg = saved_tool_config(chat_id)
-        except ToolError as e: return self._json({"error": str(e)}, 400)
-        specs, where = tool_specs(fcfg)
-        if specs:
-            req["tools"] = specs
-            note = "You may use only the tools supplied for this session. Use absolute paths and never guess file contents."
-            if folder_roots(fcfg): note += " Shared folders: %s. File operations are limited by the saved session policy. Deletion is recoverable app trash, not permanent deletion." % where
-            if any(s["function"]["name"] == "set_session_model" for s in specs):
-                note += (" Call set_session_model only when the user explicitly asks to change or switch this session's model;"
-                         " never switch on your own initiative. After calling it, stop and write nothing more:"
-                         " the new model will continue this reply and handle the rest of the user's request.")
-            msgs = req.get("messages") or []
-            if msgs and msgs[0].get("role") == "system": msgs[0] = dict(msgs[0], content=msgs[0]["content"] + "\n\n" + note)
-            else: msgs.insert(0, {"role": "system", "content": note})
-            req["messages"] = msgs
-        self._proxy_stream("/api/chat", req)
-
-    def _proxy_stream(self, path, body):
-        if not api_key(load_config()): return self._json({"error": "Add your Ollama API key in Settings to use Ollama Cloud."}, 400)
-        try: r = upstream(path, body)
-        except urllib.error.HTTPError as e: return self._json({"error": http_error_text(e)}, e.code)
-        except Exception as e: return self._json({"error": "Could not reach Ollama Cloud: %s" % e}, 502)
-        self.send_response(200); self.send_header("Content-Type", "application/x-ndjson"); self.send_header("Cache-Control", "no-store"); self.send_header("Connection", "close"); self.end_headers()
-        try:
-            with r:
-                while True:
-                    line = r.readline()
-                    if not line: break
-                    self.wfile.write(line); self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError): pass
-        except Exception as e:
-            try: self.wfile.write((json.dumps({"error": str(e)}) + "\n").encode())
-            except OSError: pass
-        self.close_connection = True
+ENGINE = runs.Engine(sys.modules[__name__])
 
 
 # Launcher
@@ -854,7 +933,7 @@ def open_window(url):
 def watchdog(httpd, idle_seconds):
     while True:
         time.sleep(5)
-        if time.time() - _last_ping > idle_seconds: httpd.shutdown(); return
+        if time.time() - _last_ping > idle_seconds and not ENGINE.any_active(): httpd.shutdown(); return
 
 
 def main():

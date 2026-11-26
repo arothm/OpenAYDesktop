@@ -1,0 +1,481 @@
+"""Server-side chat runs.
+
+A run is one reply: the model -> tool -> model loop for a single chat, on its own thread.
+Runs keep going when the window switches chats or closes, several chats can run at once,
+and approvals wait here until the user answers in any open window.
+
+Each chat has a Channel of numbered events. A window subscribes over Server-Sent Events,
+gets a full "snapshot" first, then live events:
+  snapshot  {chat, status, approval}       full state (also sent when a run starts)
+  message   {index, message}               a message was added or replaced
+  delta     {index, content, thinking}     streamed text appended to a message
+  status    {status, model}                "running" | "waiting" | "idle"
+  approval  {approval}                     a write/model change needs the user's answer
+  approval_done {id}                       that question was answered or withdrawn
+  context   {...}                          what the context budget did for this request
+  usage     {session, today, context}      token counts after a model response
+The engine is created by server.py with the server module as `srv`, which provides
+storage, tools, approvals and the Ollama Cloud connection.
+"""
+
+import copy
+import json
+import secrets
+import threading
+import time
+import urllib.error
+
+import capabilities
+import context_budget
+
+MAX_STEPS = 25
+APPROVAL_WAIT = 1800          # seconds an approval waits before it counts as denied
+EVENT_BUFFER = 5000
+MAX_IMAGES = 10
+MAX_IMAGE_CHARS = 20_000_000  # base64 characters per image
+
+
+class RunError(Exception):
+    """A run could not start (bad input, or this chat is already running)."""
+
+
+class Denied(Exception):
+    pass
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+class Channel:
+    """Numbered events for one chat, with waiting subscribers."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.events = []
+        self.seq = 0
+
+    def publish(self, event):
+        with self.cond:
+            self.seq += 1
+            self.events.append((self.seq, event))
+            if len(self.events) > EVENT_BUFFER:
+                del self.events[:len(self.events) - EVENT_BUFFER]
+            self.cond.notify_all()
+            return self.seq
+
+    def since(self, after, timeout):
+        """Events newer than `after`. `gap` is True when some were already dropped from the buffer."""
+        with self.cond:
+            if self.seq <= after:
+                self.cond.wait(timeout)
+            gap = bool(self.events) and self.events[0][0] > after + 1 and after < self.seq
+            return [e for e in self.events if e[0] > after], gap
+
+
+class Engine:
+    def __init__(self, srv):
+        self.srv = srv
+        self.lock = threading.Lock()
+        self.runs = {}
+        self.channels = {}
+
+    def channel(self, chat_id):
+        with self.lock:
+            return self.channels.setdefault(chat_id, Channel())
+
+    def active(self, chat_id):
+        run = self.runs.get(chat_id)
+        return run if run and run.alive else None
+
+    def busy(self, chat_id):
+        return self.active(chat_id) is not None
+
+    def any_active(self):
+        return any(r.alive for r in list(self.runs.values()))
+
+    def statuses(self):
+        return {cid: r.status for cid, r in list(self.runs.items()) if r.alive}
+
+    def snapshot(self, chat_id):
+        """(snapshot event, channel seq it is current as of)."""
+        ch = self.channel(chat_id)
+        run = self.active(chat_id)
+        if run:
+            with run.lock:
+                return run.snapshot_event(), ch.seq
+        with ch.cond:
+            seq = ch.seq
+        try:
+            chat = self.srv.load_chat(chat_id)
+        except (OSError, ValueError):
+            return {"type": "gone"}, seq
+        chat.pop("_path", None)
+        return {"type": "snapshot", "chat": chat, "status": "idle", "approval": None}, seq
+
+    def start(self, chat_id, options):
+        with self.lock:
+            if self.active(chat_id):
+                raise RunError("A reply is already running in this session.")
+            run = Run(self, chat_id, options)  # validates input and saves the user's message
+            self.runs[chat_id] = run
+        run.thread.start()
+        return run
+
+    def stop(self, chat_id, wait=0):
+        run = self.active(chat_id)
+        if run:
+            run.cancel()
+            if wait:
+                run.thread.join(wait)
+        return bool(run)
+
+    def decide(self, chat_id, approval_id, approve):
+        run = self.active(chat_id)
+        return bool(run and run.decide(approval_id, approve))
+
+
+class Run:
+    def __init__(self, engine, chat_id, options):
+        self.engine, self.srv, self.chat_id = engine, engine.srv, chat_id
+        self.lock = threading.RLock()
+        self.cancelled = threading.Event()
+        self.status = "running"
+        self.alive = True
+        self.approval = None
+        self.response = None
+        self.use_tools = True
+        think = options.get("think")
+        self.think = think if think in (True, False, "low", "medium", "high") else None
+        self.chat = self._prepare(options)
+        self.thread = threading.Thread(target=self._main, daemon=True, name="run-%s" % chat_id)
+
+    # ------------------------------------------------------------ setup
+    def _prepare(self, options):
+        srv = self.srv
+        with srv.chat_lock(self.chat_id):
+            try:
+                chat = srv.load_chat(self.chat_id)
+            except FileNotFoundError:
+                raise RunError("This chat doesn't exist any more.")
+            chat.pop("_path", None)
+            msgs = chat.setdefault("messages", [])
+            if options.get("regenerate"):
+                while msgs and msgs[-1].get("role") != "user":
+                    msgs.pop()
+                if not msgs:
+                    raise RunError("There is nothing to regenerate.")
+            else:
+                at = options.get("truncateAt")
+                if at is not None:  # edit and resend: drop that user message and everything after it
+                    if not isinstance(at, int) or not 0 <= at < len(msgs) or msgs[at].get("role") != "user":
+                        raise RunError("That message can't be edited.")
+                    del msgs[at:]
+                text = options.get("text") or ""
+                images = options.get("images") or []
+                if not isinstance(text, str) or not isinstance(images, list):
+                    raise RunError("Invalid message.")
+                if len(images) > MAX_IMAGES or not all(isinstance(i, str) and 0 < len(i) <= MAX_IMAGE_CHARS for i in images):
+                    raise RunError("Attach at most %d images." % MAX_IMAGES)
+                if not text.strip() and not images:
+                    raise RunError("The message is empty.")
+                message = {"role": "user", "content": text}
+                if images:
+                    message["images"] = images
+                msgs.append(message)
+            if not chat.get("model"):
+                raise RunError("Pick a model for this chat first.")
+            chat["updated"] = now_ms()
+            srv.save_chat(self.chat_id, chat)
+        return chat
+
+    # ------------------------------------------------------------ events and state
+    def public_approval(self):
+        a = self.approval
+        return {"id": a["id"], "kind": a["kind"], "data": a["data"]} if a else None
+
+    def snapshot_event(self):
+        return {"type": "snapshot", "chat": copy.deepcopy(self.chat), "status": self.status, "approval": self.public_approval()}
+
+    def publish(self, event):
+        self.engine.channel(self.chat_id).publish(event)
+
+    def add(self, message):
+        with self.lock:
+            self.chat["messages"].append(message)
+            idx = len(self.chat["messages"]) - 1
+            self.publish({"type": "message", "index": idx, "message": copy.deepcopy(message)})
+            return idx
+
+    def update(self, idx, **fields):
+        """Set fields on a message; a value of None removes that field."""
+        with self.lock:
+            m = self.chat["messages"][idx]
+            for key, value in fields.items():
+                if value is None:
+                    m.pop(key, None)
+                else:
+                    m[key] = value
+            self.publish({"type": "message", "index": idx, "message": copy.deepcopy(m)})
+
+    def delta(self, idx, content, thinking):
+        with self.lock:
+            m = self.chat["messages"][idx]
+            m["content"] = (m.get("content") or "") + content
+            m["thinking"] = (m.get("thinking") or "") + thinking
+            self.publish({"type": "delta", "index": idx, "content": content, "thinking": thinking})
+
+    def set_status(self, status):
+        with self.lock:
+            self.status = status
+            self.publish({"type": "status", "status": status, "model": self.chat.get("model")})
+
+    def save(self):
+        """Write messages, model and usage; folders/permissions/title keep what is on disk."""
+        srv = self.srv
+        with self.lock:
+            msgs = copy.deepcopy(self.chat["messages"])
+            model, usage, context = self.chat.get("model"), copy.deepcopy(self.chat.get("usage")), copy.deepcopy(self.chat.get("context"))
+        with srv.chat_lock(self.chat_id):
+            try:
+                disk = srv.load_chat(self.chat_id)
+            except (OSError, ValueError):
+                return  # deleted meanwhile
+            disk["messages"], disk["model"], disk["updated"] = msgs, model, now_ms()
+            if usage: disk["usage"] = usage
+            if context: disk["context"] = context
+            srv.save_chat(self.chat_id, disk)
+
+    # ------------------------------------------------------------ control from other threads
+    def cancel(self):
+        self.cancelled.set()
+        with self.lock:
+            a, r = self.approval, self.response
+        if a:
+            a["event"].set()  # result stays False -> denied
+        if r is not None:
+            try: r.close()  # unblocks the streaming read
+            except Exception: pass  # noqa: BLE001
+
+    def decide(self, approval_id, approve):
+        with self.lock:
+            a = self.approval
+            if not a or a["id"] != approval_id or a["event"].is_set():
+                return False
+            a["result"] = bool(approve)
+            a["event"].set()
+            return True
+
+    def wait_approval(self, kind, data):
+        a = {"id": secrets.token_hex(8), "kind": kind, "data": data, "event": threading.Event(), "result": False}
+        with self.lock:
+            self.approval = a
+            self.publish({"type": "approval", "approval": self.public_approval()})
+        self.set_status("waiting")
+        a["event"].wait(APPROVAL_WAIT)
+        with self.lock:
+            self.approval = None
+            self.publish({"type": "approval_done", "id": a["id"]})
+        if not self.cancelled.is_set():
+            self.set_status("running")
+        return a["result"] and not self.cancelled.is_set()
+
+    # ------------------------------------------------------------ the loop
+    def _main(self):
+        srv = self.srv
+        try:
+            self.publish(self.snapshot_event())
+            if not srv.api_key(srv.load_config()):
+                self.add({"role": "assistant", "content": "", "model": self.chat.get("model", ""),
+                          "error": "Add your Ollama API key in Settings to use Ollama Cloud."})
+                return
+            for step in range(MAX_STEPS):
+                if self.cancelled.is_set():
+                    break
+                idx = self.add({"role": "assistant", "content": "", "thinking": "", "model": self.chat["model"], "_live": True})
+                self.stream_step(idx)
+                reply = self.chat["messages"][idx]
+                if self.cancelled.is_set() or reply.get("error") or not reply.get("tool_calls"):
+                    break
+                for call in reply["tool_calls"]:
+                    if self.cancelled.is_set():
+                        break
+                    self.run_tool_call(call)
+                self.save()
+            else:
+                self.add({"role": "assistant", "content": "", "model": self.chat["model"],
+                          "error": "Stopped after %d tool steps. Send a message to continue." % MAX_STEPS})
+        except Exception as e:  # noqa: BLE001 - never leave a run stuck in "running"
+            self.add({"role": "assistant", "content": "", "model": self.chat.get("model", ""), "error": "Unexpected error: %s" % e})
+        finally:
+            with self.lock:
+                for m in self.chat["messages"]:
+                    for flag in ("_live", "_running", "_approval", "_modelApproval"):
+                        m.pop(flag, None)
+                self.alive = False
+            try:
+                self.save()
+            finally:
+                self.set_status("idle")
+
+    def build_request(self, model):
+        srv = self.srv
+        with self.lock:
+            history = [m for m in copy.deepcopy(self.chat["messages"]) if not m.get("_live")]
+        info_model = srv.model_info(model)
+        msgs, info = context_budget.build(history, info_model.get("context_length"))
+        body = {"model": model, "messages": msgs, "stream": True}
+        if self.think is not None:
+            body["think"] = self.think
+        if self.use_tools:
+            fcfg = srv.saved_tool_config(self.chat_id)
+            specs, where = srv.tool_specs(fcfg)
+            if specs:
+                body["tools"] = specs
+                note = srv.tool_system_note(fcfg, specs, where)
+                if msgs and msgs[0]["role"] == "system":
+                    msgs[0] = dict(msgs[0], content=msgs[0]["content"] + "\n\n" + note)
+                else:
+                    msgs.insert(0, {"role": "system", "content": note})
+        self.publish(dict(info, type="context"))
+        return body, info
+
+    def stream_step(self, idx):
+        srv = self.srv
+        model = self.chat["model"]
+        while True:
+            body, info = self.build_request(model)
+            try:
+                r = srv.upstream("/api/chat", body)
+                break
+            except urllib.error.HTTPError as e:
+                msg = srv.http_error_text(e)
+                if self.use_tools and "does not support tools" in msg.lower():
+                    self.use_tools = False  # retry this step without any tools
+                    self.update(idx, notice="This model doesn't support tools, so folder access is off for this reply.")
+                    continue
+                self.update(idx, error=msg, _live=None, thinking=None)
+                return
+            except Exception as e:  # noqa: BLE001
+                self.update(idx, error="Could not reach Ollama Cloud: %s" % e, _live=None, thinking=None)
+                return
+        with self.lock:
+            self.response = r
+        tool_calls, final, error = [], None, None
+        try:
+            with r:
+                while not self.cancelled.is_set():
+                    line = r.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        j = json.loads(line)
+                    except ValueError:
+                        continue
+                    if j.get("error"):
+                        error = str(j["error"])
+                        break
+                    msg = j.get("message") or {}
+                    content, thinking = msg.get("content") or "", msg.get("thinking") or ""
+                    if content or thinking:
+                        self.delta(idx, content, thinking)
+                    if msg.get("tool_calls"):
+                        tool_calls.extend(msg["tool_calls"])
+                    if j.get("done"):
+                        final = j
+        except Exception as e:  # noqa: BLE001 - includes the read failing after Stop closed it
+            if not self.cancelled.is_set():
+                error = str(e)
+        finally:
+            with self.lock:
+                self.response = None
+        fields = {"_live": None}
+        stats = []
+        if final:
+            stats.append(self.record_usage(final, info))
+        if self.cancelled.is_set():
+            stats.append("stopped")
+        if error:
+            fields["error"] = error
+        if tool_calls and not self.cancelled.is_set():
+            fields["tool_calls"] = tool_calls
+        if stats and any(stats):
+            fields["stats"] = " · ".join(s for s in stats if s)
+        with self.lock:
+            if not self.chat["messages"][idx].get("thinking"):
+                fields["thinking"] = None
+        self.update(idx, **fields)
+
+    def record_usage(self, final, info):
+        prompt, output = int(final.get("prompt_eval_count") or 0), int(final.get("eval_count") or 0)
+        with self.lock:
+            u = self.chat.setdefault("usage", {"promptTokens": 0, "outputTokens": 0, "requests": 0})
+            u["promptTokens"] += prompt
+            u["outputTokens"] += output
+            u["requests"] += 1
+            context = {"used": prompt + output, "limit": info["contextTokens"], "omittedMessages": info["omittedMessages"],
+                       "clippedToolResults": info["clippedToolResults"]}
+            self.chat["context"] = context
+            session = dict(u)
+        today = self.srv.record_daily_usage(prompt, output)
+        self.publish({"type": "usage", "session": session, "today": today, "context": context})
+        speed = ""
+        if output and final.get("eval_duration"):
+            speed = " · %.1f tok/s" % (output / (final["eval_duration"] / 1e9))
+        return "%d tokens%s" % (output, speed) if output else ""
+
+    def run_tool_call(self, call):
+        srv = self.srv
+        fn = (call or {}).get("function") or {}
+        name = str(fn.get("name") or "")
+        args = fn.get("arguments") or {}
+        if isinstance(args, str):
+            try: args = json.loads(args)
+            except ValueError: args = {}
+        if not isinstance(args, dict):
+            args = {}
+        display = args.get("path") or args.get("source") or args.get("model") or args.get("pattern") or args.get("contains") or ""
+        if name == "search_files" and args.get("contains"):
+            display = '"%s"%s' % (args["contains"], (" in " + args["path"]) if args.get("path") else "")
+        idx = self.add({"role": "tool", "tool_name": name, "content": "", "display": str(display), "_running": True})
+        try:
+            if name in srv.REVIEWED_TOOLS:
+                chat = srv.saved_tool_config(self.chat_id)
+                if capabilities.policy(chat)["editMode"] == "auto":
+                    out = srv.run_tool(chat, name, args)
+                else:
+                    prepared = srv.prepare_write(self.chat_id, name, args)
+                    self.update(idx, display=prepared["path"], _approval={"path": prepared["path"]})
+                    data = {k: v for k, v in prepared.items() if k != "token"}
+                    ok = self.wait_approval("write", data)
+                    self.update(idx, _approval=None)
+                    if not ok:
+                        srv.cancel_write(self.chat_id, prepared["token"])
+                        raise Denied("The write was cancelled." if self.cancelled.is_set() else "The user denied this change.")
+                    out = srv.run_approved_write(self.chat_id, prepared["token"])
+            elif name == "set_session_model":
+                r = srv.change_session_model(self.chat_id, args)
+                if r.get("needsApproval"):
+                    self.update(idx, _modelApproval={"model": r["model"]})
+                    data = {k: r.get(k) for k in ("model", "previous", "reason", "capabilities", "warnings")}
+                    ok = self.wait_approval("model", data)
+                    self.update(idx, _modelApproval=None)
+                    if not ok:
+                        srv.cancel_write(self.chat_id, r["approvalToken"])
+                        raise Denied("The model change was cancelled." if self.cancelled.is_set() else "The user denied the model change.")
+                    r = srv.change_session_model(self.chat_id, args, r["approvalToken"])
+                out = r["content"]
+                if r.get("model"):
+                    with self.lock:
+                        self.chat["model"] = r["model"]
+                    self.set_status(self.status)  # tells windows about the new model
+            else:
+                out = srv.run_tool(srv.saved_tool_config(self.chat_id), name, args)
+            self.update(idx, content=out, _running=None)
+        except Denied as e:
+            self.update(idx, content=str(e), isError=True, _running=None)
+        except (srv.ToolError, ValueError, OSError) as e:
+            self.update(idx, content="Error: %s" % e, isError=True, _running=None)

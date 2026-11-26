@@ -216,35 +216,6 @@ class HTTPPhase1Tests(TempChatsMixin, unittest.TestCase):
         status, body = self.post("/api/session/rename", {"chatId": "c1", "title": "   "})
         self.assertEqual(400, status)
 
-    def test_auto_edit_writes_without_token_review_does_not(self):
-        target = self.shared / "auto.txt"
-        self.make_chat(caps=dict(FULL, editMode="review"))
-        _, body = self.post("/api/tool", {"chatId": "c1", "name": "write_file", "arguments": {"path": str(target), "content": "x"}})
-        self.assertTrue(body.get("error")); self.assertFalse(target.exists())
-        self.make_chat(caps=dict(FULL, editMode="auto"))
-        _, body = self.post("/api/tool", {"chatId": "c1", "name": "write_file", "arguments": {"path": str(target), "content": "auto"}})
-        self.assertFalse(body.get("error")); self.assertEqual("auto", target.read_text(encoding="utf-8"))
-        _, body = self.post("/api/tool", {"chatId": "c1", "name": "write_file", "arguments": {"path": str(self.readonly / "x.txt"), "content": "x"}})
-        self.assertTrue(body.get("error")); self.assertFalse((self.readonly / "x.txt").exists())
-
-    def test_chat_request_tools_follow_policy_and_toggle(self):
-        sent = []
-        def fake_upstream(path, body):
-            import io; sent.append(body); return io.BytesIO(b'{"done": true}\n')
-        msg = {"model": "model-a", "messages": [{"role": "user", "content": "hi"}]}
-        with mock.patch.object(server, "load_config", return_value={"apiKey": "k"}), \
-             mock.patch.object(server, "upstream", side_effect=fake_upstream):
-            self.make_chat(caps=dict(FULL, modelControl="fixed"), folders=[])
-            self.post("/api/chat", dict(msg, chatId="c1"))
-            self.make_chat(caps=dict(FULL, modelControl="ask"), folders=[])
-            self.post("/api/chat", dict(msg, chatId="c1"))
-            self.post("/api/chat", dict(msg, chatId="c1", toolsEnabled=False))
-        self.assertNotIn("tools", sent[0])  # fixed + no folders: nothing to offer
-        self.assertEqual(["set_session_model"], [t["function"]["name"] for t in sent[1]["tools"]])
-        self.assertIn("explicitly asks", sent[1]["messages"][0]["content"])
-        self.assertNotIn("tools", sent[2])  # model without tool support: retry must carry no tools
-
-
 class EditAndVersionTests(TempChatsMixin, unittest.TestCase):
     """Phase 1.6: edit_file, kept versions before overwrites, and the trash screen's operations."""
 

@@ -1,3 +1,24 @@
+# Open AY Desktop 1.3.0
+
+Replies run on the server, with context management and usage (Phase 2).
+
+## New
+- **Replies run on the local server**, not in the window. Switching chats or closing the window no longer stops a reply, and several chats can reply at once. The sidebar shows which chats are replying (pulsing dot) or waiting for your approval (amber dot).
+- **Approvals wait on the server** for up to 30 minutes. **Later** closes the dialog without answering, and the card in the chat reopens it. You can answer from any open window.
+- **Context budget:** each request is fitted into the model's context window. Older tool results are shortened, and if needed the oldest whole turns are left out, with a note to the model. The saved history is never changed.
+- **Usage line** under the message box: context used in the last request, this chat's tokens, and today's tokens and requests. Daily totals are kept in `data/usage.json`.
+- **Edit and resend** shows a banner and replaces the earlier message only when you send.
+
+## Changed
+- The window talks to the server through `/api/chats`, `/api/runs` and a live event stream (`/api/chats/<id>/events`). The old `/api/chat` and `/api/tool*` endpoints are gone.
+- Escape on an approval dialog now means **Later**, not **Deny**.
+- The background server stays alive while any reply is running, even with no window open.
+
+## Verification
+59 automated tests (16 new for runs, events, approvals, stop and the context budget) and `python verify_static.py`.
+
+---
+
 # Open AY Desktop 1.2.0
 
 Undoable edits, a Trash screen and server-owned permissions (Phase 1.6).
