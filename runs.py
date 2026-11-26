@@ -27,6 +27,13 @@ import urllib.error
 
 import capabilities
 import context_budget
+import skills
+import web
+
+ACTION_TITLES = {"create_folder": "Create a folder?", "copy_path": "Copy this item?", "move_path": "Move or rename this item?",
+                 "delete_path": "Move this item to the trash?", "restore_path": "Restore this item from the trash?"}
+UNTRUSTED_WHY = ("This chat has read web content, which can contain text written to steer the model. "
+                 "So file changes in this chat need your approval each time.")
 
 MAX_STEPS = 25
 APPROVAL_WAIT = 1800          # seconds an approval waits before it counts as denied
@@ -310,7 +317,7 @@ class Run:
         finally:
             with self.lock:
                 for m in self.chat["messages"]:
-                    for flag in ("_live", "_running", "_approval", "_modelApproval"):
+                    for flag in ("_live", "_running", "_approval", "_modelApproval", "_actionApproval"):
                         m.pop(flag, None)
                 self.alive = False
             try:
@@ -327,16 +334,19 @@ class Run:
         body = {"model": model, "messages": msgs, "stream": True}
         if self.think is not None:
             body["think"] = self.think
+        fcfg = srv.saved_tool_config(self.chat_id)  # fresh from disk: permissions/skills may change mid-run
+        system = [skills.prompt(srv.skills_root(), fcfg.get("skills") or [])]
         if self.use_tools:
-            fcfg = srv.saved_tool_config(self.chat_id)
             specs, where = srv.tool_specs(fcfg)
             if specs:
                 body["tools"] = specs
-                note = srv.tool_system_note(fcfg, specs, where)
-                if msgs and msgs[0]["role"] == "system":
-                    msgs[0] = dict(msgs[0], content=msgs[0]["content"] + "\n\n" + note)
-                else:
-                    msgs.insert(0, {"role": "system", "content": note})
+                system.append(srv.tool_system_note(fcfg, specs, where))
+        note = "\n\n".join(x for x in system if x)
+        if note:
+            if msgs and msgs[0]["role"] == "system":
+                msgs[0] = dict(msgs[0], content=msgs[0]["content"] + "\n\n" + note)
+            else:
+                msgs.insert(0, {"role": "system", "content": note})
         self.publish(dict(info, type="context"))
         return body, info
 
@@ -437,7 +447,8 @@ class Run:
             except ValueError: args = {}
         if not isinstance(args, dict):
             args = {}
-        display = args.get("path") or args.get("source") or args.get("model") or args.get("pattern") or args.get("contains") or ""
+        display = (args.get("path") or args.get("source") or args.get("model") or args.get("query") or args.get("url")
+                   or args.get("pattern") or args.get("contains") or "")
         if name == "search_files" and args.get("contains"):
             display = '"%s"%s' % (args["contains"], (" in " + args["path"]) if args.get("path") else "")
         idx = self.add({"role": "tool", "tool_name": name, "content": "", "display": str(display), "_running": True})
@@ -472,10 +483,51 @@ class Run:
                     with self.lock:
                         self.chat["model"] = r["model"]
                     self.set_status(self.status)  # tells windows about the new model
+            elif name in ("web_search", "web_fetch"):
+                out = self.run_web_tool(idx, name, args)
             else:
-                out = srv.run_tool(srv.saved_tool_config(self.chat_id), name, args)
+                chat = srv.saved_tool_config(self.chat_id)
+                if name in capabilities.GATED_WHEN_UNTRUSTED and capabilities.policy(chat)["untrusted"]:
+                    detail = "\n".join("%s: %s" % (k, v) for k, v in args.items() if k in ("path", "source", "destination", "trash_id"))
+                    self.ask(idx, {"title": ACTION_TITLES.get(name, "Allow this action?"), "detail": detail, "why": UNTRUSTED_WHY},
+                             "The user denied this action.")
+                    chat = srv.saved_tool_config(self.chat_id)  # permissions may have changed while waiting
+                out = srv.run_tool(chat, name, args)
             self.update(idx, content=out, _running=None)
         except Denied as e:
             self.update(idx, content=str(e), isError=True, _running=None)
-        except (srv.ToolError, ValueError, OSError) as e:
+        except (srv.ToolError, web.WebError, ValueError, OSError) as e:
             self.update(idx, content="Error: %s" % e, isError=True, _running=None)
+
+    def ask(self, idx, data, denied_text):
+        """Ask the user to approve a gated action; raises Denied unless they allow it."""
+        self.update(idx, _actionApproval={"title": data["title"]})
+        ok = self.wait_approval("action", data)
+        self.update(idx, _actionApproval=None)
+        if not ok:
+            raise Denied("The action was cancelled." if self.cancelled.is_set() else denied_text)
+
+    def run_web_tool(self, idx, name, args):
+        srv = self.srv
+        chat = srv.saved_tool_config(self.chat_id)
+        if not capabilities.policy(chat)["webSearch"]:
+            raise srv.ToolError("Web search is off for this session.")
+        if name == "web_search":
+            out, urls = web.search(srv.cloud_post, args.get("query"), args.get("max_results", 5))
+            source = 'search: "%s"' % str(args.get("query"))[:120]
+        else:
+            url = web.valid_url(args.get("url"))
+            user_texts = [m.get("content") or "" for m in chat.get("messages") or [] if m.get("role") == "user"]
+            if not web.known_url(url, chat.get("webUrls") or [], user_texts):
+                self.ask(idx, {"title": "Open this web page?", "detail": url,
+                               "why": "This address didn't come from a web search or from your messages. A page address can carry "
+                                      "information out of this chat, so opening it needs your approval."},
+                         "The user didn't allow opening this page.")
+            out, urls = web.fetch(srv.cloud_post, url)
+            urls = [url]  # links found on the page stay unapproved
+            source = "page: %s" % url[:200]
+        flag = srv.mark_untrusted(self.chat_id, source, urls)
+        with self.lock:
+            self.chat["untrusted"] = flag
+            self.publish({"type": "untrusted", "untrusted": flag})
+        return out

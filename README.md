@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It needs Python 3 (standard library only) and Edge or Chrome. There is no frontend framework, npm installation, or build step.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.3.0
+- **Version:** 1.4.0
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -73,9 +73,37 @@ A chat's folders, permissions and name are **server-owned**. Normal chat saves f
   - *Change when I ask in chat, without confirming*: switches without the dialog.
   - *Fixed*: the session can't change its model.
 
+- **Web search and reading web pages:** off by default. See *Web search* below.
+- **Skills for this chat:** tick the skills this chat should follow. See *Skills* below.
+
   The model is told to switch only when you explicitly ask. Before switching, the server checks that the model exists in Ollama Cloud. It refuses a model without image support if the chat contains images, and warns when the new model doesn't support tools. The new model answers from the next step of the same reply. Your default model in Settings is not changed.
 
 Chats saved before these settings existed get the defaults above. A folder with **Allow edits** still allows reviewed writes, but file management and deletion stay off until you enable them.
+
+## Web search
+Turn on **Allow web search and reading web pages** in a chat's Session settings. The model gets two tools, which use Ollama's web API with your API key:
+- **`web_search`** returns titles, addresses and snippets.
+- **`web_fetch`** reads a page.
+
+The model is told to cite the sources it uses as clickable Markdown links.
+
+Web pages are written by strangers and can contain text aimed at steering the model. The app protects against that in four ways:
+- **Results are marked as data.** Everything from the web is wrapped in clear "untrusted content" markers, which a page can't fake, and the model is told never to follow instructions inside them.
+- **The chat becomes untrusted.** The first time a chat reads web content, a **⚠ Web content** badge appears in the header. From then on in that chat, no matter what its settings say:
+  - every file write or edit needs your review, even with auto-edit;
+  - model switching set to "allowed" asks you first;
+  - every create, copy, move, delete or restore needs your approval.
+- **Opening a page can need approval.** A page address can carry information out of the chat, for example file contents written into a link. So `web_fetch` opens a page without asking only if its address came from a web search in this chat or from your own messages. Links found on a page always need approval.
+- **You decide when to trust it again.** In Session settings, the notice lists what the chat read, and **Trust this chat again** clears the flag. The web content stays in the conversation.
+
+One gap remains: the model could still put private information into a search query. The model is told not to, but the app can't check it, so turn on web search only for chats where that risk is acceptable.
+
+## Skills
+A skill is a set of instructions you write once and turn on per chat, for example how to review code or the style to write in. Open **✦** in the sidebar to:
+- create, edit or delete skills;
+- import a Markdown file. An optional `name:` and `description:` header between `---` lines is read.
+
+Turn skills on for a chat in its Session settings. Enabled skills are added to the chat's system instructions on every request, up to 30,000 characters in total and 20,000 per skill. A skill is only text: it can't run code, call tools by itself, or change what the chat is allowed to do. Skills are stored as Markdown files in `data/skills/`.
 
 ## Replies run on the server
 Each reply runs on the app's local server (`runs.py`): the model answers, calls tools, gets their results, and continues, up to 25 steps. The window shows it live through an event stream. As a result:
@@ -114,7 +142,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 
 ## Publishing a release for the updater
 1. Update `APP_VERSION` in `server.py` and the version shown here.
-2. Commit and tag the release as `vX.Y.Z`, for example `v1.3.0`.
+2. Commit and tag the release as `vX.Y.Z`, for example `v1.4.0`.
 3. Publish a non-draft GitHub Release with that tag in `arothm/OpenAYDesktop`.
 4. The app's update check compares numeric semantic versions. A malformed release tag produces a clear error. If no release has been published, GitHub's 404 response is reported as **No published release yet**, not as an update.
 
@@ -124,10 +152,12 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `context_budget.py` — fits the history into the model's context window.
 - `capabilities.py` — session permission policy, file management, trash and versions.
 - `session_actions.py` — session renaming.
+- `web.py` — web search and page reading, with untrusted-content markers.
+- `skills.py` — skill files: storage, validation and the per-chat prompt.
 - `index.html` — application and dialog markup.
 - `styles.css` — interface styling and light/dark themes.
 - `app.js` — the window: live event stream, rendering, approvals, sessions, trash, and settings.
-- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`).
+- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`).
 - `verify_static.py` — optional static consistency checks.
 - `backups/pre-approved-changes/` — original source copies from before the first approved change set.
 

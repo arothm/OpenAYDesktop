@@ -1,3 +1,24 @@
+# Open AY Desktop 1.4.0
+
+Web search, skills, and protection against untrusted content (Phase 3).
+
+## New
+- **Web search:** turn it on per chat in Session settings. The model can search the web and read pages through Ollama's web API, and is told to cite its sources as clickable links.
+- **Untrusted-content protection:** once a chat reads web content, it shows a ⚠ Web content badge. From then on, in that chat:
+  - every file change needs your review, even with auto-edit;
+  - every create, copy, move, delete or restore needs your approval;
+  - model switching set to "allowed" asks you first.
+
+  Web results are wrapped in markers a page can't fake. **Trust this chat again** in Session settings clears the flag.
+- **Link approval:** the model can open a page without asking only if its address came from a web search or from your messages. Any other address, including links found on a page, needs your approval, because addresses can carry information out of the chat.
+- **Skills (✦ in the sidebar):** write or import Markdown instructions and turn them on per chat. They're added to the chat's system instructions and can't change permissions.
+- **A general approval dialog** for actions that need your approval, with Later, Deny and Allow.
+
+## Verification
+73 automated tests (14 new for web, untrusted rules, link approval, gated actions and skills) and `python verify_static.py`.
+
+---
+
 # Open AY Desktop 1.3.0
 
 Replies run on the server, with context management and usage (Phase 2).

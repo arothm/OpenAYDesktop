@@ -9,8 +9,11 @@ import uuid
 
 # modelControl: "ask" = the user approves each switch (default), "allowed" = switch when the
 # user asks without a confirmation step, "fixed" = the session can't change its model.
-DEFAULT_POLICY = {"editMode": "review", "fileManage": False, "deleteFiles": False, "modelControl": "ask"}
+# webSearch: the session may search the web and read pages (off by default).
+DEFAULT_POLICY = {"editMode": "review", "fileManage": False, "deleteFiles": False, "modelControl": "ask", "webSearch": False}
 EDIT_MODES = {"review", "auto"}
+# After a session has read untrusted content (web pages), these need the user's approval each time.
+GATED_WHEN_UNTRUSTED = {"create_folder", "copy_path", "move_path", "delete_path", "restore_path"}
 MODEL_MODES = {"allowed", "ask", "fixed"}
 MAX_COPY_BYTES = 500_000_000
 
@@ -36,6 +39,14 @@ def policy(chat):
         p["modelControl"] = "ask"
     p["fileManage"] = bool(p["fileManage"]) and writable
     p["deleteFiles"] = bool(p["deleteFiles"]) and writable
+    p["webSearch"] = bool(p["webSearch"])
+    # Untrusted content (web pages) can carry instructions aimed at the model. Once a session has
+    # read some, nothing that changes files or the model happens without the user's approval.
+    p["untrusted"] = bool(chat.get("untrusted"))
+    if p["untrusted"]:
+        p["editMode"] = "review"
+        if p["modelControl"] == "allowed":
+            p["modelControl"] = "ask"
     return p
 
 
@@ -318,7 +329,7 @@ def clean_capabilities(value):
     if "modelControl" in value:
         if value["modelControl"] not in MODEL_MODES: raise CapabilityError("Unknown model control mode.")
         out["modelControl"] = value["modelControl"]
-    for key in ("fileManage", "deleteFiles"):
+    for key in ("fileManage", "deleteFiles", "webSearch"):
         if key in value:
             if not isinstance(value[key], bool): raise CapabilityError("%s must be true or false." % key)
             out[key] = value[key]

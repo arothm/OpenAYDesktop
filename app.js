@@ -10,7 +10,7 @@ const state = {
   clearKey: false, updateUrl: "", sessionDraft: null,
   es: null, runStatus: "idle", runs: {}, editIndex: null, usage: null, today: null,
 };
-const DEFAULT_CAPABILITIES = { editMode: "review", fileManage: false, deleteFiles: false, modelControl: "ask" };
+const DEFAULT_CAPABILITIES = { editMode: "review", fileManage: false, deleteFiles: false, modelControl: "ask", webSearch: false };
 const api = async (path, opts = {}) => {
   const r = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
   const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.statusText); return j;
@@ -103,7 +103,7 @@ function applyEvent(id, ev) {
   if (ev.type === "snapshot") {
     if (ev.chat.id !== id) return;
     const first = state.chat?.id !== id; state.chat = ev.chat; state.selectedModel = ev.chat.model;
-    setRunStatus(ev.status); showApproval(ev.approval); updateModelBtn(); updateFolderBtn(); $("#title").textContent = ev.chat.title;
+    setRunStatus(ev.status); showApproval(ev.approval); updateModelBtn(); updateFolderBtn(); updateUntrustedBadge(); $("#title").textContent = ev.chat.title;
     renderMessages(); scrollBottom(first); renderUsage(); return;
   }
   const chat = state.chat; if (!chat || chat.id !== id) return;
@@ -124,6 +124,7 @@ function applyEvent(id, ev) {
       break;
     case "approval": showApproval(ev.approval); break;
     case "approval_done": closeApproval(ev.id); break;
+    case "untrusted": chat.untrusted = ev.untrusted; updateUntrustedBadge(); break;
     case "context": state.contextInfo = ev; break;
     case "usage": chat.usage = ev.session; chat.context = ev.context; state.today = ev.today; renderUsage(); break;
   }
@@ -151,14 +152,14 @@ async function loadUsage() { try { state.today = (await api("/api/usage")).today
 function newChat() {
   state.navSeq++; subscribe(null); state.chat = null; state.draftFolders = []; state.editIndex = null; closeApproval(); setRunStatus("idle");
   state.selectedModel = state.config.defaultModel || state.models[0]?.name || "";
-  renderMessages(); renderChatList(); updateModelBtn(); updateFolderBtn(); toggleFolderPop(false); renderUsage(); $("#title").textContent = ""; $("#input").focus();
+  renderMessages(); renderChatList(); updateModelBtn(); updateFolderBtn(); updateUntrustedBadge(); toggleFolderPop(false); renderUsage(); $("#title").textContent = ""; $("#input").focus();
 }
 async function openChat(id) {
   const ticket = ++state.navSeq; let chat;
   try { chat = await api("/api/chats/" + id); } catch (e) { toast(e.message); return; }
   if (ticket !== state.navSeq) return;
   closeApproval(); state.editIndex = null; state.chat = chat; state.selectedModel = chat.model; setRunStatus(state.runs[id] || "idle");
-  updateModelBtn(); renderMessages(); renderChatList(); updateFolderBtn(); toggleFolderPop(false); renderUsage(); $("#title").textContent = chat.title; scrollBottom(true);
+  updateModelBtn(); renderMessages(); renderChatList(); updateFolderBtn(); updateUntrustedBadge(); toggleFolderPop(false); renderUsage(); $("#title").textContent = chat.title; scrollBottom(true);
   subscribe(id);  // the snapshot that follows brings any live run state
 }
 async function deleteChat(id) {
@@ -169,8 +170,9 @@ async function deleteChat(id) {
 }
 
 // Rendering
-const TOOL_LABEL = { list_directory: "Listed folder", read_file: "Read file", search_files: "Searched files", write_file: "Wrote file", edit_file: "Edited file", create_folder: "Created folder", copy_path: "Copied item", move_path: "Moved/renamed item", delete_path: "Moved to trash", restore_path: "Restored item", set_session_model: "Changed model" };
+const TOOL_LABEL = { list_directory: "Listed folder", read_file: "Read file", search_files: "Searched files", write_file: "Wrote file", edit_file: "Edited file", create_folder: "Created folder", copy_path: "Copied item", move_path: "Moved/renamed item", delete_path: "Moved to trash", restore_path: "Restored item", set_session_model: "Changed model", web_search: "Searched the web", web_fetch: "Read web page" };
 function toolHTML(m, idx) {
+  if (m._actionApproval) return `<div class="approve" data-idx="${idx}"><div class="q">${esc(m._actionApproval.title)}</div><div class="detail">Nothing has happened yet. This needs your approval.</div><div class="btns"><button class="btn primary" data-action-review="yes">Review</button><button class="btn" data-action-approve="no">Deny</button></div></div>`;
   if (m._modelApproval) return `<div class="approve" data-idx="${idx}"><div class="q">Switch this session to ${esc(m._modelApproval.model)}?</div><div class="detail">Nothing has changed yet. The model is waiting for your approval.</div><div class="btns"><button class="btn primary" data-model-review="yes">Review change</button><button class="btn" data-model-approve="no">Keep current model</button></div></div>`;
   if (m._approval) return `<div class="approve" data-idx="${idx}"><div class="q">Review requested change to ${esc(m._approval.path)}</div><div class="detail">Nothing has been written. Review the complete change before deciding.</div><div class="btns"><button class="btn primary" data-review="yes">Review change</button><button class="btn" data-approve="no">Deny</button></div></div>`;
   const status = m._running ? "running…" : m.isError ? "failed" : "";
@@ -244,6 +246,11 @@ function showApproval(a) {
   if (a.kind === "write") {
     if (state.approval?.id === a.id) return;
     state.approval = { id: a.id, chatId: state.chat.id, approval: a.data, mode: a.data.exists ? "diff" : "content", decided: false }; openApprovalPreview();
+  } else if (a.kind === "action") {
+    if (state.actionApproval?.id === a.id) return;
+    state.actionApproval = { id: a.id, chatId: state.chat.id, decided: false };
+    $("#aaTitle").textContent = a.data.title || "Allow this action?"; $("#aaDetail").textContent = a.data.detail || ""; $("#aaWhy").textContent = a.data.why || "";
+    $("#actionApproveBack").classList.add("open"); $("#aaAllow").focus();
   } else if (a.kind === "model") {
     if (state.modelApproval?.id === a.id) return; const r = a.data;
     state.modelApproval = { id: a.id, chatId: state.chat.id, decided: false };
@@ -256,7 +263,13 @@ function showApproval(a) {
 function closeApproval(id) {
   if (state.approval && (!id || state.approval.id === id)) { state.approval = null; $("#previewBack").classList.remove("open"); }
   if (state.modelApproval && (!id || state.modelApproval.id === id)) { state.modelApproval = null; $("#modelApproveBack").classList.remove("open"); }
+  if (state.actionApproval && (!id || state.actionApproval.id === id)) { state.actionApproval = null; $("#actionApproveBack").classList.remove("open"); }
 }
+function decideActionApproval(approved) {
+  const pending = state.actionApproval; if (!pending || pending.decided) return; pending.decided = true; state.actionApproval = null; $("#actionApproveBack").classList.remove("open");
+  answerApproval(pending, approved);
+}
+function updateUntrustedBadge() { $("#untrustedBadge").hidden = !state.chat?.untrusted; }
 function answerApproval(pending, approved) {
   api("/api/runs/approve", { method: "POST", body: JSON.stringify({ chatId: pending.chatId, approvalId: pending.id, approve: Boolean(approved) }) }).catch((e) => toast(e.message));
 }
@@ -326,19 +339,35 @@ function openSession() {
   $("#sessionName").value = state.chat.title || "Untitled"; $("#editMode").value = c.editMode;
   $("#fileManage").checked = writable && c.fileManage; $("#deleteFiles").checked = writable && c.deleteFiles;
   $("#fileManage").disabled = !writable; $("#deleteFiles").disabled = !writable; $("#modelControl").value = c.modelControl;
+  $("#webSearch").checked = Boolean(c.webSearch);
+  const u = state.chat.untrusted; $("#untrustedBox").hidden = !u;
+  if (u) $("#untrustedSources").textContent = "Since " + new Date(u.since).toLocaleString() + ". Read: " + (u.sources || []).join("; ");
+  $("#sessionSkills").innerHTML = '<span class="help">Loading skills…</span>';
+  api("/api/skills").then((r) => {
+    const on = new Set(state.chat?.skills || []);
+    $("#sessionSkills").innerHTML = r.skills.map((s) => `<label><input type="checkbox" data-skill="${esc(s.id)}" ${on.has(s.id) ? "checked" : ""}> ${esc(s.name)} <span class="d">${esc(s.description)}</span></label>`).join("")
+      || '<span class="help" style="margin:0">No skills yet.</span>';
+  }).catch((e) => { $("#sessionSkills").textContent = e.message; });
   $("#sessionBack").classList.add("open"); $("#sessionName").focus();
+}
+async function trustChat() {
+  if (!state.chat || !confirm("Trust this chat again?\n\nFile changes and model changes will follow your normal settings again, even though web content is still in the conversation.")) return;
+  try { await api("/api/session/trust", { method: "POST", body: JSON.stringify({ chatId: state.chat.id }) }); delete state.chat.untrusted; updateUntrustedBadge(); $("#untrustedBox").hidden = true; toast("This chat is trusted again"); }
+  catch (e) { toast(e.message); }
 }
 async function saveSession() {
   const draft = state.sessionDraft; if (!draft || !state.chat || draft.id !== state.chat.id) return;
   const title = $("#sessionName").value.trim();
   const c = { editMode: $("#editMode").value, fileManage: $("#fileManage").checked,
-              deleteFiles: $("#deleteFiles").checked, modelControl: $("#modelControl").value };
+              deleteFiles: $("#deleteFiles").checked, modelControl: $("#modelControl").value, webSearch: $("#webSearch").checked };
+  const skillIds = [...document.querySelectorAll("#sessionSkills [data-skill]")].filter((x) => x.checked).map((x) => x.dataset.skill);
   try {
     if (title !== state.chat.title) {
       const result = await api("/api/session/rename", { method: "POST", body: JSON.stringify({ chatId: state.chat.id, title }) });
       state.chat.title = result.title; $("#title").textContent = result.title;
     }
-    await savePermissions(state.chat, { capabilities: c }); await loadChats();
+    const changes = { capabilities: c }; if (document.querySelector("#sessionSkills [data-skill]")) changes.skills = skillIds;
+    await savePermissions(state.chat, changes); await loadChats();
     $("#sessionBack").classList.remove("open"); toast("Session settings saved");
   } catch (e) { toast(e.message); }
 }
@@ -378,6 +407,51 @@ $("#trashEmpty").addEventListener("click", async () => {
   renderTrash();
 });
 
+// Skills: Markdown instructions stored in data/skills, turned on per chat in Session settings
+const skillsUi = { list: [], current: null };
+async function openSkills() { $("#skillsBack").classList.add("open"); await loadSkills(); if (!skillsUi.current) editSkill(null); }
+async function loadSkills() {
+  try { skillsUi.list = (await api("/api/skills")).skills; } catch (e) { toast(e.message); skillsUi.list = []; }
+  $("#skillsList").innerHTML = skillsUi.list.map((s) => `<button class="skill-item ${skillsUi.current === s.id ? "sel" : ""}" data-skill-id="${esc(s.id)}" type="button"><div class="n">${esc(s.name)}</div><div class="d">${esc(s.description || "")}</div></button>`).join("")
+    || '<div class="help" style="margin:0">No skills yet. Create one, or import a Markdown file.</div>';
+}
+async function editSkill(id) {
+  skillsUi.current = id; let s = { name: "", description: "", body: "" };
+  if (id) { try { s = await api("/api/skills/" + encodeURIComponent(id)); } catch (e) { toast(e.message); return; } }
+  $("#skillName").value = s.name; $("#skillDesc").value = s.description; $("#skillBody").value = s.body; $("#skillDelete").disabled = !id;
+  document.querySelectorAll("#skillsList .skill-item").forEach((b) => b.classList.toggle("sel", b.dataset.skillId === id));
+}
+async function saveSkill() {
+  const body = { id: skillsUi.current, name: $("#skillName").value, description: $("#skillDesc").value, body: $("#skillBody").value };
+  try { const s = await api("/api/skills", { method: "POST", body: JSON.stringify(body) }); skillsUi.current = s.id; $("#skillDelete").disabled = false; await loadSkills(); toast("Skill saved"); }
+  catch (e) { toast(e.message); }
+}
+async function deleteSkill() {
+  if (!skillsUi.current || !confirm("Delete this skill? Chats that use it will stop using it.")) return;
+  try { await api("/api/skills/" + encodeURIComponent(skillsUi.current), { method: "DELETE" }); skillsUi.current = null; await loadSkills(); editSkill(null); toast("Skill deleted"); }
+  catch (e) { toast(e.message); }
+}
+function importSkill(file) {
+  const rd = new FileReader();
+  rd.onload = () => {
+    let text = String(rd.result); let name = file.name.replace(/\.(md|markdown|txt)$/i, ""); let description = "";
+    const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+    if (m) { for (const line of m[1].split(/\r?\n/)) { const [k, ...v] = line.split(":"); if (/^name$/i.test(k.trim())) name = v.join(":").trim(); if (/^description$/i.test(k.trim())) description = v.join(":").trim(); } text = m[2]; }
+    skillsUi.current = null; $("#skillName").value = name; $("#skillDesc").value = description; $("#skillBody").value = text.trim(); $("#skillDelete").disabled = true;
+    toast("Imported. Review it, then Save skill.");
+  };
+  rd.readAsText(file);
+}
+$("#skillsBtn").addEventListener("click", openSkills);
+$("#skillsClose").addEventListener("click", () => $("#skillsBack").classList.remove("open"));
+$("#skillsBack").addEventListener("click", (e) => { if (e.target.id === "skillsBack") $("#skillsBack").classList.remove("open"); });
+$("#skillsList").addEventListener("click", (e) => { const b = e.target.closest("[data-skill-id]"); if (b) editSkill(b.dataset.skillId); });
+$("#skillNew").addEventListener("click", () => editSkill(null)); $("#skillSave").addEventListener("click", saveSkill); $("#skillDelete").addEventListener("click", deleteSkill);
+$("#skillImport").addEventListener("click", () => $("#skillFile").click());
+$("#skillFile").addEventListener("change", (e) => { if (e.target.files[0]) importSkill(e.target.files[0]); e.target.value = ""; });
+$("#trustBtn").addEventListener("click", trustChat);
+$("#untrustedBadge").addEventListener("click", openSession);
+
 // Folder access
 function chatFolders() { return state.chat ? (state.chat.folders ||= []) : state.draftFolders; }
 function renderFolderList() {
@@ -387,7 +461,7 @@ function renderFolderList() {
 // through /api/session/permissions, and the window shows what the server actually stored.
 async function savePermissions(chat, changes) {
   const r = await api("/api/session/permissions", { method: "POST", body: JSON.stringify({ chatId: chat.id, ...changes }) });
-  chat.folders = r.folders; chat.capabilities = r.capabilities; return r;
+  chat.folders = r.folders; chat.capabilities = r.capabilities; chat.skills = r.skills; return r;
 }
 async function foldersChanged() {
   renderFolderList(); updateFolderBtn(); if (!state.chat) return; const chat = state.chat;
@@ -449,6 +523,8 @@ $("#modelOptions").addEventListener("click", (e) => { const o = e.target.closest
 document.addEventListener("click", (e) => { if (!e.target.closest(".picker")) openModelMenu(false); });
 $("#thinkSel").addEventListener("change", (e) => api("/api/config", { method: "POST", body: JSON.stringify({ think: e.target.value }) }).catch(() => {}));
 $("#messages").addEventListener("click", async (e) => {
+  if (e.target.closest("[data-action-review]")) { if (state.actionApproval) $("#actionApproveBack").classList.add("open"); return; }
+  if (e.target.closest("[data-action-approve]")) { decideActionApproval(false); return; }
   if (e.target.closest("[data-model-review]")) { if (state.modelApproval) $("#modelApproveBack").classList.add("open"); return; }
   if (e.target.closest("[data-model-approve]")) { decideModelApproval(false); return; }
   if (e.target.closest("[data-review]")) { openApprovalPreview(); return; }
@@ -461,7 +537,8 @@ $("#messages").addEventListener("click", async (e) => {
 $("#previewAllow").addEventListener("click", () => decideApproval(true)); $("#previewDeny").addEventListener("click", () => decideApproval(false));
 $("#maAllow").addEventListener("click", () => decideModelApproval(true)); $("#maDeny").addEventListener("click", () => decideModelApproval(false));
 // "Later" only hides the question; the reply keeps waiting on the server, and the card in the chat reopens it
-const hideApprovalDialogs = () => { $("#previewBack").classList.remove("open"); $("#modelApproveBack").classList.remove("open"); };
+const hideApprovalDialogs = () => { for (const d of ["#previewBack", "#modelApproveBack", "#actionApproveBack"]) $(d).classList.remove("open"); };
+$("#aaLater").addEventListener("click", hideApprovalDialogs); $("#aaDeny").addEventListener("click", () => decideActionApproval(false)); $("#aaAllow").addEventListener("click", () => decideActionApproval(true));
 $("#previewLater").addEventListener("click", hideApprovalDialogs); $("#maLater").addEventListener("click", hideApprovalDialogs);
 $("#previewDiff").addEventListener("click", () => { if (state.approval) { state.approval.mode = "diff"; openApprovalPreview(); } });
 $("#previewContent").addEventListener("click", () => { if (state.approval) { state.approval.mode = "content"; openApprovalPreview(); } });
@@ -477,7 +554,7 @@ addEventListener("keydown", (e) => {
   if (e.ctrlKey && e.key.toLowerCase() === "n") { e.preventDefault(); newChat(); }
   else if (e.ctrlKey && e.key.toLowerCase() === "b") { e.preventDefault(); $("#sidebar").classList.toggle("hidden"); }
   else if (e.key === "Escape") {
-    if ($("#modelApproveBack").classList.contains("open") || $("#previewBack").classList.contains("open")) hideApprovalDialogs(); else if ($("#trashBack").classList.contains("open")) $("#trashBack").classList.remove("open"); else if ($("#sessionBack").classList.contains("open")) $("#sessionBack").classList.remove("open");
+    if ($("#modelApproveBack").classList.contains("open") || $("#previewBack").classList.contains("open") || $("#actionApproveBack").classList.contains("open")) hideApprovalDialogs(); else if ($("#skillsBack").classList.contains("open")) $("#skillsBack").classList.remove("open"); else if ($("#trashBack").classList.contains("open")) $("#trashBack").classList.remove("open"); else if ($("#sessionBack").classList.contains("open")) $("#sessionBack").classList.remove("open");
     else if ($("#folderPop").classList.contains("open")) toggleFolderPop(false); else if ($("#modalBack").classList.contains("open")) $("#modalBack").classList.remove("open"); else if (state.editIndex !== null) { state.editIndex = null; updateEditBanner(); } else if (busy()) stop();
   }
 });

@@ -5,7 +5,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 root = Path(__file__).resolve().parent
-for name in ("server.py", "runs.py", "context_budget.py", "capabilities.py", "session_actions.py"):
+for name in ("server.py", "runs.py", "context_budget.py", "capabilities.py", "session_actions.py", "skills.py", "web.py"):
     ast.parse((root / name).read_text(encoding="utf-8"))
 for test in (root / "tests").glob("test_*.py"):
     ast.parse(test.read_text(encoding="utf-8"))
