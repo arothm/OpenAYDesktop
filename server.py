@@ -41,7 +41,7 @@ import skills
 import web
 
 APP_NAME = "Open AY Desktop"
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.13.0"
 APP_SLUG = "open-ay-desktop"
 REPOSITORY = "arothm/OpenAYDesktop"
 RELEASES_URL = "https://github.com/%s/releases/latest" % REPOSITORY
@@ -1392,7 +1392,7 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/pick-folder":
             try:
                 exe = sys.executable.replace("python.exe", "pythonw.exe")
-                r = subprocess.run([exe if os.path.exists(exe) else sys.executable, "-c", PICK_FOLDER_SCRIPT], capture_output=True, text=True, timeout=600)
+                r = subprocess.run([exe if os.path.exists(exe) else sys.executable, "-c", PICK_FOLDER_SCRIPT], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=600)
                 self._json({"path": os.path.normpath(r.stdout.strip()) if r.stdout.strip() else ""})
             except Exception as e: self._json({"error": "Folder picker failed: %s" % e}, 500)
         else: self._json({"error": "not found"}, 404)
@@ -1440,7 +1440,7 @@ def open_window(url):
         profile = os.path.join(DATA_DIR, "window-profile")
         for exe in candidates:
             if os.path.isfile(exe):
-                subprocess.Popen([exe, "--app=" + url, "--user-data-dir=" + profile, "--window-size=1200,820", "--no-first-run", "--no-default-browser-check"]); return
+                subprocess.Popen([exe, "--app=" + url, "--user-data-dir=" + profile, "--window-size=1200,820", "--no-first-run", "--no-default-browser-check"], stdin=subprocess.DEVNULL); return
     webbrowser.open(url)
 
 

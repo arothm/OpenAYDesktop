@@ -12,6 +12,7 @@ Safety:
   - Commands run without a shell. Branch, remote and revision names are checked so they can't
     be read as options, and paths are passed after "--".
   - External diff/textconv programs and core.fsmonitor are disabled; terminal prompts are off.
+  - Git and gh get no stdin, and a timeout stops the whole process tree (see call()).
   - Commits and pushes are fingerprinted when reviewed and refused if anything changed since.
   - Force-push is not offered. Credentials stay with Git / the GitHub CLI.
 """
@@ -23,6 +24,7 @@ import shutil
 import subprocess
 
 import capabilities
+import commands
 
 MODES = ["off", "read", "commit", "push"]
 READ_TOOLS = {"git_status", "git_diff", "git_log", "git_show", "git_branches", "gh_pr_list"}
@@ -60,11 +62,31 @@ def _exe(name):
     return path
 
 
+def call(cmd, timeout, cwd=None):
+    """Run a program and return a CompletedProcess, without ever hanging the caller.
+
+    stdin is DEVNULL: the installed app's server keeps a thread reading its own stdin (to notice when the window
+    closes), and on Windows a child that inherits that pipe can block forever on it (Git for Windows does, at
+    start-up). On timeout the whole process tree is stopped: Git's launcher (cmd/git.exe) starts the real git.exe,
+    and killing only the launcher left the real one holding the output pipes, so the wait never ended."""
+    proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            encoding="utf-8", errors="replace", env=_env(), creationflags=NO_WINDOW)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        commands._kill_tree(proc)
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass  # something outside the tree still holds the pipes; don't wait for it
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
 def run(repo, *args, timeout=60, check=True):
     cmd = [_exe("git"), "-c", "core.fsmonitor=false", "-c", "core.pager=cat", "-c", "color.ui=false", "-C", repo, *args]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                           env=_env(), creationflags=NO_WINDOW)
+        r = call(cmd, timeout)
     except subprocess.TimeoutExpired:
         raise GitError("git %s took too long and was stopped." % args[0])
     if check and r.returncode != 0:
@@ -74,8 +96,7 @@ def run(repo, *args, timeout=60, check=True):
 
 def gh(repo, *args, timeout=120):
     try:
-        r = subprocess.run([_exe("gh"), *args], cwd=repo, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           timeout=timeout, env=_env(), creationflags=NO_WINDOW)
+        r = call([_exe("gh"), *args], timeout, cwd=repo)
     except subprocess.TimeoutExpired:
         raise GitError("gh %s took too long and was stopped." % args[0])
     if r.returncode != 0:
@@ -299,9 +320,11 @@ def execute(chat, name, args, record):
     if run(top, "rev-parse", "--verify", record["branch"]).strip() != record["head"]:
         raise GitError("The branch moved after you reviewed it, so nothing was sent. Review it again.")
     if name == "git_push":
-        r = subprocess.run([_exe("git"), "-c", "core.fsmonitor=false", "-C", top, "push", "--", record["remote"],
-                            "refs/heads/%s:refs/heads/%s" % (record["branch"], record["branch"])],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300, env=_env(), creationflags=NO_WINDOW)
+        try:
+            r = call([_exe("git"), "-c", "core.fsmonitor=false", "-C", top, "push", "--", record["remote"],
+                      "refs/heads/%s:refs/heads/%s" % (record["branch"], record["branch"])], 300)
+        except subprocess.TimeoutExpired:
+            raise GitError("git push took more than 5 minutes and was stopped.")
         if r.returncode != 0:
             raise GitError((r.stderr or r.stdout).strip()[:2000] or "git push failed.")
         return "Pushed %s to %s.\n%s" % (record["branch"], record["remote"], (r.stderr or r.stdout).strip()[:2000])

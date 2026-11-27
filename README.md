@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It runs as an **Electron** desktop app, with a local Python 3 server (standard library only) doing the work. It can also still open in an Edge or Chrome app window without Electron. There is no frontend framework or build step for the interface itself.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.12.0
+- **Version:** 1.13.0
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -297,7 +297,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `package.json` — Electron and electron-builder setup (`npm start`, `npm run smoke`, `npm run dist`, `npm run release`).
 - `scripts/fetch-python.js` — downloads and verifies the embeddable Python that the installer bundles.
 - `scripts/release.js` — publishes the built installer as a GitHub Release for the updater (`npm run release`).
-- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`, `test_git.py`, `test_commands.py`, `test_tokens.py`, `test_features.py`, `test_skill_folders.py`).
+- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`, `test_git.py`, `test_commands.py`, `test_tokens.py`, `test_features.py`, `test_skill_folders.py`, `test_git_processes.py`).
 - `verify_static.py` — optional static consistency checks.
 - `backups/pre-approved-changes/` — original source copies from before the first approved change set.
 

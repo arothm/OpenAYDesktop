@@ -1,3 +1,33 @@
+# Open AY Desktop 1.13.0
+
+Skill folders in the open Agent Skills format, a fix for Git steps that never finished, and a new icon set.
+
+## Skill folders
+- **Import a whole skill**, the same format Claude, Codex, Cursor and others use:
+  - **Import folder** takes a folder with a `SKILL.md`, or a repository that holds one;
+  - **Import file** takes a `.skill` or `.zip` package.
+- **The skill is copied** into the app's data, so it keeps working if the original moves. **Update from folder** copies it again after you change the original.
+- **Chats read its files on demand** with a new read-only `read_skill_file` tool, so long reference files cost nothing until they're needed. It also works in plan mode.
+- **Scripts run only through Run commands**, under the usual approval rules.
+- **Imports are checked:** unsafe paths and links are refused, sizes are limited, and the app asks before replacing a skill.
+- Descriptions can be up to 1,024 characters.
+
+## Fixed
+- **Git steps could hang forever** (for example "Git status ... running"). Git inherited an input the app keeps open, which can block Git for Windows at start-up. When the 60-second limit stopped Git's launcher, the real Git process kept running, so the reply never continued.
+  - Git and the GitHub CLI no longer get that input.
+  - A time limit now stops the whole process tree.
+- **Skills window:** the file list no longer overlaps the instructions.
+
+## New look
+- All 41 icons redrawn on one grid, with a soft fill that strengthens on hover, selection and badges.
+
+## Verification
+- 153 automated tests (17 new). The new Git test reproduces the hang without the fix.
+- `python verify_static.py`.
+- A real chat on gpt-oss:120b with AYS imported as a skill folder: it read the right reference file and cited 10 real rule IDs.
+
+---
+
 # Open AY Desktop 1.12.0
 
 Fewer tokens and lower cost, projects and memory, plan mode, undo, documents, scheduled tasks, and in-app updates.
