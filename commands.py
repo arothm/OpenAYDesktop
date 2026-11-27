@@ -194,7 +194,7 @@ def execute(plan, cancelled=None):
         if outcome:
             _kill_tree(proc); break
         time.sleep(0.1)
-    proc.wait(); reader.join(5)
+    proc.wait(); reader.join(5); proc.stdout.close()
     text = b"".join(chunks).decode("utf-8", "replace")
     if len(text) > HEAD + TAIL:
         text = text[:HEAD] + "\n[... %d characters not shown ...]\n" % (len(text) - HEAD - TAIL) + text[-TAIL:]

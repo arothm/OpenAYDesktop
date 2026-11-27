@@ -1,3 +1,67 @@
+# Open AY Desktop 1.12.0
+
+Fewer tokens and lower cost, projects and memory, plan mode, undo, documents, scheduled tasks, and in-app updates.
+
+## Saving tokens
+- **Requests that reuse Ollama's cache.** The start of every request stays identical between steps and turns, so Ollama bills it at the cached-input rate (often about a tenth of normal input). The usage line shows the share of each chat's input that came from the cache.
+- **Context budget** (Settings > Usage & context): Full (default), Balanced 64k or Economy 32k.
+  - Past the budget, older turns are replaced by a summary, with your own earlier messages kept next to it, shortened and in order.
+  - The summary stays the same until the next one, so the cache keeps working.
+- **Shorter tool definitions:** 21% smaller for the same tools.
+- **Smaller tool results:**
+  - `read_file` reads 800 lines (about 28,000 characters) at a time and says where to continue;
+  - one result in the current reply is capped at 30,000 characters, down from 60,000;
+  - Git output is capped at 30,000 characters.
+- **Pictures shrink to at most 1600 px** before sending.
+- **Fixed:**
+  - the size estimate now counts tool definitions and instructions, so requests no longer overflow the window;
+  - garbled characters in the web-citation instruction and the saved-key hint.
+
+## Quality check (old 1.11 vs new, real requests on gpt-oss:120b and two vision models, 3 runs each)
+- **40k-token conversation, forced to summarize (Economy):**
+  - 12 of 12 facts recalled and the order of events kept, the same as 1.11;
+  - 23% fewer input tokens per run.
+  - With caching, the one-off cost of writing a summary is only repaid over later turns, which is why Full is the default.
+- **Finding a function in a 1,900-line file:** the same accuracy, with 67% fewer input tokens and half the cost.
+- **Fixing a bug with edit tools:** 3 of 3 correct (1.11: 2 of 3), with 11% fewer input tokens.
+- **Reading an invoice screenshot:**
+  - correct in every run on both models;
+  - 69% fewer image tokens on a model that bills by resolution;
+  - no change on gemma4, which uses a fixed image size.
+
+## New
+- **Projects:** chats share folders, starting permissions, skills, instructions and memory.
+- **Memory:**
+  - global and per-project notes the model can save when you ask, and that you can edit;
+  - a chat that has read web content asks before saving.
+- **Instruction files:** AGENTS.md, CLAUDE.md or .openay/instructions.md in a shared folder are followed.
+- **Plan mode:** a plan first, with read-only tools enforced by the server, then "Carry out this plan".
+- **Undo changes:** under a reply, puts back the files it changed (edits, new files, moves, deletions). Later edits are respected, and what undo replaces goes to Trash.
+- **Documents:** attach PDF, Word, Excel, PowerPoint, CSV, JSON, code and text files.
+- **Isolated subtasks:** helpers can work in their own Git worktree and branch. The new `git_merge` tool brings their work in after you approve.
+- **Scheduled tasks:** daily, weekdays, weekly, every few hours, or once.
+- **Terminal and preview panel** (Ctrl+J):
+  - run your own commands in a shared folder;
+  - preview files the chat changed (HTML runs sandboxed).
+- **Full-text search** across all chats' messages, jumping to the match.
+- **Export** a chat as Markdown.
+- **Quick entry:** Ctrl+Alt+Space opens a new chat from anywhere.
+- **Dictation:** Windows speech recognition, offline.
+- **Software updates in Settings:**
+  - the installed app checks GitHub Releases, downloads in the background and installs on restart;
+  - you can turn automatic installs off.
+  - This is the first version with the updater: moving from 1.11 needs one manual install.
+
+## Verification
+- 136 automated tests (24 new).
+- `python verify_static.py`.
+- The A/B quality runs above.
+- A real end-to-end run of plan mode, a document and memory across chats.
+- A live check of every new screen.
+- The packaged-app smoke test.
+
+---
+
 # Open AY Desktop 1.11.0
 
 New look: the Graphite redesign.

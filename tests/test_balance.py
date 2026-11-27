@@ -98,7 +98,7 @@ class BalanceGuardTests(RunTestCase):
             run = self.wait_status(cid, "paused")
             self.assertEqual(2, len(self.requests))
             wrap = self.requests[1]
-            self.assertNotIn("tools", wrap); self.assertIn("balance is nearly used up", wrap["messages"][0]["content"])
+            self.assertNotIn("tools", wrap); self.assertIn("balance is nearly used up", wrap["messages"][-1]["content"])  # last, so the cached start stays the same
             saved = server.load_chat(cid)
             self.assertTrue(saved["messages"][-1].get("wrapUp")); self.assertIn("Summary", saved["messages"][-1]["content"])
             self.low = False; server.ENGINE.balance_changed(); self.wait(cid)

@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It runs as an **Electron** desktop app, with a local Python 3 server (standard library only) doing the work. It can also still open in an Edge or Chrome app window without Electron. There is no frontend framework or build step for the interface itself.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.11.0
+- **Version:** 1.12.0
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -208,19 +208,44 @@ Each reply runs on the app's local server (`runs.py`): the model answers, calls 
 - **Edit and resend** shows a banner. The earlier message and everything after it are replaced only when you send.
 - While a reply runs, its chat's messages and model can't be changed from elsewhere. Folders and permissions can still change, and they take effect at the next tool call.
 
-## Context and usage
-Before each request, the server fits the conversation into the model's context window. It learns the window size from Ollama Cloud and assumes 64k tokens if Ollama Cloud doesn't report it.
-- Tool results from earlier turns are shortened, and the model can call the tool again if it needs them.
-- If the conversation still doesn't fit, the oldest whole turns are left out of the request and a note tells the model. The full history stays saved in the chat.
+## Context, tokens and cost
+Ollama Cloud bills per token, and input it has seen before at the start of a request ("cached input") costs far less, often about a tenth. So the app keeps the start of every request the same from step to step and turn to turn: instructions and tools first, then the history, and anything that changes per request at the end. Ollama reports how much was cached, and the usage line shows it.
 
-The line under the message box shows:
-- how full the context was in the last request, from Ollama's real token counts;
-- how many older messages were left out;
-- this chat's total tokens;
-- today's tokens and requests across all chats. Daily totals are kept in `data/usage.json` for 90 days.
+Before each request the server fits the conversation into the **context budget** (Settings > Usage & context):
+- **Full** (default) uses the model's whole window. **Balanced** (64k tokens) and **Economy** (32k) send less per request; they suit models without cached-input pricing.
+- Everything sent counts: messages, tool definitions and instructions.
+- Tool results from earlier turns are shortened, and the model can call the tool again.
+- Past the budget, the older turns are replaced by a summary the chat's model writes, kept until the next one. Your own earlier messages stay next to it, shortened and in order, so details you gave aren't lost. A "View summary" divider shows where it starts. If a summary can't be made, the oldest turns are left out instead.
+- A file is read up to 800 lines (about 28,000 characters) at a time, with a note saying where to continue.
+- Pictures are shrunk to at most 1600 pixels on the long side before sending. Models that bill by resolution use far fewer tokens: one test screenshot went from 5,069 to 1,579 tokens with the same answer.
+
+The line under the message box shows how full the context was, the share of this chat's input that came from the cache, and today's totals (kept in `data/usage.json` for 90 days).
+
+## Projects and memory
+- **Projects** (the switcher under the search box, or Manage projects) group chats. A project has folders, starting permissions, skills, written instructions and its own memory. New chats in the project start with all of them.
+- **Memory**: notes chats can use later. Global memory (Settings > Memory) applies everywhere; project memory only in that project. Ask the model to remember something and it saves a note; you can edit or delete notes at any time. A chat that has read web content asks you before saving, so a web page can't plant lasting instructions.
+- **Instruction files**: `AGENTS.md`, `CLAUDE.md` or `.openay/instructions.md` at the top of a shared folder are followed by the chat (Session settings can turn this off). They can't change permissions.
+
+## Plan mode, undo and documents
+- **Plan** (next to the folder button) asks for a plan first: the model only gets tools that read, and the server refuses anything else. Then **Carry out this plan**, or reply with changes.
+- **Undo changes** under a reply puts back every file it created, edited, moved or deleted. Files changed again afterwards are skipped and listed, and what undo replaces goes to the Trash, so an undo can be undone. Commands and Git actions can't be undone and are listed as such.
+- **Documents**: attach PDF, Word, Excel, PowerPoint, CSV, JSON, code or text files with the paperclip, by pasting, or by dropping. Their text goes to the model with your message. Scanned PDFs have no text: attach page images instead.
+
+## Scheduled tasks, terminal and preview
+- **Scheduled tasks** (clock icon) start a new chat with a prompt every day, on weekdays, weekly, every few hours, or once, in a project if you like. They run while the app is open or in the tray. A run missed while the app was closed happens once when it next starts.
+- **Terminal and preview** (Ctrl+J or the panel button): run commands you type in a writable shared folder, and see the commands the model ran. Preview shows files the chat changed: HTML pages run in a sandbox with no access to the app, Markdown is rendered, and images and text are shown.
+- **Search** under New chat looks through every chat's messages, not just titles, and jumps to the matching message.
+- **Export** (header button) saves the chat as Markdown.
+- **Quick entry**: Ctrl+Alt+Space opens the app on a new chat from anywhere (Settings > App & updates).
+- **Dictation** (microphone button) uses Windows speech recognition, offline. It needs a speech language installed and microphone access for desktop apps.
+
+## Software updates
+The installed app checks GitHub Releases at start and every 6 hours (Settings > App & updates > Check now). With **Install updates automatically** on, a new version downloads in the background and installs when the app closes. Otherwise Settings offers Download and Restart. Chats and settings are kept. Version 1.12.0 is the first with the updater, so moving from 1.11 or older needs one manual install.
 
 ## Features
-Streaming replies, Markdown and code highlighting, collapsible thinking/reasoning panels, image attachments for vision models (paste, drop, or paperclip), stop, regenerate, edit-and-resend, searchable chat history, and server-approved folder tools.
+Streaming replies, Markdown and code highlighting, collapsible thinking/reasoning panels, image and document attachments, stop, regenerate, edit-and-resend, full-text search, projects, memory, plan mode, undo, scheduled tasks, a terminal and preview panel, export, and server-approved folder tools.
+
+**Isolated subtasks**: with Git set to commit or more and subtasks on, the model can start a helper with `isolated: true`. The helper works in its own Git worktree and branch (`openay/<chat id>`), so several helpers can change code at once without touching your working tree. Its work is committed on that branch when it finishes, and `git_merge` brings it in after you approve. Deleting the helper chat removes the worktree; the branch stays.
 
 ## Persistence and reliability
 - Chats and configuration are written atomically with unique temporary files.
@@ -236,15 +261,20 @@ The browser loads Marked, DOMPurify, Highlight.js, and both syntax themes from t
 On the first request for each asset, the server downloads its fixed HTTPS URL into `vendor/`. After all five have been cached successfully, the complete interface works offline without contacting cdnjs. If a first download fails, plain-text Markdown fallback remains available. See `vendor/README.md` for upstream source URLs and licensing information.
 
 ## Publishing a release for the updater
-1. Update `APP_VERSION` in `server.py` and the version shown here.
-2. Commit and tag the release as `vX.Y.Z`, for example `v1.10.0`. Keep `version` in `package.json` the same (`verify_static.py` checks it).
-3. Publish a non-draft GitHub Release with that tag in `arothm/OpenAYDesktop`.
-4. The app's update check compares numeric semantic versions. A malformed release tag produces a clear error. If no release has been published, GitHub's 404 response is reported as **No published release yet**, not as an update.
+1. Update `APP_VERSION` in `server.py`, `version` in `package.json` (`verify_static.py` checks they match), the version shown here, and `RELEASE_NOTES.md` (the new version's notes first).
+2. Commit, tag `vX.Y.Z`, and push the branch and the tag.
+3. Run `npm run release`. It builds the installer and publishes a GitHub Release with the installer, its `.blockmap`, and `latest.yml` (what installed apps read), using the GitHub CLI.
+4. Installed apps find the new version within 6 hours, or at once with Check now. A browser window without Electron only links to the release page.
 
 ## Source layout
 - `server.py` — HTTP API, storage, folder tools, write approvals, model info, usage totals, update checker, local assets, and launcher.
 - `runs.py` — server-side replies: the model/tool loop, live events, approvals, stop, and per-chat usage.
-- `context_budget.py` — fits the history into the model's context window.
+- `context_budget.py` — the context budget, summaries (compaction), cache-friendly requests and attached documents' text.
+- `projects.py` — projects, memory notes and instruction files.
+- `undo.py` — the journal behind "Undo changes".
+- `documents.py` — text from PDF, Word, Excel, PowerPoint and text files.
+- `scheduler.py` — scheduled tasks.
+- `worktrees.py` — isolated subtasks in Git worktrees.
 - `capabilities.py` — session permission policy, file management, trash and versions.
 - `session_actions.py` — session renaming.
 - `web.py` — web search and page reading, with untrusted-content markers.
@@ -253,11 +283,13 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `skills.py` — skill files: storage, validation and the per-chat prompt.
 - `index.html` — application and dialog markup.
 - `styles.css` — the Graphite look: colour tokens for dark and light (it follows the Windows setting), components and motion. The page's security policy blocks inline styles, so every look is a class here.
-- `app.js` — the window: live event stream, rendering, approvals, sessions, trash, and settings.
-- `electron/` — the Electron shell: `main.js` (server lifecycle, window, tray, quit), `preload.js` (folder picker only), `icon.png` (app icon), `tray.png` (simplified tray icon).
-- `package.json` — Electron and electron-builder setup (`npm start`, `npm run smoke`, `npm run dist`).
+- `app.js` — the window: live event stream, rendering, approvals, sessions, trash, settings, plan mode, undo and documents.
+- `features.js` — projects, scheduled tasks, the terminal and preview panel, export, dictation and quick entry.
+- `electron/` — the Electron shell: `main.js` (server lifecycle, window, tray, quit), `preload.js` (folder picker, export, dictation, quick entry and updates), `icon.png` (app icon), `tray.png` (simplified tray icon).
+- `package.json` — Electron and electron-builder setup (`npm start`, `npm run smoke`, `npm run dist`, `npm run release`).
 - `scripts/fetch-python.js` — downloads and verifies the embeddable Python that the installer bundles.
-- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`, `test_git.py`, `test_commands.py`).
+- `scripts/release.js` — publishes the built installer as a GitHub Release for the updater (`npm run release`).
+- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`, `test_git.py`, `test_commands.py`, `test_tokens.py`, `test_features.py`).
 - `verify_static.py` — optional static consistency checks.
 - `backups/pre-approved-changes/` — original source copies from before the first approved change set.
 

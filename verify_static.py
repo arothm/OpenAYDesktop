@@ -5,20 +5,21 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 root = Path(__file__).resolve().parent
-for name in ("server.py", "runs.py", "context_budget.py", "capabilities.py", "session_actions.py", "skills.py", "web.py", "gittools.py"):
+for name in ("server.py", "runs.py", "context_budget.py", "capabilities.py", "session_actions.py", "skills.py", "web.py", "gittools.py",
+             "commands.py", "projects.py", "documents.py", "scheduler.py", "worktrees.py", "undo.py"):
     ast.parse((root / name).read_text(encoding="utf-8"))
 for test in (root / "tests").glob("test_*.py"):
     ast.parse(test.read_text(encoding="utf-8"))
 print("Python syntax: OK")
 
 html = (root / "index.html").read_text(encoding="utf-8")
-js = (root / "app.js").read_text(encoding="utf-8")
+js = (root / "app.js").read_text(encoding="utf-8") + "\n" + (root / "features.js").read_text(encoding="utf-8")
 source = (root / "server.py").read_text(encoding="utf-8")
 assert "<title>Open AY Desktop</title>" in html
 assert 'APP_NAME = "Open AY Desktop"' in source
 assert 'REPOSITORY = "arothm/OpenAYDesktop"' in source
 assert "cdnjs.cloudflare.com" not in html
-assert 'src="/app.js"' in html and 'href="/styles.css"' in html
+assert 'src="/app.js"' in html and 'src="/features.js"' in html and 'href="/styles.css"' in html
 assert "4000" not in js
 print("Application identity and local-only assets: OK")
 

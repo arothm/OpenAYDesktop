@@ -55,7 +55,7 @@ class PolicyTests(unittest.TestCase):
     def test_defaults_are_conservative(self):
         p = capabilities.policy({"folders": []})
         self.assertEqual({"editMode": "review", "fileManage": False, "deleteFiles": False, "modelControl": "ask",
-                          "webSearch": False, "subtasks": False, "git": "off", "commands": False, "untrusted": False}, p)
+                          "webSearch": False, "subtasks": False, "git": "off", "commands": False, "instructions": True, "memory": True, "untrusted": False}, p)
 
     def test_invalid_saved_values_fall_back_to_safe_defaults(self):
         p = capabilities.policy({"capabilities": {"editMode": "yolo", "modelControl": "whatever"}})
@@ -127,7 +127,8 @@ class FileOperationTests(TempChatsMixin, unittest.TestCase):
         limited = names(self.make_chat(caps={"editMode": "review", "modelControl": "fixed"}))
         self.assertIn("read_file", limited)
         self.assertFalse({"create_folder", "delete_path", "set_session_model"} & limited)
-        self.assertEqual({"set_session_model"}, names({"folders": [], "capabilities": {"modelControl": "ask"}}))
+        self.assertEqual({"set_session_model", "save_memory"}, names({"folders": [], "capabilities": {"modelControl": "ask"}}))
+        self.assertEqual({"set_session_model"}, names({"folders": [], "capabilities": {"modelControl": "ask", "memory": False}}))
 
 
 class ModelSwitchTests(TempChatsMixin, unittest.TestCase):

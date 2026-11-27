@@ -1,7 +1,7 @@
 {
   "name": "open-ay-desktop",
   "productName": "Open AY Desktop",
-  "version": "1.11.0",
+  "version": "1.12.0",
   "description": "Desktop chat for Ollama Cloud models",
   "author": "arothm",
   "homepage": "https://github.com/arothm/OpenAYDesktop",
@@ -11,7 +11,8 @@
     "start": "electron .",
     "smoke": "electron . --smoke",
     "dist": "node scripts/fetch-python.js && electron-builder --win",
-    "fetch-python": "node scripts/fetch-python.js"
+    "fetch-python": "node scripts/fetch-python.js",
+    "release": "node scripts/fetch-python.js && electron-builder --win --publish never && node scripts/release.js"
   },
   "build": {
     "appId": "com.arothm.openaydesktop",
@@ -37,8 +38,14 @@
           "web.py",
           "gittools.py",
           "commands.py",
+          "projects.py",
+          "documents.py",
+          "scheduler.py",
+          "worktrees.py",
+          "undo.py",
           "index.html",
           "app.js",
+          "features.js",
           "styles.css",
           "vendor/**"
         ]
@@ -58,11 +65,23 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
-      "shortcutName": "Open AY Desktop"
-    }
+      "shortcutName": "Open AY Desktop",
+      "artifactName": "OpenAYDesktop-Setup-${version}.${ext}"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "arothm",
+        "repo": "OpenAYDesktop",
+        "releaseType": "release"
+      }
+    ]
   },
   "devDependencies": {
     "electron": "^45.5.0",
     "electron-builder": "^26.18.0"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.11"
   }
 }

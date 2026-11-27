@@ -7,8 +7,11 @@
 //   - shows it in a locked-down window (no Node in the page; navigation stays on the app),
 //   - keeps replies running from the tray when the window closes, if you choose,
 //   - shuts the server down when you quit. The server also exits by itself if this process dies,
-//     because it watches its stdin (--exit-with-stdin).
-const { app, BrowserWindow, Tray, Menu, dialog, shell, ipcMain, nativeImage, nativeTheme, session } = require("electron");
+//     because it watches its stdin (--exit-with-stdin),
+//   - installs updates from GitHub Releases (electron-updater), as allowed in Settings,
+//   - registers the quick-entry shortcut (Ctrl+Alt+Space), dictation (Windows speech
+//     recognition) and saving exported chats.
+const { app, BrowserWindow, Tray, Menu, dialog, shell, ipcMain, nativeImage, nativeTheme, session, globalShortcut } = require("electron");
 const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
 const net = require("net");
@@ -42,9 +45,20 @@ async function start() {
     const r = await dialog.showOpenDialog(win, { title: "Choose a folder to share with this chat", properties: ["openDirectory"] });
     return r.canceled ? "" : r.filePaths[0];
   });
+  ipcMain.handle("save-text", (_e, name, text) => saveText(name, text));
+  ipcMain.handle("dictate", () => dictate());
+  ipcMain.handle("quick-entry", (_e, on) => setQuickEntry(Boolean(on)));
+  ipcMain.handle("update-check", () => updates.check(true));
+  ipcMain.handle("update-download", () => updates.download());
+  ipcMain.handle("update-install", () => updates.install());
+  ipcMain.handle("update-auto", (_e, on) => updates.setAuto(Boolean(on)));
+  ipcMain.handle("update-state", () => updates.state);
   try {
     origin = (DEV && (await findRunningServer())) || (await startServer());
     createWindow();
+    const cfg = await fetch(origin + "/api/config").then((r) => r.json()).catch(() => ({}));
+    setQuickEntry(cfg.quickEntry !== false);
+    updates.start(cfg.autoUpdate !== false);
   } catch (e) {
     dialog.showErrorBox("Open AY Desktop", String(e.message || e));
     app.exit(1);
@@ -164,9 +178,10 @@ async function onClose(e) {
   else if (response === 1) quit();
 }
 
-async function quit() {
+async function quit(then) {
   if (quitting) return;
   quitting = true;
+  globalShortcut.unregisterAll();
   if (server) {  // only shut down a server this shell started
     try { await fetch(origin + "/api/shutdown", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}", signal: AbortSignal.timeout(8000) }); } catch {}
     await new Promise((resolve) => {
@@ -176,10 +191,108 @@ async function quit() {
     });
   }
   if (tray) tray.destroy();
+  if (typeof then === "function") return then();  // e.g. install a downloaded update once the server has stopped
   app.exit(0);
 }
 
 app.on("before-quit", (e) => { if (!quitting) { e.preventDefault(); quit(); } });
+
+// ---------------------------------------------------------------- software updates (GitHub Releases)
+// Checks at start and every 6 hours. With "Install updates automatically" on (Settings), a new
+// version downloads in the background and installs when the app quits; otherwise the window
+// offers Download and Restart. The window gets every state change on "update-status".
+const updates = {
+  state: { state: DEV ? "dev" : "idle", version: app.getVersion() },
+  updater: null,
+  send(patch) {
+    this.state = { ...this.state, ...patch, version: app.getVersion() };
+    if (win && !win.isDestroyed()) win.webContents.send("update-status", this.state);
+  },
+  start(auto) {
+    if (DEV || SMOKE) return;
+    try { this.updater = require("electron-updater").autoUpdater; } catch (e) { this.send({ state: "error", error: String(e.message || e) }); return; }
+    const u = this.updater;
+    u.autoDownload = auto; u.autoInstallOnAppQuit = true; u.logger = null;
+    u.on("checking-for-update", () => this.send({ state: "checking", error: "" }));
+    u.on("update-available", (i) => this.send({ state: u.autoDownload ? "downloading" : "available", latest: i.version, percent: 0 }));
+    u.on("update-not-available", () => this.send({ state: "current", checkedAt: Date.now() }));
+    u.on("download-progress", (p) => this.send({ state: "downloading", percent: Math.round(p.percent || 0) }));
+    u.on("update-downloaded", (i) => this.send({ state: "ready", latest: i.version }));
+    u.on("error", (e) => this.send({ state: "error", error: String((e && e.message) || e).split("\n")[0].slice(0, 300) }));
+    setTimeout(() => this.check(false), 15000);
+    setInterval(() => this.check(false), 6 * 3600 * 1000);
+  },
+  async check(manual) {
+    if (!this.updater || ["downloading", "ready"].includes(this.state.state)) return this.state;
+    try { await this.updater.checkForUpdates(); } catch (e) { if (manual) this.send({ state: "error", error: String(e.message || e).slice(0, 300) }); }
+    return this.state;
+  },
+  async download() {
+    if (!this.updater || this.state.state !== "available") return this.state;
+    this.send({ state: "downloading", percent: 0 });
+    try { await this.updater.downloadUpdate(); } catch (e) { this.send({ state: "error", error: String(e.message || e).slice(0, 300) }); }
+    return this.state;
+  },
+  install() {
+    if (!this.updater || this.state.state !== "ready") return false;
+    // Stop the server first (the installer replaces its files), then restart into the new version.
+    quit(() => this.updater.quitAndInstall(true, true));
+    return true;
+  },
+  setAuto(on) { if (this.updater) this.updater.autoDownload = on; return on; },
+};
+
+// ---------------------------------------------------------------- quick entry, dictation, export
+function setQuickEntry(on) {
+  globalShortcut.unregister("Control+Alt+Space");
+  if (!on || SMOKE) return false;
+  return globalShortcut.register("Control+Alt+Space", () => {
+    showWindow();
+    if (win) win.webContents.send("quick-entry");
+  });
+}
+
+// Dictation uses Windows' own speech recognition (System.Speech), offline: it listens until you
+// pause, then returns the text. It needs a Windows speech language and microphone access for desktop apps.
+const DICTATE_PS = [
+  "$ErrorActionPreference = 'Stop'",
+  "Add-Type -AssemblyName System.Speech",
+  "$r = New-Object System.Speech.Recognition.SpeechRecognitionEngine",
+  "$r.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))",
+  "$r.SetInputToDefaultAudioDevice()",
+  "$r.InitialSilenceTimeout = [TimeSpan]::FromSeconds(6)",
+  "$r.EndSilenceTimeout = [TimeSpan]::FromSeconds(1.2)",
+  "$res = $r.Recognize([TimeSpan]::FromSeconds(30))",
+  "[Console]::OutputEncoding = [Text.Encoding]::UTF8",
+  "if ($res) { [Console]::Out.Write($res.Text) }",
+].join("; ");
+let dictation = null;
+function dictate() {
+  if (dictation) { try { dictation.kill(); } catch {} dictation = null; return Promise.resolve({ stopped: true }); }
+  return new Promise((resolve) => {
+    const ps = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", DICTATE_PS], { windowsHide: true });
+    dictation = ps; let out = "", err = "";
+    ps.stdout.on("data", (d) => { out += d; }); ps.stderr.on("data", (d) => { err += d; });
+    ps.on("close", (code) => {
+      if (dictation !== ps) return resolve({ stopped: true });
+      dictation = null;
+      if (code === 0) return resolve({ text: out.trim() });
+      const first = err.split("\n").find((l) => l.trim()) || "";
+      resolve({ error: /recognizer|language|culture/i.test(err) ? "Windows speech recognition isn't set up for a language (Settings > Time & language > Speech)."
+        : /audio|device|microphone/i.test(err) ? "No microphone is available, or desktop apps aren't allowed to use it (Settings > Privacy & security > Microphone)."
+        : "Dictation didn't work: " + first.slice(0, 200) });
+    });
+  });
+}
+
+async function saveText(name, text) {
+  const safe = String(name || "chat").replace(/[\\/:*?"<>|]+/g, " ").trim().slice(0, 120) || "chat";
+  const r = await dialog.showSaveDialog(win, { title: "Export chat", defaultPath: path.join(app.getPath("documents"), safe + ".md"),
+                                               filters: [{ name: "Markdown", extensions: ["md"] }] });
+  if (r.canceled || !r.filePath) return "";
+  await fs.promises.writeFile(r.filePath, String(text || ""), "utf8");
+  return r.filePath;
+}
 
 // ---------------------------------------------------------------- npm run smoke
 async function smokeReport() {

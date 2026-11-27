@@ -26,8 +26,8 @@ import capabilities
 
 MODES = ["off", "read", "commit", "push"]
 READ_TOOLS = {"git_status", "git_diff", "git_log", "git_show", "git_branches", "gh_pr_list"}
-REVIEWED = {"git_commit": "commit", "git_push": "push", "gh_pr_create": "push"}
-MAX_OUT = 60_000
+REVIEWED = {"git_commit": "commit", "git_merge": "commit", "git_push": "push", "gh_pr_create": "push"}
+MAX_OUT = 30_000  # one Git result; diffs longer than this are cut (the model can ask for one path)
 NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]{0,99}$")            # remote / branch names
 REV = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/~^@{}-]{0,99}$")       # commit-ish
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -225,6 +225,25 @@ def prepare(chat, name, args):
         return ({"title": "Make this commit?", "detail": detail,
                  "why": "The commit is made with your Git identity. Nothing is pushed."},
                 {"top": top, "paths": paths, "message": message, "fingerprint": fp})
+    if name == "git_merge":
+        top = repo_root(chat, args.get("repo"), write=True)
+        current = run(top, "rev-parse", "--abbrev-ref", "HEAD").strip()
+        if current == "HEAD":
+            raise GitError("The repository isn't on a branch (detached HEAD).")
+        other = _name(args.get("branch"), "branch")
+        tip = run(top, "rev-parse", "--verify", "-q", "refs/heads/%s" % other, check=False).strip()
+        if not tip:
+            raise GitError("There is no local branch named %s." % other)
+        if run(top, "status", "--porcelain=v1", "--untracked-files=no").strip():
+            raise GitError("The repository has uncommitted changes. Commit them first, then merge.")
+        commits = run(top, "log", "--oneline", "-n", "50", "HEAD..%s" % tip).strip()
+        if not commits:
+            raise GitError("Nothing to merge: %s has no commits that %s lacks." % (other, current))
+        stat = run(top, "diff", "--stat", "HEAD...%s" % tip, check=False)
+        detail = "Repository: %s\nMerge %s into %s\n\nCommits:\n%s\n\nFiles:\n%s" % (top, other, current, commits, clip(stat, 20_000))
+        return ({"title": "Merge %s into %s?" % (other, current), "detail": detail,
+                 "why": "This changes your working branch. If the changes conflict, nothing is merged."},
+                {"top": top, "branch": current, "head": run(top, "rev-parse", "HEAD").strip(), "other": other, "tip": tip})
     top = repo_root(chat, args.get("repo"))
     branch = run(top, "rev-parse", "--abbrev-ref", "HEAD").strip()
     if branch == "HEAD":
@@ -267,6 +286,16 @@ def execute(chat, name, args, record):
         commit = ["commit", "-m", record["message"]] + ([] if record["paths"] == ["."] else ["--", *record["paths"]])
         run(top, *commit, timeout=120)
         return "Committed:\n" + run(top, "log", "-1", "--stat", "--pretty=format:%h %s")
+    if name == "git_merge":
+        if run(top, "rev-parse", "HEAD").strip() != record["head"] or run(top, "rev-parse", "--verify", "refs/heads/%s" % record["other"]).strip() != record["tip"]:
+            raise GitError("A branch moved after you reviewed the merge, so nothing was merged. Review it again.")
+        r = run(top, "merge", "--no-edit", "--no-ff", record["tip"], check=False, timeout=120)
+        if run(top, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).strip():
+            run(top, "merge", "--abort", check=False)
+            raise GitError("The branches conflict, so the merge was cancelled and nothing changed.\n" + r[-1500:])
+        if run(top, "rev-parse", "HEAD").strip() == record["head"]:
+            raise GitError("git merge failed:\n" + r[-1500:])
+        return "Merged %s into %s.\n%s" % (record["other"], record["branch"], run(top, "log", "-1", "--stat", "--pretty=format:%h %s"))
     if run(top, "rev-parse", "--verify", record["branch"]).strip() != record["head"]:
         raise GitError("The branch moved after you reviewed it, so nothing was sent. Review it again.")
     if name == "git_push":

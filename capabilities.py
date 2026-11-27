@@ -12,8 +12,10 @@ import uuid
 # webSearch: the session may search the web and read pages (off by default).
 # subtasks: the session may start helper chats that run in parallel and report back (off by default).
 # git: "off" | "read" | "commit" | "push" (see gittools.py).
+# instructions: read AGENTS.md / CLAUDE.md / .openay/instructions.md from shared folders (on by default).
+# memory: use and save memory notes (see projects.py; on by default).
 DEFAULT_POLICY = {"editMode": "review", "fileManage": False, "deleteFiles": False, "modelControl": "ask", "webSearch": False,
-                  "subtasks": False, "git": "off", "commands": False}
+                  "subtasks": False, "git": "off", "commands": False, "instructions": True, "memory": True}
 GIT_MODES = ("off", "read", "commit", "push")
 EDIT_MODES = {"review", "auto"}
 # After a session has read untrusted content (web pages), these need the user's approval each time.
@@ -48,6 +50,8 @@ def policy(chat):
     if p["git"] not in GIT_MODES:
         p["git"] = "off"
     p["subtasks"] = bool(p["subtasks"]) and not chat.get("parentId")  # one level only: subtasks can't start subtasks
+    p["instructions"] = bool(p["instructions"])
+    p["memory"] = bool(p["memory"]) and not chat.get("parentId")  # helpers neither read nor save memory
     # Untrusted content (web pages) can carry instructions aimed at the model. Once a session has
     # read some, nothing that changes files or the model happens without the user's approval.
     p["untrusted"] = bool(chat.get("untrusted"))
@@ -63,7 +67,8 @@ def child_capabilities(parent):
     p = policy(parent)
     return {"editMode": p["editMode"], "fileManage": p["fileManage"], "deleteFiles": p["deleteFiles"],
             "modelControl": "fixed", "webSearch": p["webSearch"], "subtasks": False,
-            "git": "read" if p["git"] != "off" else "off", "commands": False}  # subtasks never commit, push or run commands
+            "git": "read" if p["git"] != "off" else "off", "commands": False,  # subtasks never commit, push or run commands
+            "instructions": p["instructions"], "memory": False}
 
 
 def grants(chat):
@@ -348,7 +353,7 @@ def clean_capabilities(value):
     if "git" in value:
         if value["git"] not in GIT_MODES: raise CapabilityError("Unknown Git mode.")
         out["git"] = value["git"]
-    for key in ("fileManage", "deleteFiles", "webSearch", "subtasks", "commands"):
+    for key in ("fileManage", "deleteFiles", "webSearch", "subtasks", "commands", "instructions", "memory"):
         if key in value:
             if not isinstance(value[key], bool): raise CapabilityError("%s must be true or false." % key)
             out[key] = value[key]

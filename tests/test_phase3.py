@@ -146,7 +146,7 @@ class SkillTests(RunTestCase):
     def test_enabled_skills_reach_the_model_even_without_tools(self):
         skills.save(self.root(), "Pirate", "Talk like a pirate", "Always answer like a pirate.")
         c = server.create_chat({"model": "m1", "folders": []})
-        server.update_permissions(c["id"], {"skills": ["pirate"], "capabilities": {"modelControl": "fixed"}})
+        server.update_permissions(c["id"], {"skills": ["pirate"], "capabilities": {"modelControl": "fixed", "memory": False}})
         self.script = [say("Arr")]; self.run_to_end(c["id"])
         self.assertNotIn("tools", self.requests[-1])
         self.assertIn("Always answer like a pirate.", self.requests[-1]["messages"][0]["content"])

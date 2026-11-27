@@ -8,8 +8,9 @@ const state = {
   approval: null, modelApproval: null, navSeq: 0,
   clearKey: false, updateUrl: "", sessionDraft: null,
   es: null, runStatus: "idle", runs: {}, editIndex: null, usage: null, today: null,
+  documents: [], plan: false, projects: [], projectFilter: "", undoRuns: [], searchHits: null,
 };
-const DEFAULT_CAPABILITIES = { editMode: "review", fileManage: false, deleteFiles: false, modelControl: "ask", webSearch: false, subtasks: false, git: "off", commands: false };
+const DEFAULT_CAPABILITIES = { editMode: "review", fileManage: false, deleteFiles: false, modelControl: "ask", webSearch: false, subtasks: false, git: "off", commands: false, instructions: true, memory: true };
 const api = async (path, opts = {}) => {
   const r = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
   const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.statusText); return j;
@@ -70,11 +71,18 @@ function openModelMenu(open) {
 // shows them through a live event stream and sends user actions as requests.
 async function loadChats() { state.chats = await api("/api/chats").catch(() => []); renderChatList(); }
 function chatOrder(q) {
-  if (q) return state.chats.filter((c) => c.title.toLowerCase().includes(q));  // flat while searching
-  const ids = new Set(state.chats.map((c) => c.id)); const out = [];
-  for (const c of state.chats) {
+  const inProject = (c) => !state.projectFilter || c.projectId === state.projectFilter;
+  if (q) {  // flat while searching: title matches at once, then message matches from the server
+    const hits = state.searchHits?.q === q ? state.searchHits.results : [];
+    const byId = new Map(state.chats.filter((c) => c.title.toLowerCase().includes(q)).map((c) => [c.id, c]));
+    for (const h of hits) if (!byId.has(h.id)) byId.set(h.id, h);
+    return [...byId.values()].filter(inProject);
+  }
+  const chats = state.chats.filter(inProject);
+  const ids = new Set(chats.map((c) => c.id)); const out = [];
+  for (const c of chats) {
     if (c.parentId && ids.has(c.parentId)) continue;  // shown under its parent
-    out.push(c); for (const k of state.chats) if (k.parentId === c.id) out.push(k);
+    out.push(c); for (const k of chats) if (k.parentId === c.id) out.push(k);
   }
   return out;
 }
@@ -87,8 +95,20 @@ function renderChatList() {
       : run === "paused" ? '<span class="dot pause" title="Paused: low Ollama balance"></span>' : run ? '<span class="dot run" title="Replying…"></span>' : "";
     let label = "";
     if (!q && !c.parentId) { const g = dayGroup(c.updated); if (g !== group) { group = g; label = `<div class="list-label">${g}</div>`; } }
-    return `${label}<div class="chat-item ${state.chat?.id === c.id ? "active" : ""} ${c.parentId ? "child" : ""}" data-id="${c.id}" title="${esc(c.model || "")}">${badge}<span class="t">${esc(c.title)}</span><button class="icon-btn del" type="button" title="Delete chat" aria-label="Delete chat">${ic("trash", "sm")}</button></div>`;
-  }).join("") || `<div class="list-note">${q ? "No matches" : "No chats yet"}</div>`;
+    const mark = c.scheduled ? ic("clock", "sm") : "";
+    const snippet = q && c.snippet ? `<span class="snip">${esc(c.snippet)}</span>` : "";
+    return `${label}<div class="chat-item ${state.chat?.id === c.id ? "active" : ""} ${c.parentId ? "child" : ""} ${snippet ? "hit" : ""}" data-id="${c.id}" data-index="${c.index ?? ""}" title="${esc(c.model || "")}">${badge}${mark}<span class="t">${esc(c.title)}${snippet}</span><button class="icon-btn del" type="button" title="Delete chat" aria-label="Delete chat">${ic("trash", "sm")}</button></div>`;
+  }).join("") || `<div class="list-note">${q ? (state.searchHits?.q === q ? "No matches" : "Searching…") : state.projectFilter ? "No chats in this project yet" : "No chats yet"}</div>`;
+}
+// Full-text search over every chat's messages, a moment after typing stops
+let searchTimer = 0;
+function searchChats() {
+  clearTimeout(searchTimer); const q = $("#search").value.trim().toLowerCase(); renderChatList();
+  if (q.length < 2) return;
+  searchTimer = setTimeout(async () => {
+    try { const r = await api("/api/search?q=" + encodeURIComponent(q)); state.searchHits = { q, results: r.results }; } catch { state.searchHits = { q, results: [] }; }
+    if ($("#search").value.trim().toLowerCase() === q) renderChatList();
+  }, 250);
 }
 function dayGroup(ms) {
   const d = new Date(ms || 0); const today = new Date(); today.setHours(0, 0, 0, 0);
@@ -150,8 +170,10 @@ function applyEvent(id, ev) {
     case "status":
       setRunStatus(ev.status);
       if (ev.model && ev.model !== chat.model) { chat.model = ev.model; state.selectedModel = ev.model; updateModelBtn(); const meta = state.chats.find((c) => c.id === chat.id); if (meta) meta.model = ev.model; }
-      if (ev.status === "idle") { loadChats(); renderMessages(); }
+      if (ev.status === "idle") { loadChats(); loadUndoRuns().then(renderMessages); }
       break;
+    case "compacting": setStatusBar(ev.active ? "Summarizing earlier messages to fit the context budget…" : ""); break;
+    case "compaction": chat.compaction = ev.compaction; renderMessages(); break;
     case "approval": showApproval(ev.approval); break;
     case "approval_done": closeApproval(ev.id); break;
     case "untrusted": chat.untrusted = ev.untrusted; updateUntrustedBadge(); break;
@@ -176,11 +198,14 @@ function renderUsage() {
     parts.push(`<span class="${pct >= 80 ? "warn" : ""}" title="Tokens in the last request, out of this model's context window (${pct}%)">Context <span class="bar"><i></i></span> ${kTokens(c.used)} / ${kTokens(c.limit)}</span>`);
     if (c.omittedMessages) parts.push(`<span class="warn" title="Older messages are left out of requests so the conversation fits">${c.omittedMessages} older message${c.omittedMessages > 1 ? "s" : ""} left out</span>`);
   }
-  if (u) parts.push(`<span title="Tokens sent and generated in this chat">This chat ${kTokens(u.promptTokens)} in · ${kTokens(u.outputTokens)} out</span>`);
+  if (u) {
+    const cached = u.cachedTokens ? ` (${Math.round((u.cachedTokens / Math.max(1, u.promptTokens)) * 100)}% cached)` : "";
+    parts.push(`<span title="Tokens sent and generated in this chat. Cached input is billed at Ollama's cheaper cached-input rate.">This chat ${kTokens(u.promptTokens)} in${cached} · ${kTokens(u.outputTokens)} out</span>`);
+  }
   if (t) {
     const used = t.promptTokens + t.outputTokens; const lim = state.limits?.dailyTokenLimit || 0;
     const of = lim ? ` / ${kTokens(lim)}` : ""; const warn = lim && used >= lim * 0.8 ? "warn" : "";
-    parts.push(`<span class="${warn}" title="All chats today${lim ? ", against your daily limit" : ""}">Today ${kTokens(used)}${of} tokens · ${t.requests} requests</span>`);
+    parts.push(`<span class="${warn}" title="All chats today${lim ? ", against your daily limit" : ""}${t.cachedTokens ? `. ${kTokens(t.cachedTokens)} input tokens came from Ollama's cache` : ""}">Today ${kTokens(used)}${of} tokens · ${t.requests} requests</span>`);
   }
   $("#usageLine").innerHTML = parts.join('<span class="sep">·</span>');
   const fill = $("#usageLine .bar i"); if (fill) fill.style.width = pct + "%";  // CSSOM: allowed by the page's CSP
@@ -202,19 +227,30 @@ function renderBalanceBadge() {
   badge.querySelector("span").textContent = text; badge.title = tip;
 }
 async function loadUsage() { try { const u = await api("/api/usage"); state.today = u.today; state.limits = u.limits; renderUsage(); } catch {} }
+function setStatusBar(text) { $("#statusBar").hidden = !text; $("#statusText").textContent = text || ""; }
+// Replies in this chat that still have file changes to undo (see undo.py)
+async function loadUndoRuns() {
+  const chat = state.chat; if (!chat) { state.undoRuns = []; return; }
+  try { const r = await api(`/api/undo?chat=${encodeURIComponent(chat.id)}&run=`); if (state.chat?.id === chat.id) state.undoRuns = r.runs || []; } catch { state.undoRuns = []; }
+}
 
 function newChat() {
   state.navSeq++; subscribe(null); state.chat = null; state.pause = null; renderPause(); state.draftFolders = []; state.editIndex = null; closeApproval(); setRunStatus("idle");
   state.selectedModel = state.config.defaultModel || state.models[0]?.name || "";
+  state.undoRuns = []; setStatusBar("");
   renderMessages(); renderChatList(); updateModelBtn(); updateFolderBtn(); updateUntrustedBadge(); toggleFolderPop(false); renderUsage(); $("#title").textContent = ""; $("#input").focus();
+  if (typeof onChatChanged === "function") onChatChanged();
 }
 async function openChat(id) {
   const ticket = ++state.navSeq; let chat;
   try { chat = await api("/api/chats/" + id); } catch (e) { toast(e.message); return; }
   if (ticket !== state.navSeq) return;
   closeApproval(); state.pause = null; renderPause(); state.editIndex = null; state.chat = chat; state.selectedModel = chat.model; setRunStatus(state.runs[id] || "idle");
+  state.undoRuns = []; setStatusBar("");
   updateModelBtn(); renderMessages(); renderChatList(); updateFolderBtn(); updateUntrustedBadge(); toggleFolderPop(false); renderUsage(); $("#title").textContent = titleFor(chat); scrollBottom(true);
   subscribe(id);  // the snapshot that follows brings any live run state
+  loadUndoRuns().then(() => { if (state.chat?.id === chat.id) renderMessages(); });
+  if (typeof onChatChanged === "function") onChatChanged();
 }
 async function deleteChat(id) {
   const running = state.runs[id] ? "\n\nA reply is running in this chat; it will be stopped." : "";
@@ -250,13 +286,34 @@ function msgHTML(m, idx, isLast) {
   if (m.role === "user" && m.auto) return `<div class="msg user auto${enter}" data-idx="${idx}"><div class="bubble">${esc(m.content)}</div></div>`;
   if (m.role === "user") {
     const imgs = (m.images || []).map((b) => `<img src="data:image/*;base64,${b}" alt="">`).join("");
-    return `<div class="msg user${enter}" data-idx="${idx}">${imgs ? `<div class="imgs">${imgs}</div>` : ""}<div class="bubble">${esc(m.content)}</div><div class="actions"><button class="icon-btn act-copy" type="button" title="Copy" aria-label="Copy">${ic("copy", "sm")}</button><button class="icon-btn act-edit" type="button" title="Edit & resend" aria-label="Edit and resend">${ic("edit", "sm")}</button></div></div>`;
+    const docs = (m.attachments || []).map((a) => `<span class="doc-chip" title="${esc(a.note || "")}">${ic("doc", "sm")}${esc(a.name)}<span class="faint">${kTokens(Math.round((a.chars || 0) / 4))} tokens</span></span>`).join("");
+    const plan = m.plan ? `<span class="chip running plan-chip">${ic("plan", "sm")}Plan mode</span>` : "";
+    return `<div class="msg user${enter}" data-idx="${idx}">${imgs ? `<div class="imgs">${imgs}</div>` : ""}${docs || plan ? `<div class="docs">${plan}${docs}</div>` : ""}${m.content ? `<div class="bubble">${esc(m.content)}</div>` : ""}<div class="actions"><button class="icon-btn act-copy" type="button" title="Copy" aria-label="Copy">${ic("copy", "sm")}</button><button class="icon-btn act-edit" type="button" title="Edit & resend" aria-label="Edit and resend">${ic("edit", "sm")}</button></div></div>`;
   }
   const liveThought = m._live && !m.content;
   const thinking = m.thinking ? `<details class="thinking${liveThought ? " live" : ""}" ${liveThought ? "open" : ""}><summary>${ic("thought", "sm")}<span class="lbl">${liveThought ? "Thinking…" : "Thought process"}</span>${ic("chevron", "sm chev")}</summary><div class="tbody">${esc(m.thinking)}</div></details>` : "";
   const stats = m.stats ? `<span>· ${m.stats}</span>` : ""; const body = m.content ? renderMarkdown(m.content) : "";
   if (m.tool_calls?.length && !m._live) return `<div class="msg assistant step${enter}" data-idx="${idx}">${thinking}${body ? `<div class="content">${body}</div>` : ""}</div>`;
-  return `<div class="msg assistant${isLast ? " last" : ""}${enter}" data-idx="${idx}"><div class="meta"><span>${esc(m.model || "")}</span>${stats}${m.wrapUp ? '<span class="wrapup-tag" title="Low balance: the model summarized its progress before pausing">wrap-up</span>' : ""}</div>${thinking}<div class="content ${m._live ? "cursor" : ""}">${body}</div>${m.notice ? `<div class="notice">${esc(m.notice)}</div>` : ""}${m.error ? `<div class="err">${linkify(m.error)}</div>` : ""}${m._live ? "" : `<div class="actions"><button class="icon-btn act-copy" type="button" title="Copy" aria-label="Copy">${ic("copy", "sm")}</button>${isLast ? `<button class="icon-btn act-regen" type="button" title="Regenerate" aria-label="Regenerate">${ic("redo", "sm")}</button>` : ""}</div>`}</div>`;
+  const turn = turnMeta[idx] || {};
+  const undoRun = !m._live && (turn.runs || []).filter((r) => state.undoRuns.includes(r)).pop();
+  const nChanged = undoRun ? (state.chat?.messages || []).filter((x) => x.runId === undoRun).length : 0;
+  const undoBtn = undoRun ? `<span class="help">${nChanged} file change${nChanged === 1 ? "" : "s"} in this reply</span><button class="btn sm ghost" type="button" data-undo="${esc(undoRun)}" title="Put back the files this reply changed">${ic("undo", "sm")}Undo changes</button>` : "";
+  const planBtn = turn.plan && isLast && !m._live && !m.error && !busy() ? `<div class="plan-go"><button class="btn sm primary" type="button" data-carry-out>${ic("play", "sm")}Carry out this plan</button><span class="help">Or reply with changes to the plan first.</span></div>` : "";
+  return `<div class="msg assistant${isLast ? " last" : ""}${enter}" data-idx="${idx}"><div class="meta"><span>${esc(m.model || "")}</span>${stats}${m.wrapUp ? '<span class="wrapup-tag" title="Low balance: the model summarized its progress before pausing">wrap-up</span>' : ""}</div>${thinking}<div class="content ${m._live ? "cursor" : ""}">${body}</div>${m.notice ? `<div class="notice">${esc(m.notice)}</div>` : ""}${m.error ? `<div class="err">${linkify(m.error)}</div>` : ""}${planBtn}${undoBtn ? `<div class="reply-foot">${undoBtn}</div>` : ""}${m._live ? "" : `<div class="actions"><button class="icon-btn act-copy" type="button" title="Copy" aria-label="Copy">${ic("copy", "sm")}</button>${isLast ? `<button class="icon-btn act-regen" type="button" title="Regenerate" aria-label="Regenerate">${ic("redo", "sm")}</button>` : ""}</div>`}</div>`;
+}
+// For each turn's answer: the replies (run IDs) that changed files in it, and whether it was asked in plan mode
+let turnMeta = {};
+function computeTurns(msgs) {
+  const meta = {}; let plan = false, runs = [];
+  msgs.forEach((m, i) => {
+    if (m.role === "user" && !m.auto) { plan = Boolean(m.plan); runs = []; }
+    else if (m.role === "tool" && m.runId && !runs.includes(m.runId)) runs.push(m.runId);
+    else if (m.role === "assistant" && !m.tool_calls?.length) meta[i] = { plan, runs: runs.slice() };
+  });
+  return meta;
+}
+function summaryDivider(c) {
+  return `<div class="summary-divider" data-summary><span class="line"></span><button class="btn sm ghost" type="button" data-show-summary>${ic("memory", "sm")}Earlier messages were summarized to fit the context budget · View summary</button><span class="line"></span></div><div class="summary-box content" hidden>${renderMarkdown(c.summary || "")}</div>`;
 }
 const APP_LOGO = '<svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="9" fill="#1D2026"/><rect x=".5" y=".5" width="31" height="31" rx="8.5" fill="none" stroke="rgba(255,255,255,.1)"/><path d="M9.5 22V13.5a6.5 6.5 0 0 1 13 0V22" fill="none" stroke="#F2F3F5" stroke-width="2.6" stroke-linecap="round"/><circle cx="13.3" cy="15.4" r="1.6" fill="#8B9CFF"/><circle cx="18.7" cy="15.4" r="1.6" fill="#8B9CFF"/></svg>';
 const SUGGESTIONS = [
@@ -273,7 +330,9 @@ function renderMessages() {
       <div class="suggest">${SUGGESTIONS.map((s, i) => `<button type="button" data-suggest="${i}">${ic(s[0])}<b>${s[1]}</b><span>${s[2]}</span></button>`).join("")}</div></div>`;
     shown.count = msgs.length; return;
   }
-  const lastIdx = msgs.length - 1; box.innerHTML = msgs.map((m, i) => msgHTML(m, i, i === lastIdx)).join("");
+  const lastIdx = msgs.length - 1; turnMeta = computeTurns(msgs);
+  const c = state.chat?.compaction; const upTo = c && c.upTo > 0 && c.upTo < msgs.length ? c.upTo : -1;
+  box.innerHTML = msgs.map((m, i) => (i === upTo ? summaryDivider(c) : "") + msgHTML(m, i, i === lastIdx)).join("");
   // A message that slid in moments ago and was re-rendered continues its slide where it was
   const now = performance.now(); shown.times ||= {};
   for (let i = shown.count; i < msgs.length; i++) shown.times[i] = now;
@@ -301,27 +360,49 @@ function updateSendBtn() {
   const stopping = busy(); b.classList.toggle("stop", stopping);
   if (b.dataset.icon !== (stopping ? "stop" : "send")) { b.dataset.icon = stopping ? "stop" : "send"; b.innerHTML = ic(b.dataset.icon); }
   if (stopping) { b.title = "Stop"; b.setAttribute("aria-label", "Stop"); b.disabled = false; }
-  else { b.title = "Send (Enter)"; b.setAttribute("aria-label", "Send"); b.disabled = !$("#input").value.trim() && !state.attachments.length; }
+  else { b.title = "Send (Enter)"; b.setAttribute("aria-label", "Send"); b.disabled = !$("#input").value.trim() && !state.attachments.length && !state.documents.length; }
 }
 
 // Sending: the server saves the message and runs the reply
 function thinkOption() { const t = $("#thinkSel").value; return t === "default" ? null : t === "true" ? true : t === "false" ? false : t; }
-async function send() {
-  const text = $("#input").value.trim(); if (busy() || (!text && !state.attachments.length)) return;
+async function send(override) {
+  const text = override ?? $("#input").value.trim(); if (busy() || (!text && !state.attachments.length && !state.documents.length)) return;
+  if (state.documents.some((d) => d.loading)) { toast("Wait for the attached documents to finish reading"); return; }
   const model = currentModel(); if (!model) { toast("Pick a cloud model first"); openModelMenu(true); return; }
-  const images = state.attachments.slice(); const truncateAt = state.editIndex;
+  const images = state.attachments.slice(); const docs = state.documents.slice(); const truncateAt = state.editIndex;
+  const plan = override === undefined && state.plan;
   try {
     if (!state.chat) {
-      const chat = await api("/api/chats", { method: "POST", body: JSON.stringify({ title: (text || "Image").slice(0, 60).replace(/\s+/g, " "), model, folders: state.draftFolders }) });
+      const title = (text || docs[0]?.name || "Image").slice(0, 60).replace(/\s+/g, " ");
+      const chat = await api("/api/chats", { method: "POST", body: JSON.stringify({ title, model, folders: state.draftFolders, projectId: state.projectFilter || undefined }) });
       state.draftFolders = []; state.chat = chat; shown.chatId = chat.id; shown.count = 0; $("#title").textContent = chat.title; updateChatMeta(chat); subscribe(chat.id);
     }
     const chat = state.chat; setRunStatus("running");
-    $("#input").value = ""; autoGrow(); state.attachments = []; renderAttachments(); state.editIndex = null; updateEditBanner();
-    await api("/api/runs", { method: "POST", body: JSON.stringify({ chatId: chat.id, text, images, truncateAt, think: thinkOption() }) });
+    if (override === undefined) { $("#input").value = ""; autoGrow(); state.attachments = []; renderAttachments(); state.documents = []; renderDocs(); setPlan(false); }
+    state.editIndex = null; updateEditBanner();
+    await api("/api/runs", { method: "POST", body: JSON.stringify({ chatId: chat.id, text, images, truncateAt, think: thinkOption(), plan,
+      documents: docs.map((d) => ({ name: d.name, text: d.text, note: d.note })) }) });
   } catch (e) {
     toast(e.message); setRunStatus("idle");
-    if (!$("#input").value) { $("#input").value = text; state.attachments = images; renderAttachments(); autoGrow(); }
+    if (override === undefined && !$("#input").value) { $("#input").value = text; state.attachments = images; state.documents = docs; renderAttachments(); renderDocs(); autoGrow(); }
   }
+}
+function setPlan(on) { state.plan = Boolean(on); $("#planBtn").setAttribute("aria-pressed", String(state.plan)); $("#input").placeholder = state.plan ? "Describe the task: the model investigates and proposes a plan, without changing anything…" : "Ask anything, or describe a task…"; }
+
+// Documents: the server reads their text (documents.py); it goes to the model with the message
+async function addDocument(file) {
+  const doc = { name: file.name, loading: true, text: "", note: "", chars: 0 }; state.documents.push(doc); renderDocs();
+  try {
+    const data = await new Promise((ok, fail) => { const rd = new FileReader(); rd.onload = () => ok(String(rd.result).split(",")[1] || ""); rd.onerror = fail; rd.readAsDataURL(file); });
+    const r = await api("/api/documents/extract", { method: "POST", body: JSON.stringify({ name: file.name, data }) });
+    Object.assign(doc, { text: r.text, note: r.note, chars: r.chars, loading: false });
+    if (r.note) toast(`${file.name}: ${r.note}`);
+  } catch (e) { state.documents = state.documents.filter((d) => d !== doc); toast(`${file.name}: ${e.message}`); }
+  renderDocs();
+}
+function renderDocs() {
+  $("#docList").innerHTML = state.documents.map((d, i) => `<span class="doc-chip${d.loading ? " loading" : ""}" title="${esc(d.note || "")}">${ic("doc", "sm")}${esc(d.name)}<span class="faint">${d.loading ? "reading…" : `${kTokens(Math.round(d.chars / 4))} tokens`}</span><button type="button" data-doc="${i}" aria-label="Remove ${esc(d.name)}">×</button></span>`).join("");
+  updateSendBtn();
 }
 function stop() { if (state.chat && busy()) api("/api/runs/stop", { method: "POST", body: JSON.stringify({ chatId: state.chat.id }) }).catch((e) => toast(e.message)); }
 async function regenerate() {
@@ -410,8 +491,27 @@ function decideModelApproval(approved) {
 
 // Attachments
 function renderAttachments() { $("#attachments").innerHTML = state.attachments.map((b, i) => `<div class="att"><img src="data:image/*;base64,${b}"><button data-i="${i}" title="Remove">×</button></div>`).join(""); updateSendBtn(); }
-function addFiles(files) {
-  for (const f of files) { if (!f.type.startsWith("image/")) continue; const rd = new FileReader(); rd.onload = () => { state.attachments.push(String(rd.result).split(",")[1]); renderAttachments(); }; rd.readAsDataURL(f); }
+// Pictures are shrunk to at most 1600 px on the long side before sending: vision models bill by image
+// size, and they read text in screenshots just as well at that size. Small pictures go as they are.
+const MAX_IMAGE_SIDE = 1600;
+async function imageBase64(file) {
+  const original = await new Promise((ok, fail) => { const rd = new FileReader(); rd.onload = () => ok(String(rd.result).split(",")[1]); rd.onerror = fail; rd.readAsDataURL(file); });
+  try {
+    const bmp = await createImageBitmap(file); const side = Math.max(bmp.width, bmp.height);
+    if (side <= MAX_IMAGE_SIDE && file.size <= 400_000) { bmp.close(); return original; }
+    const k = Math.min(1, MAX_IMAGE_SIDE / side); const c = document.createElement("canvas");
+    c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+    c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height); bmp.close();
+    const type = file.type === "image/png" ? "image/png" : "image/jpeg";  // screenshots stay PNG for sharp text
+    const smaller = c.toDataURL(type, 0.9).split(",")[1];
+    return smaller.length < original.length ? smaller : original;
+  } catch { return original; }
+}
+async function addFiles(files) {
+  for (const f of files) {
+    if (f.type.startsWith("image/")) { state.attachments.push(await imageBase64(f)); renderAttachments(); }
+    else if (typeof addDocument === "function") await addDocument(f);
+  }
 }
 
 // Settings and updates
@@ -424,7 +524,30 @@ function openSettings() {
   $("#setVer").textContent = c.version ? "Version " + c.version : "";
   $("#keyState").className = "key-state" + (c.hasApiKey ? " ok" : ""); $("#keyState").textContent = c.hasApiKey ? `Saved ${c.apiKeyHint || "(from OLLAMA_API_KEY)"}` : "Not set";
   renderSettingsBalance(); showSettingsSection("secConn", false);
+  setBudgetButtons(c.contextBudget || "full");
+  $("#autoUpdate").checked = c.autoUpdate !== false; $("#quickEntry").checked = c.quickEntry !== false;
+  $("#quickEntry").closest(".perm").hidden = !window.openay?.isElectron;
+  $("#globalMemory").value = ""; state.memoryLoaded = null;
+  api("/api/memory?scope=global").then((r) => { $("#globalMemory").value = r.text; state.memoryLoaded = r.text; }).catch(() => {});
+  if (window.openay?.updates) window.openay.updates.state().then(renderUpdateState).catch(() => {});
   populateDefaultModels(); $("#modalBack").classList.add("open");
+}
+function setBudgetButtons(name) { document.querySelectorAll("#ctxBudget [data-budget]").forEach((b) => b.classList.toggle("primary", b.dataset.budget === name)); }
+document.querySelector("#ctxBudget").addEventListener("click", (e) => { const b = e.target.closest("[data-budget]"); if (b) setBudgetButtons(b.dataset.budget); });
+// In the Electron app, updates install from GitHub Releases (electron/main.js); in a browser window the
+// older check only links to the release page.
+function renderUpdateState(s) {
+  if (!s) return;
+  const st = $("#updateStatus"), meter = $("#updateMeter");
+  const text = { dev: "Updates install in the installed app (this is a development copy).", idle: "Checks for updates a few seconds after start, then every 6 hours.",
+    checking: "Checking for updates…", current: "You have the latest version.", available: `Version ${s.latest} is available.`,
+    downloading: `Downloading version ${s.latest || ""}… ${s.percent || 0}%`, ready: `Version ${s.latest} is ready. It installs when you restart the app.`,
+    error: "Couldn't check for updates: " + (s.error || "unknown error") }[s.state] || "";
+  st.textContent = text; meter.hidden = s.state !== "downloading";
+  if (s.state === "downloading") meter.querySelector("i").style.width = (s.percent || 0) + "%";
+  $("#downloadUpdate").hidden = s.state !== "available"; $("#installUpdate").hidden = s.state !== "ready";
+  $("#checkUpdates").disabled = ["checking", "downloading", "dev"].includes(s.state);
+  const badge = $("#settingsBtn"); badge.classList.toggle("has-update", ["available", "ready"].includes(s.state));
 }
 function renderSettingsBalance() {
   const b = state.balance?.balance; const min = state.balance?.minimumUsd ?? state.config.minBalanceUsd ?? 0; const level = balanceLevel();
@@ -451,22 +574,28 @@ function populateDefaultModels() {
   select.value = selected; if (!state.models.length && !selected) select.innerHTML = '<option value="">Choose a model after saving your API key</option>';
 }
 async function checkUpdates() {
+  if (window.openay?.updates) { renderUpdateState(await window.openay.updates.check()); return; }
   const button = $("#checkUpdates"); button.disabled = true; button.textContent = "Checking…";
   $("#updateStatus").textContent = "Contacting GitHub Releases…"; $("#openUpdate").hidden = true; state.updateUrl = "";
   try {
     const result = await api("/api/updates/check", { method: "POST", body: "{}" }); $("#updateStatus").textContent = result.message;
     if (result.updateAvailable) { state.updateUrl = result.releaseUrl; $("#openUpdate").hidden = false; }
   } catch (e) { $("#updateStatus").textContent = e.message; }
-  finally { button.disabled = false; button.textContent = "Check for Updates"; }
+  finally { button.disabled = false; button.textContent = "Check now"; }
 }
 async function saveSettings() {
+  const budget = document.querySelector("#ctxBudget .primary")?.dataset.budget || "full";
   const body = { defaultModel: $("#defaultModel").value, dailyTokenLimit: Number($("#dailyLimit").value || 0),
                  chatTokenLimit: Number($("#chatLimit").value || 0), maxConcurrentRuns: Number($("#maxRuns").value || 4), minBalanceUsd: Number($("#minBalance").value || 0),
-                 allowedCommands: $("#allowedCommands").value.split(/\r?\n/).map((l) => l.trim()).filter(Boolean) };
+                 allowedCommands: $("#allowedCommands").value.split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
+                 contextBudget: budget, autoUpdate: $("#autoUpdate").checked, quickEntry: $("#quickEntry").checked };
   const key = $("#apiKey").value.trim(); if (key) body.apiKey = key;
   if (state.clearKey && !key) body.clearApiKey = true;
   try {
+    if (state.memoryLoaded !== null && $("#globalMemory").value !== state.memoryLoaded)
+      await api("/api/memory", { method: "POST", body: JSON.stringify({ scope: "global", text: $("#globalMemory").value }) });
     const saved = await api("/api/config", { method: "POST", body: JSON.stringify(body) }); const oldDefault = state.config.defaultModel; state.config = saved;
+    if (window.openay?.updates) { window.openay.updates.setAuto(saved.autoUpdate !== false); window.openay.setQuickEntry(saved.quickEntry !== false); }
     if (!state.chat && oldDefault !== saved.defaultModel) { state.selectedModel = saved.defaultModel || state.models[0]?.name || ""; renderMessages(); updateModelBtn(); }
     $("#modalBack").classList.remove("open"); await loadModels(); loadUsage(); toast("Settings saved");
   } catch (e) { toast(e.message); }
@@ -488,7 +617,10 @@ function openSession() {
   if (isChild) $("#subtasksHelp").textContent = "This chat is a subtask. Its permissions come from the chat that started it, and it can't start subtasks of its own.";
   const u = state.chat.untrusted; $("#untrustedBox").hidden = !u;
   if (u) $("#untrustedSources").textContent = "Since " + new Date(u.since).toLocaleString() + ". Read: " + (u.sources || []).join("; ");
-  if (!isChild) $("#subtasksHelp").textContent = "Helper chats that work on parts of a task at the same time and report back. Each gets this chat's folders and skills, at most its permissions, and a fixed model. Stopping this chat stops its helpers.";
+  if (!isChild) $("#subtasksHelp").textContent = "Helper chats that work on parts of a task at the same time and report back. Each gets this chat's folders and skills, at most its permissions, and a fixed model. With Git set to commit, a helper can work in its own branch (a Git worktree). Stopping this chat stops its helpers.";
+  $("#instructionsOn").checked = c.instructions !== false; $("#memoryOn").checked = c.memory !== false && !isChild; $("#memoryOn").disabled = isChild;
+  $("#sessionProject").innerHTML = '<option value="">No project</option>' + state.projects.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("");
+  $("#sessionProject").value = state.chat.projectId && state.projects.some((p) => p.id === state.chat.projectId) ? state.chat.projectId : "";
   $("#sessionSkills").innerHTML = '<span class="help">Loading skills…</span>';
   api("/api/skills").then((r) => {
     const on = new Set(state.chat?.skills || []);
@@ -506,14 +638,15 @@ async function saveSession() {
   const draft = state.sessionDraft; if (!draft || !state.chat || draft.id !== state.chat.id) return;
   const title = $("#sessionName").value.trim();
   const c = { editMode: $("#editMode").value, fileManage: $("#fileManage").checked,
-              deleteFiles: $("#deleteFiles").checked, modelControl: $("#modelControl").value, webSearch: $("#webSearch").checked, git: $("#gitMode").value, commands: $("#commandsOn").checked && !$("#commandsOn").disabled, subtasks: $("#subtasks").checked && !$("#subtasks").disabled };
+              deleteFiles: $("#deleteFiles").checked, modelControl: $("#modelControl").value, webSearch: $("#webSearch").checked, git: $("#gitMode").value, commands: $("#commandsOn").checked && !$("#commandsOn").disabled, subtasks: $("#subtasks").checked && !$("#subtasks").disabled,
+              instructions: $("#instructionsOn").checked, memory: $("#memoryOn").checked && !$("#memoryOn").disabled };
   const skillIds = [...document.querySelectorAll("#sessionSkills [data-skill]")].filter((x) => x.checked).map((x) => x.dataset.skill);
   try {
     if (title !== state.chat.title) {
       const result = await api("/api/session/rename", { method: "POST", body: JSON.stringify({ chatId: state.chat.id, title }) });
       state.chat.title = result.title; $("#title").textContent = result.title;
     }
-    const changes = { capabilities: c }; if (document.querySelector("#sessionSkills [data-skill]")) changes.skills = skillIds;
+    const changes = { capabilities: c, projectId: $("#sessionProject").value || null }; if (document.querySelector("#sessionSkills [data-skill]")) changes.skills = skillIds;
     await savePermissions(state.chat, changes); await loadChats();
     $("#sessionBack").classList.remove("open"); toast("Session settings saved");
   } catch (e) { toast(e.message); }
@@ -652,7 +785,7 @@ function renderFolderList() {
 // through /api/session/permissions, and the window shows what the server actually stored.
 async function savePermissions(chat, changes) {
   const r = await api("/api/session/permissions", { method: "POST", body: JSON.stringify({ chatId: chat.id, ...changes }) });
-  chat.folders = r.folders; chat.capabilities = r.capabilities; chat.skills = r.skills; if (state.chat === chat) updateSubtitle(); return r;
+  chat.folders = r.folders; chat.capabilities = r.capabilities; chat.skills = r.skills; chat.projectId = r.projectId; if (state.chat === chat) updateSubtitle(); return r;
 }
 async function foldersChanged() {
   renderFolderList(); updateFolderBtn(); if (!state.chat) return; const chat = state.chat;
@@ -695,16 +828,23 @@ $("#folderList").addEventListener("click", (e) => {
 function autoGrow() { const t = $("#input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 240) + "px"; updateSendBtn(); }
 $("#input").addEventListener("input", autoGrow);
 $("#input").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
-$("#input").addEventListener("paste", (e) => { const files = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith("image/")); if (files.length) { e.preventDefault(); addFiles(files); } });
+$("#input").addEventListener("paste", (e) => { const files = [...(e.clipboardData?.files || [])]; if (files.length) { e.preventDefault(); addFiles(files); } });
 $("#sendBtn").addEventListener("click", () => busy() ? stop() : send()); $("#attachBtn").addEventListener("click", () => $("#fileInput").click());
 $("#fileInput").addEventListener("change", (e) => { addFiles(e.target.files); e.target.value = ""; });
 $("#attachments").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) { state.attachments.splice(+b.dataset.i, 1); renderAttachments(); } });
+$("#docList").addEventListener("click", (e) => { const b = e.target.closest("[data-doc]"); if (b) { state.documents.splice(+b.dataset.doc, 1); renderDocs(); } });
+$("#planBtn").addEventListener("click", () => { setPlan(!state.plan); $("#input").focus(); });
 let dragDepth = 0;
 addEventListener("dragenter", (e) => { if (e.dataTransfer?.types.includes("Files")) { dragDepth++; $("#drop").classList.add("show"); } });
 addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; $("#drop").classList.remove("show"); } });
 addEventListener("dragover", (e) => e.preventDefault()); addEventListener("drop", (e) => { e.preventDefault(); dragDepth = 0; $("#drop").classList.remove("show"); addFiles(e.dataTransfer.files); });
-$("#newChat").addEventListener("click", newChat); $("#search").addEventListener("input", renderChatList);
-$("#chatList").addEventListener("click", (e) => { const item = e.target.closest(".chat-item"); if (!item) return; if (e.target.closest(".del")) deleteChat(item.dataset.id); else openChat(item.dataset.id); });
+$("#newChat").addEventListener("click", newChat); $("#search").addEventListener("input", searchChats);
+$("#chatList").addEventListener("click", async (e) => {
+  const item = e.target.closest(".chat-item"); if (!item) return; if (e.target.closest(".del")) { deleteChat(item.dataset.id); return; }
+  await openChat(item.dataset.id);
+  const at = item.dataset.index; if (at === "") return;  // a search hit: show the matching message
+  const el = $(`#messages [data-idx="${at}"]`); if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("found"); setTimeout(() => el.classList.remove("found"), 1600); }
+});
 $("#toggleSide").addEventListener("click", () => $("#sidebar").classList.toggle("hidden"));
 $("#modelBtn").addEventListener("click", (e) => { e.stopPropagation(); openModelMenu(!$("#modelMenu").classList.contains("open")); });
 $("#modelFilter").addEventListener("input", () => { state.kbIndex = 0; renderModelOptions(); });
@@ -733,6 +873,9 @@ $("#messages").addEventListener("click", async (e) => {
   const ap = e.target.closest("[data-approve]"); if (ap) { decideApproval(ap.dataset.approve === "yes"); return; }
   const cc = e.target.closest(".copy-code");
   if (cc) { await navigator.clipboard.writeText(cc.parentElement.querySelector("code").innerText); cc.textContent = "Copied"; setTimeout(() => (cc.textContent = "Copy"), 1200); return; }
+  if (e.target.closest("[data-show-summary]")) { const box = e.target.closest(".summary-divider").nextElementSibling; box.hidden = !box.hidden; return; }
+  if (e.target.closest("[data-carry-out]")) { send("Go ahead and carry out the plan."); return; }
+  const un = e.target.closest("[data-undo]"); if (un) { openUndo(un.dataset.undo); return; }
   const msgEl = e.target.closest(".msg"); if (!msgEl) return; const idx = +msgEl.dataset.idx; const m = state.chat?.messages[idx];
   if (e.target.closest(".act-copy")) { await navigator.clipboard.writeText(m.content); toast("Copied"); } else if (e.target.closest(".act-regen")) regenerate(); else if (e.target.closest(".act-edit")) editMessage(idx);
 });
@@ -757,6 +900,7 @@ addEventListener("keydown", (e) => {
   else if (e.ctrlKey && e.key.toLowerCase() === "b") { e.preventDefault(); $("#sidebar").classList.toggle("hidden"); }
   else if (e.key === "Escape") {
     if ($("#modelApproveBack").classList.contains("open") || $("#previewBack").classList.contains("open") || $("#actionApproveBack").classList.contains("open")) hideApprovalDialogs(); else if ($("#activityBack").classList.contains("open")) closeActivity(); else if ($("#skillsBack").classList.contains("open")) $("#skillsBack").classList.remove("open"); else if ($("#trashBack").classList.contains("open")) $("#trashBack").classList.remove("open"); else if ($("#sessionBack").classList.contains("open")) $("#sessionBack").classList.remove("open");
+    else if (document.querySelector("#projectsBack.open, #schedBack.open, #undoBack.open")) document.querySelectorAll("#projectsBack, #schedBack, #undoBack").forEach((b) => b.classList.remove("open"));
     else if ($("#folderPop").classList.contains("open")) toggleFolderPop(false); else if ($("#modalBack").classList.contains("open")) $("#modalBack").classList.remove("open"); else if (state.editIndex !== null) { state.editIndex = null; updateEditBanner(); } else if (busy()) stop();
   }
 });
@@ -777,6 +921,28 @@ $("#pauseCheck").addEventListener("click", () => loadBalance(true));
 $("#pauseStop").addEventListener("click", stop);
 $("#pauseRecharge").addEventListener("click", () => window.open("https://ollama.com/settings", "_blank", "noopener"));
 $("#editCancel").addEventListener("click", () => { state.editIndex = null; updateEditBanner(); $("#input").value = ""; state.attachments = []; renderAttachments(); autoGrow(); });
+
+// Undo this reply: shows what will be put back, then does it (undo.py on the server)
+async function openUndo(runId) {
+  const chat = state.chat; if (!chat || busy()) { toast("Wait for the reply to finish first"); return; }
+  let r; try { r = await api(`/api/undo?chat=${encodeURIComponent(chat.id)}&run=${encodeURIComponent(runId)}`); } catch (e) { toast(e.message); return; }
+  if (!r.steps.length) { toast("Nothing left to undo for this reply"); return; }
+  $("#undoList").innerHTML = r.steps.map((s) => `<div class="undo-step ${s.ok ? "" : "skip"}">${ic(s.ok ? "undo" : "x", "sm")}<span>${esc(s.text)}</span></div>`).join("");
+  $("#undoConfirm").disabled = !r.steps.some((s) => s.ok); $("#undoConfirm").dataset.run = runId;
+  $("#undoBack").classList.add("open");
+}
+$("#undoConfirm").addEventListener("click", async () => {
+  const chat = state.chat; const runId = $("#undoConfirm").dataset.run; if (!chat) return;
+  try {
+    const r = await api("/api/runs/undo", { method: "POST", body: JSON.stringify({ chatId: chat.id, runId }) });
+    const done = r.results.filter((x) => x.ok).length, skipped = r.results.length - done;
+    toast(`Undid ${done} change${done === 1 ? "" : "s"}${skipped ? `; ${skipped} skipped` : ""}. Earlier versions are in Trash.`);
+  } catch (e) { toast(e.message); }
+  $("#undoBack").classList.remove("open"); await loadUndoRuns(); renderMessages();
+});
+if (window.openay?.updates) window.openay.updates.onStatus(renderUpdateState);
+$("#downloadUpdate").addEventListener("click", async () => { if (window.openay?.updates) renderUpdateState(await window.openay.updates.download()); });
+$("#installUpdate").addEventListener("click", () => { if (window.openay?.updates) window.openay.updates.install(); });
 (async function init() {
   updateSendBtn(); await loadConfig().catch((e) => toast(e.message)); await Promise.all([loadModels(), loadChats(), pollRuns(), loadUsage(), loadBalance(false)]); renderMessages();
   if (document.activeElement === document.body) $("#input").focus();
