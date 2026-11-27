@@ -445,12 +445,12 @@ class Run:
         changes per request (the wrap-up note) goes at the end."""
         srv = self.srv
         fcfg = srv.saved_tool_config(self.chat_id)  # fresh from disk: permissions/skills may change mid-run
-        system = [srv.instructions_prompt(fcfg), skills.prompt(srv.skills_root(), fcfg.get("skills") or [])]
-        specs = []
-        if self.use_tools:
-            specs, where = srv.tool_specs(fcfg, plan=self.plan)
-            if specs:
-                system.append(srv.tool_system_note(fcfg, specs, where))
+        specs, where = srv.tool_specs(fcfg, plan=self.plan) if self.use_tools else ([], "")
+        names = {x["function"]["name"] for x in specs}
+        system = [srv.instructions_prompt(fcfg), skills.prompt(srv.skills_root(), fcfg.get("skills") or [],
+                                                                "read_skill_file" in names, "run_command" in names)]
+        if specs:
+            system.append(srv.tool_system_note(fcfg, specs, where))
         if self.plan:
             system.append(PLAN_NOTE)
         note = "\n\n".join(x for x in system if x)
@@ -775,6 +775,8 @@ class Run:
         name, args = parse_call(call)
         display = (args.get("path") or args.get("source") or args.get("model") or args.get("query") or args.get("url")
                    or args.get("pattern") or args.get("contains") or args.get("title") or args.get("message") or args.get("repo") or "")
+        if name == "read_skill_file":
+            display = "%s/%s" % (args.get("skill") or "?", str(args.get("path") or ".").lstrip("./") or ".")
         if name == "search_files" and args.get("contains"):
             display = '"%s"%s' % (args["contains"], (" in " + args["path"]) if args.get("path") else "")
         idx = self.add({"role": "tool", "tool_name": name, "content": "", "display": str(display), "_running": True})

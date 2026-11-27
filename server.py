@@ -436,6 +436,11 @@ def tool_read_file(cfg, path="", start_line=1, max_lines=800, **_):
     p = resolve_path(cfg, path)
     if not os.path.isfile(p):
         raise ToolError("Not a file: " + p)
+    return read_window(p, start_line, max_lines)
+
+
+def read_window(p, start_line=1, max_lines=800):
+    """Up to max_lines lines of a text file from start_line, stopping before READ_CHARS, with a note on where to continue."""
     with open(p, "rb") as f:
         head = f.read(8192)
     if b"\x00" in head:
@@ -540,13 +545,21 @@ def file_fingerprint(p):
     with open(p, "rb") as f: return hashlib.sha256(f.read()).hexdigest()
 
 
+def tool_read_skill_file(cfg, skill="", path=".", start_line=1, max_lines=800, **_):
+    """A file from one of this chat's enabled skill folders (see skills.py)."""
+    if skill not in (cfg.get("skills") or []):
+        raise ToolError("The %s skill isn't enabled for this chat." % skill if skill else "Name the skill to read from.")
+    try: return skills.read_file(skills_root(), skill, path, lambda p: read_window(p, start_line, max_lines))
+    except skills.SkillError as e: raise ToolError(str(e))
+
+
 TOOLS = {"list_directory": tool_list_directory, "read_file": tool_read_file, "search_files": tool_search_files,
-         "write_file": tool_write_file, "edit_file": tool_edit_file}
+         "write_file": tool_write_file, "edit_file": tool_edit_file, "read_skill_file": tool_read_skill_file}
 REVIEWED_TOOLS = ("write_file", "edit_file")
 
 
 READ_ONLY_TOOLS = {"list_directory", "read_file", "search_files", "web_search", "web_fetch", "git_status", "git_diff", "git_log",
-                   "git_show", "git_branches", "gh_pr_list", "read_memory"}
+                   "git_show", "git_branches", "gh_pr_list", "read_memory", "read_skill_file"}
 
 
 def tool_specs(cfg, plan=False):
@@ -630,6 +643,9 @@ def tool_specs(cfg, plan=False):
         specs.append(fn("save_memory", "Save a lasting note (a preference, fact or decision) for future chats, or replace an old note.",
                         {"note": s, "replace": {"type": "string", "description": "Exact text of an old note to replace (optional)"},
                          "scope": {"type": "string", "description": "project (default when the chat is in a project) or global"}}, ["note"]))
+    if skills.has_folders(skills_root(), cfg.get("skills")):
+        specs.append(fn("read_skill_file", "Read a file from an enabled skill folder, by its path inside the skill. Path . lists the files.",
+                        {"skill": {"type": "string", "description": "The skill's ID"}, "path": s, "start_line": i}, ["skill", "path"]))
     if pol["modelControl"] != "fixed":
         specs.append(fn("set_session_model", "Switch this chat to another Ollama Cloud model, only when the user asks." +
                         (" The user approves it." if pol["modelControl"] == "ask" else ""),
@@ -1305,6 +1321,19 @@ class Handler(BaseHTTPRequestHandler):
                     chat = load_chat(chat_id); result = session_actions.rename(chat, body.get("title")); save_chat(chat_id, chat)
                 self._json({"content": result, "title": chat["title"]})
             except (OSError, ValueError) as e: self._json({"error": str(e)}, 400)
+        elif p == "/api/skills/import":  # a skill folder, from a folder path or a .skill/.zip file (base64)
+            try:
+                if body.get("path"): s = skills.import_folder(skills_root(), body["path"], body.get("replace") is True)
+                else:
+                    try: data = base64.b64decode(str(body.get("zip") or ""), validate=True)
+                    except ValueError: return self._json({"error": "The file couldn't be read."}, 400)
+                    s = skills.import_zip(skills_root(), data, str(body.get("name") or "skill.zip"), body.get("replace") is True)
+                self._json(s)
+            except skills.SkillExists as e: self._json({"error": str(e), "exists": True, "id": e.skill_id}, 409)
+            except (skills.SkillError, OSError) as e: self._json({"error": str(e)}, 400)
+        elif p == "/api/skills/update":  # copy a skill folder again from where it was imported
+            try: self._json(skills.update_from_source(skills_root(), body.get("id")))
+            except (skills.SkillError, OSError) as e: self._json({"error": str(e)}, 400)
         elif p == "/api/skills":
             try: self._json(skills.save(skills_root(), body.get("name"), body.get("description"), body.get("body"), body.get("id") or None))
             except skills.SkillError as e: self._json({"error": str(e)}, 400)

@@ -135,9 +135,17 @@ One gap remains: the model could still put private information into a search que
 ## Skills
 A skill is a set of instructions you write once and turn on per chat, for example how to review code or the style to write in. Open **✦** in the sidebar to:
 - create, edit or delete skills;
-- import a Markdown file. An optional `name:` and `description:` header between `---` lines is read.
+- import a Markdown file. An optional `name:` and `description:` header between `---` lines is read;
+- import a **skill folder** in the open Agent Skills format, the same skills Claude, Codex, Cursor and others use. Use **Import folder** for a folder with a `SKILL.md`, or **Import file** for a `.skill` or `.zip` package.
 
-Turn skills on for a chat in its Session settings. Enabled skills are added to the chat's system instructions on every request, up to 30,000 characters in total and 20,000 per skill. A skill is only text: it can't run code, call tools by itself, or change what the chat is allowed to do. Skills are stored as Markdown files in `data/skills/`.
+Turn skills on for a chat in its Session settings. Enabled skills are added to the chat's system instructions on every request, up to 30,000 characters in total and 20,000 per written skill. A skill never changes what the chat is allowed to do. Written skills are Markdown files in `data/skills/`; skill folders are copied to `data/skills/<name>/`.
+
+**Skill folders.** A skill folder has a `SKILL.md` (instructions, with `name:` and `description:` in its header) and any other files, such as reference documents and scripts.
+- **Importing:** you can pick the skill's own folder or a folder above it, such as a repository with `skills/<name>/SKILL.md`, as long as it holds one skill. `.git`, `node_modules`, caches and Office lock files are left out.
+- **Copy, not a link:** the copy keeps working if the original moves. After changing the original, click **Update from folder** in the Skills window. A `.skill` file is updated by importing it again.
+- **What the chat sees:** its `SKILL.md` instructions and a list of its other files. The model reads a file with the `read_skill_file` tool when the instructions call for it, so long reference files cost nothing until they're needed. `read_skill_file` reads only the chat's enabled skill folders, and it works in plan mode. If `SKILL.md` is too long to send every time, the model gets the description and reads the instructions first.
+- **Placeholders:** `<skill-dir>` and `{baseDir}` in `SKILL.md` are replaced with the skill's folder.
+- **Scripts:** these run only through **Run commands**, under the usual rules. The model runs the script by its full path from a shared folder, and anything not on your allowed list needs your approval.
 
 ## Git and GitHub
 The **Git and GitHub** session setting gives the model Git tools for repositories in the chat's shared folders. It has four levels:
@@ -280,7 +288,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `web.py` — web search and page reading, with untrusted-content markers.
 - `commands.py` — running commands: parsing, the allowed list, the batch-file guard, time limits and Stop.
 - `gittools.py` — Git and GitHub tools: repository checks, the safe command runner, and commit, push and pull request reviews.
-- `skills.py` — skill files: storage, validation and the per-chat prompt.
+- `skills.py` — skills: written skills and skill folders, importing (folder, .skill, .zip), `read_skill_file` and the per-chat prompt.
 - `index.html` — application and dialog markup.
 - `styles.css` — the Graphite look: colour tokens for dark and light (it follows the Windows setting), components and motion. The page's security policy blocks inline styles, so every look is a class here.
 - `app.js` — the window: live event stream, rendering, approvals, sessions, trash, settings, plan mode, undo and documents.
@@ -289,7 +297,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `package.json` — Electron and electron-builder setup (`npm start`, `npm run smoke`, `npm run dist`, `npm run release`).
 - `scripts/fetch-python.js` — downloads and verifies the embeddable Python that the installer bundles.
 - `scripts/release.js` — publishes the built installer as a GitHub Release for the updater (`npm run release`).
-- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`, `test_git.py`, `test_commands.py`, `test_tokens.py`, `test_features.py`).
+- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`, `test_git.py`, `test_commands.py`, `test_tokens.py`, `test_features.py`, `test_skill_folders.py`).
 - `verify_static.py` — optional static consistency checks.
 - `backups/pre-approved-changes/` — original source copies from before the first approved change set.
 

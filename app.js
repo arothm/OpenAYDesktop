@@ -728,13 +728,13 @@ $("#activityBack").addEventListener("click", async (e) => {
   else { try { await api("/api/runs/stop", { method: "POST", body: JSON.stringify({ chatId: id }) }); } catch (err) { toast(err.message); } renderActivity(); }
 });
 
-// Skills: Markdown instructions stored in data/skills, turned on per chat in Session settings
+// Skills: Markdown instructions or skill folders stored in data/skills, turned on per chat in Session settings
 const skillsUi = { list: [], current: null };
 async function openSkills() { $("#skillsBack").classList.add("open"); await loadSkills(); if (!skillsUi.current) editSkill(null); }
 async function loadSkills() {
   try { skillsUi.list = (await api("/api/skills")).skills; } catch (e) { toast(e.message); skillsUi.list = []; }
-  $("#skillsList").innerHTML = skillsUi.list.map((s) => `<button class="skill-item ${skillsUi.current === s.id ? "sel" : ""}" data-skill-id="${esc(s.id)}" type="button"><span class="av c${hashIndex(s.id, 4)}">${esc(initials(s.name))}</span><span class="tx"><div class="n">${esc(s.name)}</div><div class="d">${esc(s.description || "")}</div></span></button>`).join("")
-    || '<div class="skill-list-note">No skills yet. Create one, or import a Markdown file.</div>';
+  $("#skillsList").innerHTML = skillsUi.list.map((s) => `<button class="skill-item ${skillsUi.current === s.id ? "sel" : ""}" data-skill-id="${esc(s.id)}" type="button"><span class="av c${hashIndex(s.id, 4)}">${esc(initials(s.name))}</span><span class="tx"><div class="n">${esc(s.name)}${s.folder ? ` <span class="pkg-tag">${ic("folder", "sm")}${s.files} file${s.files === 1 ? "" : "s"}</span>` : ""}</div><div class="d">${esc(s.description || "")}</div></span></button>`).join("")
+    || '<div class="skill-list-note">No skills yet. Create one, or import a Markdown file, a .skill file or a skill folder.</div>';
 }
 const initials = (name) => (String(name).match(/[A-Za-z0-9]+/g) || ["?"]).slice(0, 2).map((w) => w[0].toUpperCase()).join("");
 function hashIndex(s, n) { let h = 0; for (const ch of String(s)) h = (h * 31 + ch.charCodeAt(0)) >>> 0; return h % n; }
@@ -743,6 +743,7 @@ async function editSkill(id) {
   skillsUi.current = id; let s = { name: "", description: "", body: "" };
   if (id) { try { s = await api("/api/skills/" + encodeURIComponent(id)); } catch (e) { toast(e.message); return; } }
   $("#skillName").value = s.name; $("#skillDesc").value = s.description; $("#skillBody").value = s.body; $("#skillDelete").disabled = !id; updateSkillCount();
+  renderSkillPackage(s);
   document.querySelectorAll("#skillsList .skill-item").forEach((b) => b.classList.toggle("sel", b.dataset.skillId === id));
 }
 async function saveSkill() {
@@ -755,13 +756,42 @@ async function deleteSkill() {
   try { await api("/api/skills/" + encodeURIComponent(skillsUi.current), { method: "DELETE" }); skillsUi.current = null; await loadSkills(); editSkill(null); toast("Skill deleted"); }
   catch (e) { toast(e.message); }
 }
+function renderSkillPackage(s) {
+  const box = $("#skillPkg"); box.hidden = !s.folder; if (!s.folder) { box.innerHTML = ""; return; }
+  const files = s.files || [];
+  box.innerHTML = `<div class="pkg-row">${ic("folder")}<div class="pkg-text"><b>Skill folder</b> with ${files.length} other file${files.length === 1 ? "" : "s"}. The model reads them when the instructions call for them; scripts run only with Run commands.
+      <div class="help">${s.source ? `Imported from <span class="mono">${esc(s.source)}</span>. Edits you make here are replaced by Update from folder.` : "Imported from a .skill or .zip file. Import it again to update it."}</div></div>
+      ${s.source ? `<button class="btn sm" id="skillUpdate" type="button">${ic("redo", "sm")}Update from folder</button>` : ""}</div>
+    ${files.length ? `<details class="pkg-files"><summary>Show files</summary><div class="mono">${files.map((f) => `<div><span>${esc(f.path)}</span><span>${humanBytes(f.size)}</span></div>`).join("")}</div></details>` : ""}`;
+}
+async function importSkillPackage(body, label) {
+  for (;;) {
+    const r = await fetch("/api/skills/import", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 409 && j.exists && !body.replace) { if (!confirm(j.error + "\n\nIts files and instructions are replaced. Chats that use it keep using it.")) return; body.replace = true; continue; }
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    skillsUi.current = j.id; await loadSkills(); await editSkill(j.id); toast(`Imported ${label}`); return;
+  }
+}
+async function importSkillFolder() {
+  try {
+    const picked = window.openay?.pickFolder ? await window.openay.pickFolder() : (await api("/api/pick-folder", { method: "POST" })).path;
+    if (picked) await importSkillPackage({ path: picked }, "the skill folder");
+  } catch (e) { toast(e.message); }
+}
 function importSkill(file) {
+  if (/\.(skill|zip)$/i.test(file.name)) {
+    const rd = new FileReader();
+    rd.onload = () => importSkillPackage({ zip: String(rd.result).split(",")[1] || "", name: file.name }, file.name).catch((e) => toast(e.message));
+    rd.onerror = () => toast("Couldn't read " + file.name);
+    rd.readAsDataURL(file); return;
+  }
   const rd = new FileReader();
   rd.onload = () => {
     let text = String(rd.result); let name = file.name.replace(/\.(md|markdown|txt)$/i, ""); let description = "";
     const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
     if (m) { for (const line of m[1].split(/\r?\n/)) { const [k, ...v] = line.split(":"); if (/^name$/i.test(k.trim())) name = v.join(":").trim(); if (/^description$/i.test(k.trim())) description = v.join(":").trim(); } text = m[2]; }
-    skillsUi.current = null; $("#skillName").value = name; $("#skillDesc").value = description; $("#skillBody").value = text.trim(); $("#skillDelete").disabled = true; updateSkillCount();
+    skillsUi.current = null; $("#skillName").value = name; $("#skillDesc").value = description; $("#skillBody").value = text.trim(); $("#skillDelete").disabled = true; updateSkillCount(); renderSkillPackage({});
     toast("Imported. Review it, then Save skill.");
   };
   rd.readAsText(file);
@@ -771,7 +801,12 @@ $("#skillsClose").addEventListener("click", () => $("#skillsBack").classList.rem
 $("#skillsBack").addEventListener("click", (e) => { if (e.target.id === "skillsBack") $("#skillsBack").classList.remove("open"); });
 $("#skillsList").addEventListener("click", (e) => { const b = e.target.closest("[data-skill-id]"); if (b) editSkill(b.dataset.skillId); });
 $("#skillNew").addEventListener("click", () => editSkill(null)); $("#skillSave").addEventListener("click", saveSkill); $("#skillDelete").addEventListener("click", deleteSkill);
-$("#skillImport").addEventListener("click", () => $("#skillFile").click()); $("#skillBody").addEventListener("input", updateSkillCount);
+$("#skillImport").addEventListener("click", () => $("#skillFile").click()); $("#skillImportFolder").addEventListener("click", importSkillFolder);
+$("#skillPkg").addEventListener("click", async (e) => {
+  if (!e.target.closest("#skillUpdate") || !skillsUi.current) return;
+  try { const s = await api("/api/skills/update", { method: "POST", body: JSON.stringify({ id: skillsUi.current }) }); await loadSkills(); await editSkill(s.id); toast("Updated from the folder"); }
+  catch (err) { toast(err.message); }
+}); $("#skillBody").addEventListener("input", updateSkillCount);
 $("#skillFile").addEventListener("change", (e) => { if (e.target.files[0]) importSkill(e.target.files[0]); e.target.value = ""; });
 $("#trustBtn").addEventListener("click", trustChat);
 $("#untrustedBadge").addEventListener("click", openSession);

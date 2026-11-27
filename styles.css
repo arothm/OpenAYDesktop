@@ -46,7 +46,9 @@ a { color: var(--accent); }
 ::selection { background: color-mix(in srgb, var(--accent) 35%, transparent); }
 * { scrollbar-width: thin; scrollbar-color: var(--track) transparent; }
 [hidden] { display: none !important; }
-.ico { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+/* Icons are two-tone: a line layer plus a soft fill layer whose strength is fill-opacity (inherited into the sprite). */
+.ico { width: 16px; height: 16px; flex: none; fill: none; fill-opacity: .2; stroke: currentColor; stroke-width: 1.65; stroke-linecap: round; stroke-linejoin: round; transition: fill-opacity .15s ease; }
+button:hover .ico, .chat-item.active .ico, .sq .ico, .btn.primary .ico { fill-opacity: .3; }
 .ico.sm { width: 14px; height: 14px; }
 .ico.lg { width: 18px; height: 18px; }
 .mono { font-family: var(--mono); }
@@ -472,6 +474,19 @@ label.perm { cursor: pointer; }
 #skillBody { flex: 1; min-height: 200px; font: 12.5px/1.7 var(--mono); resize: none; }
 .skill-editor-foot { display: flex; gap: 8px; align-items: center; }
 .skill-list-note { color: var(--muted); font-size: 12.5px; padding: 10px; }
+.pkg-tag { display: inline-flex; align-items: center; gap: 4px; margin-left: 6px; padding: 1px 7px; border-radius: 999px; background: var(--hover); color: var(--muted); font-size: 11px; font-weight: 500; vertical-align: 1px; }
+.pkg-tag .ico.sm { width: 12px; height: 12px; }
+.skill-editor:has(.skill-pkg:not([hidden])) { overflow-y: auto; }
+.skill-pkg:not([hidden]) + .grow { flex: 1 0 auto; }
+.skill-pkg:not([hidden]) + .grow #skillBody { min-height: 220px; }
+.skill-pkg { flex: none; border-radius: 12px; background: var(--hover); padding: 10px 12px; font-size: 13px; display: flex; flex-direction: column; gap: 6px; }
+.pkg-row { display: flex; gap: 10px; align-items: flex-start; }
+.pkg-row > .ico { color: var(--accent); margin-top: 2px; }
+.pkg-text { flex: 1; min-width: 0; }
+.pkg-text .mono { word-break: break-all; }
+.pkg-files summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+.pkg-files .mono { margin-top: 6px; max-height: 140px; overflow-y: auto; font-size: 12px; }
+.pkg-files .mono div { display: flex; justify-content: space-between; gap: 12px; padding: 1px 0; color: var(--muted); }
 .activity-modal { width: min(840px, 100%); height: min(640px, 100%); }
 .stat-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; padding: 0 20px 4px; flex: none; }
 .stat { border-radius: 14px; padding: 12px 14px; background: var(--hover); box-shadow: inset 0 0 0 1px var(--line); }
