@@ -41,7 +41,7 @@ import skills
 import web
 
 APP_NAME = "Open AY Desktop"
-APP_VERSION = "1.14.2"
+APP_VERSION = "1.15.0"
 APP_SLUG = "open-ay-desktop"
 REPOSITORY = "arothm/OpenAYDesktop"
 RELEASES_URL = "https://github.com/%s/releases/latest" % REPOSITORY
@@ -59,7 +59,8 @@ DEFAULT_CONFIG = {"apiKey": "", "defaultModel": "", "think": "default",
                   "dailyTokenLimit": 0, "chatTokenLimit": 0, "maxConcurrentRuns": 4, "minBalanceUsd": 1.0,
                   "allowedCommands": [],  # see commands.py
                   "contextBudget": "full",  # see context_budget.BUDGETS
-                  "autoUpdate": True, "quickEntry": True}
+                  "autoUpdate": True, "quickEntry": True,
+                  "keepInTray": False, "startAtLogin": False}  # Electron: keep running in the tray / start with Windows
 LIMIT_RANGES = {"dailyTokenLimit": (0, 10_000_000_000), "chatTokenLimit": (0, 10_000_000_000), "maxConcurrentRuns": (1, 20)}
 VENDOR_FILES = {
     "marked.min.js": {"url": "https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js", "type": "application/javascript; charset=utf-8"},
@@ -362,26 +363,46 @@ def set_chat_model(chat_id, model):
     return {"model": model}
 
 
+_chat_index = {}  # (chats folder, file name) -> ((mtime, size), metadata or None)
+_chat_index_lock = threading.Lock()
+
+
 def list_chats():
+    """Every chat's title, dates and links, newest first. A chat file is parsed again only when it changed
+    (its size or modification time), so the list stays fast with many long chats."""
     os.makedirs(CHATS_DIR, exist_ok=True)
-    out = []
-    for name in os.listdir(CHATS_DIR):
-        if not name.endswith(".json"):
-            continue
-        try:
-            with open(os.path.join(CHATS_DIR, name), "r", encoding="utf-8") as f:
-                c = json.load(f)
-            out.append({"id": c["id"], "title": c.get("title", "Untitled"), "updated": c.get("updated", 0), "model": c.get("model", ""),
-                        "parentId": c.get("parentId") or None, "projectId": c.get("projectId") or None,
-                        "scheduled": c.get("scheduled") or None})
-        except (OSError, ValueError, KeyError):
-            continue
+    out, seen = [], set()
+    with _chat_index_lock:
+        for entry in os.scandir(CHATS_DIR):
+            if not entry.name.endswith(".json"):
+                continue
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            key = (CHATS_DIR, entry.name); stamp = (st.st_mtime_ns, st.st_size); seen.add(key)
+            cached = _chat_index.get(key)
+            if cached and cached[0] == stamp:
+                meta = cached[1]
+            else:
+                try:
+                    with open(entry.path, "r", encoding="utf-8") as f:
+                        c = json.load(f)
+                    meta = {"id": c["id"], "title": c.get("title", "Untitled"), "updated": c.get("updated", 0), "model": c.get("model", ""),
+                            "parentId": c.get("parentId") or None, "projectId": c.get("projectId") or None,
+                            "scheduled": c.get("scheduled") or None}
+                except (OSError, ValueError, KeyError, TypeError):
+                    meta = None
+                _chat_index[key] = (stamp, meta)
+            if meta:
+                out.append(dict(meta))
+        for key in [k for k in _chat_index if k[0] == CHATS_DIR and k not in seen]:
+            del _chat_index[key]
     return sorted(out, key=lambda c: c["updated"], reverse=True)
 
 
 # Folder tools
 
-MAX_READ = 200_000
 READ_CHARS = 28_000  # one read_file result stops at a whole line before this; the note says where to continue
 MAX_LIST = 500
 MAX_HITS = 200
@@ -454,13 +475,17 @@ def read_window(p, start_line=1, max_lines=800):
     if b"\x00" in head:
         return "%s is a binary file (%s); it can't be read as text." % (p, _human(os.path.getsize(p)))
     start = max(1, int(start_line or 1)); count = max(1, min(int(max_lines or 800), 5000))
-    out, size, total = [], 0, 0
+    out, size, total, cut = [], 0, 0, 0
     with open(p, "r", encoding="utf-8", errors="replace") as f:
         for i, line in enumerate(f, 1):
             total = i
             if i < start or len(out) >= count or size + len(line) > READ_CHARS and out: continue
+            if len(line) > READ_CHARS:  # one huge line (minified code, one-line JSON): only its start
+                cut = len(line); line = line[:READ_CHARS] + "\n"
             out.append(line); size += len(line)
     text = "".join(out); end = start + len(out) - 1
+    if cut:
+        text += "[line %d is %s characters long; only its first %s are shown]\n" % (start, "{:,}".format(cut), "{:,}".format(READ_CHARS))
     if start == 1 and end >= total: return text
     more = "; continue with start_line=%d" % (end + 1) if end < total else ""
     return text + "\n[lines %d-%d of %d%s]" % (start, end, total, more)
@@ -786,16 +811,41 @@ def search_chats(query, limit=60):
     return out
 
 
-def run_terminal(body):
+_jobs = {}  # terminal job id -> commands.Job
+_jobs_lock = threading.Lock()
+
+
+def terminal_plan(body):
     """A command the user typed in the Terminal panel: runs at once (it's the user's own action),
     without a shell, in one of the chat's shared folders with Allow edits."""
     chat = load_chat(str(body.get("chatId") or ""))
     try: cwd = capabilities.resolve(chat, body.get("cwd") or "", write=True)
     except capabilities.CapabilityError as e: raise commands.CommandError("%s The terminal runs in a shared folder with Allow edits." % e)
     argv = commands.split(body.get("command"))
-    plan = {"argv": argv, "exe": commands.resolve_program(argv), "cwd": cwd, "line": subprocess.list2cmdline(argv),
-            "timeout": max(5, min(int(body.get("timeout") or 300), commands.MAX_TIMEOUT))}
-    return commands.execute(plan)
+    return {"argv": argv, "exe": commands.resolve_program(argv), "cwd": cwd, "line": subprocess.list2cmdline(argv),
+            "timeout": max(5, min(int(body.get("timeout") or 600), commands.MAX_TIMEOUT))}
+
+
+def run_terminal(body):
+    """Run a Terminal panel command and wait for it (kept for scripts and tests)."""
+    return commands.execute(terminal_plan(body))
+
+
+def start_terminal_job(body):
+    plan = terminal_plan(body)
+    with _jobs_lock:
+        now = time.time()
+        for jid, job in list(_jobs.items()):  # forget jobs that ended a while ago
+            if job.done and job.ended and now - job.ended > 600: del _jobs[jid]
+        if sum(1 for j in _jobs.values() if not j.done) >= 4: raise commands.CommandError("4 terminal commands are already running.")
+        jid = secrets.token_hex(8); _jobs[jid] = commands.Job(plan)
+    return {"jobId": jid, "line": plan["line"], "cwd": plan["cwd"]}
+
+
+def terminal_job(jid):
+    with _jobs_lock: job = _jobs.get(str(jid or ""))
+    if not job: raise ValueError("That command isn't running any more.")
+    return job
 
 
 PREVIEW_CSP = ("sandbox allow-scripts allow-forms allow-modals; default-src 'self' data: blob: 'unsafe-inline' 'unsafe-eval'; "
@@ -819,12 +869,20 @@ def preview_file(path):
 
 
 def start_scheduled(task):
-    """Scheduler callback: a new chat (in the task's project) that starts replying to the task's prompt."""
+    """Scheduler callback: a new chat (in the task's project) that starts replying to the task's prompt.
+    Raises scheduler.Busy (the task waits and is tried again) when the most replies are already running."""
+    if ENGINE.running_count() >= int(load_config().get("maxConcurrentRuns") or 4):
+        raise scheduler.Busy("%d replies are already running." % ENGINE.running_count())
     chat = create_chat({"model": task["model"], "projectId": task.get("projectId"), "folders": [],
                         "title": "%s \u00b7 %s" % (task["name"], time.strftime("%d %b %H:%M"))})
-    with chat_lock(chat["id"]):
-        c = load_chat(chat["id"]); c["scheduled"] = {"id": task["id"], "name": task["name"]}; save_chat(chat["id"], c)
-    ENGINE.start(chat["id"], {"text": task["prompt"]})
+    try:
+        with chat_lock(chat["id"]):
+            c = load_chat(chat["id"]); c["scheduled"] = {"id": task["id"], "name": task["name"]}; save_chat(chat["id"], c)
+        ENGINE.start(chat["id"], {"text": task["prompt"]})
+    except runs.RunError as e:  # don't leave an empty chat behind
+        delete_chat(chat["id"])
+        if "limit" in str(e): raise scheduler.Busy(str(e))
+        raise
     return chat["id"]
 
 
@@ -1222,6 +1280,10 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/search":
             self._json({"results": search_chats((parse_qs(urlsplit(self.path).query).get("q") or [""])[0])})
         elif p == "/api/schedules": self._json({"tasks": scheduler.listing(data_root())})
+        elif p == "/api/terminal/job":
+            q = parse_qs(urlsplit(self.path).query)
+            try: self._json(terminal_job((q.get("id") or [""])[0]).poll((q.get("since") or ["0"])[0]))
+            except ValueError as e: self._json({"error": str(e)}, 404)
         elif p == "/api/undo":
             q = parse_qs(urlsplit(self.path).query)
             chat_id, run_id = (q.get("chat") or [""])[0], (q.get("run") or [""])[0]
@@ -1305,7 +1367,7 @@ class Handler(BaseHTTPRequestHandler):
                 if "contextBudget" in body:
                     if body["contextBudget"] not in context_budget.BUDGETS: return self._json({"error": "Unknown context budget."}, 400)
                     cfg["contextBudget"] = body["contextBudget"]
-                for k in ("autoUpdate", "quickEntry"):
+                for k in ("autoUpdate", "quickEntry", "keepInTray", "startAtLogin"):
                     if k in body:
                         if not isinstance(body[k], bool): return self._json({"error": "%s must be true or false." % k}, 400)
                         cfg[k] = body[k]
@@ -1398,6 +1460,12 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/terminal/run":
             try: self._json({"output": run_terminal(body)})
             except (commands.CommandError, OSError, ValueError) as e: self._json({"error": str(e)}, 400)
+        elif p == "/api/terminal/start":
+            try: self._json(start_terminal_job(body))
+            except (commands.CommandError, OSError, ValueError) as e: self._json({"error": str(e)}, 400)
+        elif p == "/api/terminal/stop":
+            try: terminal_job(body.get("jobId")).cancel.set(); self._json({"ok": True})
+            except ValueError as e: self._json({"error": str(e)}, 404)
         elif p == "/api/schedules":
             try:
                 models = [m["name"] for m in get_models()[0]]
@@ -1408,8 +1476,9 @@ class Handler(BaseHTTPRequestHandler):
             if not task: return self._json({"error": "not found"}, 404)
             self._json(SCHEDULER.run_task(task))
         elif p == "/api/shutdown":  # used by the Electron shell when you quit
-            stopped = [cid for cid in list(ENGINE.statuses()) if ENGINE.stop(cid, wait=5)]
-            self._json({"ok": True, "stopped": len(stopped)})
+            with _jobs_lock:
+                for job in _jobs.values(): job.cancel.set()
+            self._json({"ok": True, "stopped": ENGINE.stop_all(wait=5)})
             if _httpd: threading.Thread(target=_httpd.shutdown, daemon=True).start()
         elif p == "/api/pick-folder":
             try:
@@ -1428,15 +1497,24 @@ class Handler(BaseHTTPRequestHandler):
         def send(event, seq):
             self.wfile.write(("id: %d\ndata: %s\n\n" % (seq, json.dumps(event))).encode("utf-8")); self.wfile.flush()
         self.wfile.write(b"retry: 2000\n\n")
-        snap, seq = ENGINE.snapshot(chat_id); send(snap, seq)
         channel = ENGINE.channel(chat_id)
-        while True:  # ends when the window disconnects (the write fails)
-            events, gap = channel.since(seq, 15)
-            if gap:
-                snap, seq = ENGINE.snapshot(chat_id); send(snap, seq); continue
-            if not events:
-                self.wfile.write(b": keepalive\n\n"); self.wfile.flush(); continue
-            for seq, event in events: send(event, seq)
+        with channel.cond: channel.subscribers += 1
+        try:
+            snap, seq = ENGINE.snapshot(chat_id); send(snap, seq)
+            while True:  # ends when the window disconnects (the write fails)
+                current = ENGINE.channel(chat_id)
+                if current is not channel:  # forgotten while idle and made again: follow the new one
+                    with channel.cond: channel.subscribers -= 1
+                    channel = current
+                    with channel.cond: channel.subscribers += 1
+                events, gap = channel.since(seq, 15)
+                if gap or seq > channel.seq:
+                    snap, seq = ENGINE.snapshot(chat_id); send(snap, seq); continue
+                if not events:
+                    self.wfile.write(b": keepalive\n\n"); self.wfile.flush(); continue
+                for seq, event in events: send(event, seq)
+        finally:
+            with channel.cond: channel.subscribers -= 1
 
 
 ENGINE = runs.Engine(sys.modules[__name__])
@@ -1479,7 +1557,7 @@ def exit_with_stdin(httpd):
             pass
     except (OSError, ValueError):
         pass
-    for cid in list(ENGINE.statuses()): ENGINE.stop(cid, wait=5)
+    ENGINE.stop_all(wait=5)
     httpd.shutdown()
 
 

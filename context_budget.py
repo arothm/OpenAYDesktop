@@ -191,13 +191,15 @@ def build(messages, context_tokens=None, budget_name=None, overhead_tokens=0, co
     return final, info
 
 
-def plan_compaction(messages, compaction=None, context_tokens=None, budget_name=None, overhead_tokens=0):
+def plan_compaction(messages, compaction=None, context_tokens=None, budget_name=None, overhead_tokens=0, keep_budget=None):
     """(start, split): summarize messages[start:split] (plus any earlier summary), keep messages[split:].
 
-    Recent turns are kept up to KEEP_RECENT of the budget (always at least the current turn).
-    Returns None when there is nothing older than the current turn to summarize.
+    Recent turns are kept up to KEEP_RECENT of the budget, or up to keep_budget tokens when given (the
+    Compact button); always at least the current turn. Returns None when there is nothing older than the
+    current turn to summarize.
     """
     budget, _ = budget_for(context_tokens, budget_name, overhead_tokens)
+    keep = keep_budget if keep_budget is not None else budget * KEEP_RECENT
     compaction = valid_compaction(messages, compaction)
     start = compaction["upTo"] if compaction else 0
     turns = _turns(messages, start)
@@ -206,7 +208,7 @@ def plan_compaction(messages, compaction=None, context_tokens=None, budget_name=
     keep_from, used = len(turns) - 1, estimate_tokens(_render(turns[-1:], OLD_TOOL_CHARS, CURRENT_TOOL_CHARS)[0])
     while keep_from > 1:
         size = estimate_tokens(_render([turns[keep_from - 1]], OLD_TOOL_CHARS, OLD_TOOL_CHARS)[0])
-        if used + size > budget * KEEP_RECENT:
+        if used + size > keep:
             break
         used += size
         keep_from -= 1

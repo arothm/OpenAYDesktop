@@ -5,7 +5,8 @@
 // This file only:
 //   - starts that server on a free local port (or reuses one already running from this folder),
 //   - shows it in a locked-down window (no Node in the page; navigation stays on the app),
-//   - keeps replies running from the tray when the window closes, if you choose,
+//   - keeps replies running from the tray when the window closes, if you choose (Settings: keep running
+//     in the tray, start with Windows: then scheduled tasks run while the window is closed),
 //   - shuts the server down when you quit. The server also exits by itself if this process dies,
 //     because it watches its stdin (--exit-with-stdin),
 //   - installs updates from GitHub Releases (electron-updater), as allowed in Settings,
@@ -18,6 +19,7 @@ const net = require("net");
 const path = require("path");
 
 const SMOKE = process.argv.includes("--smoke");          // npm run smoke: start, load, report, quit
+const HIDDEN = process.argv.includes("--hidden");        // started with Windows: stay in the tray until opened
 const DEV = !app.isPackaged;
 const SERVER_DIR = DEV ? path.join(__dirname, "..") : path.join(process.resourcesPath, "app-server");
 const ICON = path.join(__dirname, "icon.png");
@@ -31,6 +33,7 @@ let tray = null;
 let quitting = false;
 let serverLog = "";
 let pythonUsed = "";
+const background = { keepInTray: false, startAtLogin: false, told: false };
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -53,11 +56,14 @@ async function start() {
   ipcMain.handle("update-install", () => updates.install());
   ipcMain.handle("update-auto", (_e, on) => updates.setAuto(Boolean(on)));
   ipcMain.handle("update-state", () => updates.state);
+  ipcMain.handle("background", (_e, opts) => setBackground(opts || {}));
   try {
     origin = (DEV && (await findRunningServer())) || (await startServer());
     createWindow();
     const cfg = await fetch(origin + "/api/config").then((r) => r.json()).catch(() => ({}));
     setQuickEntry(cfg.quickEntry !== false);
+    setBackground({ keepInTray: cfg.keepInTray === true, startAtLogin: cfg.startAtLogin === true });
+    if (HIDDEN) ensureTray();
     updates.start(cfg.autoUpdate !== false);
   } catch (e) {
     dialog.showErrorBox("Open AY Desktop", String(e.message || e));
@@ -138,7 +144,7 @@ function createWindow() {
   win.webContents.on("context-menu", (_e, p) => textMenu(p));  // pages that show their own menu (the sidebar) prevent this
   win.on("close", onClose);
   if (SMOKE) win.webContents.once("did-finish-load", smokeReport);
-  else win.once("ready-to-show", () => win.show());
+  else if (!HIDDEN) win.once("ready-to-show", () => win.show());
   win.loadURL(origin + "/");
 }
 
@@ -170,13 +176,33 @@ function showWindow() {
 function ensureTray() {
   if (tray) return;
   tray = new Tray(nativeImage.createFromPath(TRAY_ICON).resize({ width: 16, height: 16 }));
-  tray.setToolTip("Open AY Desktop: replies running in the background");
+  tray.setToolTip("Open AY Desktop: running in the background");
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: "Open Open AY Desktop", click: showWindow },
+    { label: "New chat", click: () => { showWindow(); if (win) win.webContents.send("quick-entry"); } },
     { type: "separator" },
     { label: "Stop replies and quit", click: quit },
   ]));
   tray.on("click", showWindow);
+}
+
+// Settings > App: keep running in the tray when the window closes, and start with Windows (hidden, in the tray)
+function setBackground(opts) {
+  if (typeof opts.keepInTray === "boolean") background.keepInTray = opts.keepInTray;
+  if (typeof opts.startAtLogin === "boolean") background.startAtLogin = opts.startAtLogin;
+  if (!DEV && !SMOKE) {
+    try { app.setLoginItemSettings({ openAtLogin: background.startAtLogin, args: ["--hidden"] }); } catch {}
+  }
+  if (background.keepInTray && !tray && win && !win.isVisible()) ensureTray();
+  return { ...background };
+}
+
+function hideToTray() {
+  win.hide(); ensureTray();
+  if (!background.told && tray && process.platform === "win32") {
+    background.told = true;
+    try { tray.displayBalloon({ title: "Open AY Desktop is still running", content: "Replies and scheduled tasks keep running here. Right-click the icon to quit." }); } catch {}
+  }
 }
 
 async function runningReplies() {
@@ -186,6 +212,7 @@ async function runningReplies() {
 async function onClose(e) {
   if (quitting) return;
   e.preventDefault();
+  if (background.keepInTray) return hideToTray();
   const running = await runningReplies();
   if (!running) return quit();
   const { response } = await dialog.showMessageBox(win, {
@@ -194,7 +221,7 @@ async function onClose(e) {
     message: `${running} ${running === 1 ? "reply is" : "replies are"} still running.`,
     detail: "Keep them running from the system tray, or stop them and quit. Stopped replies keep what they did so far.",
   });
-  if (response === 0) { win.hide(); ensureTray(); }
+  if (response === 0) hideToTray();
   else if (response === 1) quit();
 }
 

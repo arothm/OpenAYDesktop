@@ -1,6 +1,6 @@
 "use strict";
 // What the page can reach from Electron: the folder picker, saving an exported chat, dictation,
-// the quick-entry shortcut and software updates. No Node, files or shell beyond these.
+// the quick-entry shortcut, running in the background and software updates. No Node, files or shell beyond these.
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("openay", {
@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld("openay", {
   saveText: (name, text) => ipcRenderer.invoke("save-text", String(name), String(text)),
   dictate: () => ipcRenderer.invoke("dictate"),
   setQuickEntry: (on) => ipcRenderer.invoke("quick-entry", Boolean(on)),
+  setBackground: (opts) => ipcRenderer.invoke("background", { keepInTray: Boolean(opts.keepInTray), startAtLogin: Boolean(opts.startAtLogin) }),
   onQuickEntry: (fn) => ipcRenderer.on("quick-entry", () => fn()),
   updates: {
     state: () => ipcRenderer.invoke("update-state"),

@@ -16,6 +16,7 @@ How a command runs:
     list and approvals are for.
 """
 
+import codecs
 import os
 import shlex
 import shutil
@@ -167,8 +168,9 @@ def _kill_tree(proc):
             proc.kill()
 
 
-def execute(plan, cancelled=None):
-    """Run a prepared command. Returns a text report: exit code, time, and output (start and end kept)."""
+def execute(plan, cancelled=None, on_output=None):
+    """Run a prepared command. Returns a text report: exit code, time, and output (start and end kept).
+    on_output, if given, receives the output as it arrives (the Terminal panel shows it live)."""
     env = {k: v for k, v in os.environ.items() if k not in SECRET_ENV}
     env.update(CI="1", NO_COLOR="1", FORCE_COLOR="0", PYTHONIOENCODING="utf-8")
     kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)} \
@@ -176,14 +178,22 @@ def execute(plan, cancelled=None):
     started = time.time()
     proc = subprocess.Popen([plan["exe"], *plan["argv"][1:]], cwd=plan["cwd"], env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs)
-    chunks, size = [], [0]
+    head, tail, total = bytearray(), bytearray(), [0]  # the first HEAD bytes, a rolling last TAIL bytes, and the count
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
     def read():
-        for block in iter(lambda: proc.stdout.read(4096), b""):
-            chunks.append(block); size[0] += len(block)
-            if size[0] > 4 * (HEAD + TAIL):  # keep memory bounded: first part plus a rolling tail
-                head = b"".join(chunks)[:HEAD]; tail = b"".join(chunks)[-TAIL:]
-                chunks[:] = [head, b"\n[...]\n", tail]; size[0] = len(head) + len(tail)
+        for block in iter(lambda: proc.stdout.read1(4096), b""):
+            total[0] += len(block)
+            if on_output is not None:
+                try: on_output(decoder.decode(block))
+                except Exception: pass  # noqa: BLE001 - a display problem must not stop the command
+            room = HEAD - len(head)
+            if room > 0:
+                head.extend(block[:room]); block = block[room:]
+            if block:
+                tail.extend(block)
+                if len(tail) > TAIL:
+                    del tail[:len(tail) - TAIL]
     reader = threading.Thread(target=read, daemon=True); reader.start()
     outcome = None
     while proc.poll() is None:
@@ -195,8 +205,47 @@ def execute(plan, cancelled=None):
             _kill_tree(proc); break
         time.sleep(0.1)
     proc.wait(); reader.join(5); proc.stdout.close()
-    text = b"".join(chunks).decode("utf-8", "replace")
-    if len(text) > HEAD + TAIL:
-        text = text[:HEAD] + "\n[... %d characters not shown ...]\n" % (len(text) - HEAD - TAIL) + text[-TAIL:]
+    hidden = total[0] - len(head) - len(tail)
+    text = bytes(head).decode("utf-8", "replace")
+    if hidden > 0:
+        text += "\n[... %s bytes of output not shown ...]\n" % "{:,}".format(hidden)
+    text += bytes(tail).decode("utf-8", "replace")
     status = outcome or ("exit code %d" % proc.returncode)
     return "$ %s\n(in %s, %s, %.1fs)\n\n%s" % (plan["line"], plan["cwd"], status, time.time() - started, text.strip() or "(no output)")
+
+
+class Job:
+    """A command from the Terminal panel, running in the background: the window polls its output and can stop it."""
+    KEEP = 200_000  # characters of live output kept for the window
+
+    def __init__(self, plan):
+        self.plan, self.text, self.done, self.result = plan, "", False, None
+        self.dropped = 0  # characters trimmed from the start of text (offsets stay absolute)
+        self.cancel = threading.Event()
+        self.lock = threading.Lock()
+        self.started = time.time()
+        self.ended = None
+        threading.Thread(target=self._run, daemon=True, name="terminal-job").start()
+
+    def _out(self, s):
+        with self.lock:
+            self.text += s
+            if len(self.text) > self.KEEP:
+                self.dropped += len(self.text) - self.KEEP
+                self.text = self.text[-self.KEEP:]
+
+    def _run(self):
+        try:
+            self.result = execute(self.plan, self.cancel, self._out)
+        except Exception as e:  # noqa: BLE001 - shown in the panel
+            self.result = "$ %s\nCouldn't run it: %s" % (self.plan["line"], e)
+        self.ended = time.time()
+        self.done = True
+
+    def poll(self, since=0):
+        """Output after character `since` of what's kept, plus the final report once it's done."""
+        with self.lock:
+            text, dropped = self.text, self.dropped
+        start = max(0, min(int(since or 0) - dropped, len(text)))
+        return {"output": text[start:], "next": dropped + len(text), "done": self.done, "result": self.result,
+                "seconds": round((self.ended or time.time()) - self.started, 1), "line": self.plan["line"], "cwd": self.plan["cwd"]}

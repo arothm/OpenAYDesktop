@@ -108,6 +108,9 @@ def resolve(chat, raw, write=False):
         raise CapabilityError("Access denied: path is outside the shared folders.")
     if write and not max(matches, key=lambda g: len(g["path"]))["write"]:
         raise CapabilityError("The target folder is read-only.")
+    if write and any(part.lower() == ".git" for part in path.split(os.sep)):
+        # Git's own files (config, hooks) can make Git run programs: changing them needs a command, not a file tool.
+        raise CapabilityError("Files inside a .git folder can't be changed with file tools.")
     return path
 
 

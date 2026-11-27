@@ -20,8 +20,16 @@ const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 
 const humanBytes = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
 function toast(msg) { const t = $("#toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("show"), 2600); }
 function linkify(s) { return esc(s).replace(/https?:\/\/[^\s)]+/g, (u) => `<a href="${u}" target="_blank" rel="noopener">${u}</a>`); }
+const mdCache = new Map();  // text -> rendered HTML (most recent last), so redrawing a long chat stays fast
 function renderMarkdown(text) {
   if (!window.marked || !window.DOMPurify) return `<p class="pre-wrap">${esc(text)}</p>`;
+  const hit = mdCache.get(text);
+  if (hit !== undefined) { mdCache.delete(text); mdCache.set(text, hit); return hit; }
+  const html = renderMarkdownNow(text);
+  mdCache.set(text, html); if (mdCache.size > 600) mdCache.delete(mdCache.keys().next().value);
+  return html;
+}
+function renderMarkdownNow(text) {
   const html = DOMPurify.sanitize(marked.parse(text, { gfm: true, breaks: false }));
   const div = document.createElement("div"); div.innerHTML = html;
   div.querySelectorAll("a").forEach((a) => { a.target = "_blank"; a.rel = "noopener"; });
@@ -117,17 +125,17 @@ function dayGroup(ms) {
   const diff = Math.floor((today - new Date(d.getFullYear(), d.getMonth(), d.getDate())) / 864e5);
   return diff <= 0 ? "Today" : diff === 1 ? "Yesterday" : diff < 7 ? "This week" : "Earlier";
 }
-// The header's second line: model · folders · Git, so the chat's reach is always visible
+// The header shows the chat's name (and, for a subtask, its parent); the row under the message box shows
+// what the chat can reach: folders and Git
 function updateSubtitle() {
-  const parts = []; const m = currentModel(); if (m && state.chat) parts.push(m);
-  const n = chatFolders().length; if (state.chat || n) parts.push(n ? `${n} folder${n > 1 ? "s" : ""}` : "no folders");
+  const parent = state.chat?.parentId ? state.chats.find((c) => c.id === state.chat.parentId) : null;
+  $("#subtitle").textContent = parent ? "subtask of " + parent.title : "";
   const git = state.chat?.capabilities?.git; const gitText = { read: "Git: read", commit: "Git: commit", push: "Git: push" }[git] || "";
-  if (gitText) parts.push(gitText);
-  if (state.chat?.parentId) { const p = state.chats.find((c) => c.id === state.chat.parentId); if (p) parts.push("subtask of " + p.title); }
-  $("#subtitle").textContent = state.chat ? parts.join(" · ") : "";
-  $("#gitLabel").innerHTML = gitText ? `${ic("git", "sm")}${esc(gitText)}` : "";
+  $("#gitLabel").innerHTML = gitText ? `<span class="meta-btn static">${ic("git", "sm")}${esc(gitText)}</span>` : "";
+  $("#titleBtn").classList.toggle("empty", !state.chat);
 }
-function titleFor(chat) { return chat.title; }
+function setTitle(text) { $("#title").textContent = text || "New chat"; $("#titleBtn").classList.toggle("empty", !state.chat); $("#exportBtn").hidden = !state.chat; }
+function titleFor(chat) { return chat?.title || "New chat"; }
 function updateChatMeta(chat) {
   const i = state.chats.findIndex((x) => x.id === chat.id);
   const meta = { ...(i >= 0 ? state.chats[i] : {}), id: chat.id, title: chat.title, updated: chat.updated || Date.now(), model: chat.model,
@@ -159,66 +167,120 @@ function applyEvent(id, ev) {
   if (ev.type === "snapshot") {
     if (ev.chat.id !== id) return;
     const first = state.chat?.id !== id; state.chat = ev.chat; state.selectedModel = ev.chat.model;
-    state.pause = ev.pause || null; renderPause();
-    setRunStatus(ev.status); showApproval(ev.approval); updateModelBtn(); updateFolderBtn(); updateUntrustedBadge(); $("#title").textContent = titleFor(ev.chat);
-    renderMessages(); scrollBottom(first); renderUsage(); return;
+    state.pause = ev.pause || null; renderPause(); if (ev.started) state.runStarted = ev.started;
+    setRunStatus(ev.status); showApproval(ev.approval); updateModelBtn(); updateFolderBtn(); updateUntrustedBadge(); setTitle(titleFor(ev.chat));
+    const nb = first || nearBottom(); renderMessages(); if (nb) scrollBottom(true); renderUsage(); return;
   }
   const chat = state.chat; if (!chat || chat.id !== id) return;
   switch (ev.type) {
     case "message": {
+      if (ev.index > chat.messages.length) { renderMessages(); return; }  // a gap: the next snapshot fills it
       const isNew = ev.index >= chat.messages.length; chat.messages[ev.index] = ev.message;
-      if (isNew || ev.index !== chat.messages.length - 1) { const nb = nearBottom(); renderMessages(); if (nb) scrollBottom(true); } else scheduleLive();
-      break;
+      if (isNew || ev.index !== chat.messages.length - 1) { const nb = nearBottom(); updateMessage(ev.index, isNew); if (nb) scrollBottom(true); } else scheduleLive();
+      updateWorking(); break;
     }
     case "delta": {
       const m = chat.messages[ev.index]; if (!m) return;
-      m.content = (m.content || "") + (ev.content || ""); m.thinking = (m.thinking || "") + (ev.thinking || ""); scheduleLive(); break;
+      m.content = (m.content || "") + (ev.content || ""); m.thinking = (m.thinking || "") + (ev.thinking || ""); scheduleLive(); updateWorking(); break;
     }
     case "status":
+      if (ev.started) state.runStarted = ev.started;
       setRunStatus(ev.status);
       if (ev.model && ev.model !== chat.model) { chat.model = ev.model; state.selectedModel = ev.model; updateModelBtn(); const meta = state.chats.find((c) => c.id === chat.id); if (meta) meta.model = ev.model; }
       if (ev.status === "idle") { loadChats(); loadUndoRuns().then(renderMessages); }
       break;
-    case "compacting": setStatusBar(ev.active ? "Summarizing earlier messages to fit the context budget…" : ""); break;
+    case "compacting": setStatusBar(ev.active ? "Summarizing earlier messages" : ""); break;
     case "compaction": chat.compaction = ev.compaction; renderMessages(); break;
+    case "compact_done": toast(ev.ok ? `Compacted: ${ev.messages} earlier message${ev.messages === 1 ? " is" : "s are"} now a summary` : ev.error); break;
     case "approval": showApproval(ev.approval); break;
     case "approval_done": closeApproval(ev.id); break;
     case "untrusted": chat.untrusted = ev.untrusted; updateUntrustedBadge(); break;
     case "session":  // renamed, or settings changed, while a reply runs
       for (const [k, v] of Object.entries(ev.chat || {})) { if (v === null) delete chat[k]; else chat[k] = v; }
-      $("#title").textContent = titleFor(chat); updateSubtitle(); updateFolderBtn(); updateUntrustedBadge(); loadChats(); break;
+      setTitle(titleFor(chat)); updateSubtitle(); updateFolderBtn(); updateUntrustedBadge(); loadChats(); break;
     case "balance_wait": state.pause = ev.balance ? { balance: ev.balance, minimumUsd: ev.minimumUsd } : null; if (ev.balance) state.balance = { balance: ev.balance, minimumUsd: ev.minimumUsd }; renderPause(); renderUsage(); break;
     case "context": state.contextInfo = ev; break;
     case "usage": chat.usage = ev.session; chat.context = ev.context; state.today = ev.today; renderUsage(); break;
   }
 }
 function setRunStatus(status) {
+  const was = busy();
   state.runStatus = status || "idle"; updateSendBtn();
+  if (busy() && !was && !state.runStarted) state.runStarted = Date.now();
+  if (!busy()) { state.runStarted = 0; state.compacting = false; state.follow = false; }
   if (state.chat) { if (busy()) state.runs[state.chat.id] = state.runStatus; else delete state.runs[state.chat.id]; renderChatList(); }
+  updateWorking(); renderUsage();
+}
+
+// The working line above the message box: what the reply is doing now, and for how long
+const TOOL_DOING = { read_file: "Reading", list_directory: "Looking in", search_files: "Searching files", write_file: "Writing", edit_file: "Editing",
+  create_folder: "Creating a folder", copy_path: "Copying", move_path: "Moving", delete_path: "Moving to the trash", restore_path: "Restoring",
+  web_search: "Searching the web", web_fetch: "Reading", run_command: "Running", start_subtask: "Running subtask", message_subtask: "Messaging a subtask",
+  wait_subtasks: "Waiting for subtasks", message_parent: "Messaging the parent chat", read_skill_file: "Reading skill file", read_memory: "Reading memory",
+  save_memory: "Saving to memory", set_session_model: "Switching model", git_commit: "Committing", git_push: "Pushing", git_merge: "Merging", gh_pr_create: "Opening a pull request" };
+const baseName = (p) => String(p || "").split(/[\\/]/).filter(Boolean).pop() || String(p || "");
+function toolDoing(m) {
+  if (m._approval) return `Waiting for you to review ${baseName(m._approval.path)}`;
+  if (m._actionApproval || m._modelApproval) return "Waiting for your approval";
+  if (m._waitingParent) return "Waiting for the parent chat's answer";
+  const verb = TOOL_DOING[m.tool_name] || (/^(git|gh)_/.test(m.tool_name || "") ? "Checking Git" : "Using " + (TOOL_LABEL[m.tool_name] || m.tool_name || "a tool").toLowerCase());
+  const d = String(m.display || "");
+  if (["read_file", "list_directory", "write_file", "edit_file", "read_skill_file"].includes(m.tool_name)) return `${verb} ${baseName(d.split(" → ").pop())}`;
+  if (m.tool_name === "web_fetch") { try { return `${verb} ${new URL(d).host}`; } catch { return `${verb} a web page`; } }
+  if (m.tool_name === "run_command" || m.tool_name === "start_subtask") return `${verb} ${d.length > 48 ? d.slice(0, 47) + "…" : d}`;
+  return verb;
+}
+function workingText() {
+  if (state.runStatus === "waiting") return "Waiting for your approval";
+  if (state.runStatus === "wrapping") return "Wrapping up: the Ollama balance is low";
+  if (state.compacting) return "Summarizing earlier messages";
+  const msgs = state.chat?.messages || [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m.role === "tool" && (m._running || m._approval || m._actionApproval || m._modelApproval)) return toolDoing(m);
+    if (m.role === "assistant" && m._live) return m.content ? "Writing" : m.thinking ? "Thinking" : "Working";
+    if (m.role === "user" && !m.auto) break;
+  }
+  return "Working";
+}
+const fmtElapsed = (ms) => { const s = Math.max(0, Math.floor(ms / 1000)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`; };
+let workingTimer = 0;
+function updateWorking() {
+  const show = busy() && state.runStatus !== "paused" && Boolean(state.chat || state.runStarted);
+  const w = $("#working"); w.hidden = !show;
+  if (!show) { clearInterval(workingTimer); workingTimer = 0; return; }
+  const text = workingText(); if ($("#workingText").textContent !== text) $("#workingText").textContent = text;
+  w.classList.toggle("waiting", /^Waiting for (your|you)/.test(text));
+  $("#workingTime").textContent = fmtElapsed(Date.now() - (state.runStarted || Date.now()));
+  if (!workingTimer) workingTimer = setInterval(updateWorking, 1000);
 }
 
 // Token usage and context, shown under the message box
 const kTokens = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n || 0);
 function renderUsage() {
-  const parts = []; const c = state.chat?.context; const u = state.chat?.usage; const t = state.today;
-  renderBalanceBadge();
-  let pct = 0;
-  if (c && c.limit) {
-    pct = Math.min(100, Math.round((c.used / c.limit) * 100));
-    parts.push(`<span class="${pct >= 80 ? "warn" : ""}" title="Tokens in the last request, out of this model's context window (${pct}%)">Context <span class="bar"><i></i></span> ${kTokens(c.used)} / ${kTokens(c.limit)}</span>`);
-    if (c.omittedMessages) parts.push(`<span class="warn" title="Older messages are left out of requests so the conversation fits">${c.omittedMessages} older message${c.omittedMessages > 1 ? "s" : ""} left out</span>`);
-  }
-  if (u) {
-    const cached = u.cachedTokens ? ` (${Math.round((u.cachedTokens / Math.max(1, u.promptTokens)) * 100)}% cached)` : "";
-    parts.push(`<span title="Tokens sent and generated in this chat. Cached input is billed at Ollama's cheaper cached-input rate.">This chat ${kTokens(u.promptTokens)} in${cached} · ${kTokens(u.outputTokens)} out</span>`);
-  }
-  if (t) {
-    const used = t.promptTokens + t.outputTokens; const lim = state.limits?.dailyTokenLimit || 0;
-    const of = lim ? ` / ${kTokens(lim)}` : ""; const warn = lim && used >= lim * 0.8 ? "warn" : "";
-    parts.push(`<span class="${warn}" title="All chats today${lim ? ", against your daily limit" : ""}${t.cachedTokens ? `. ${kTokens(t.cachedTokens)} input tokens came from Ollama's cache` : ""}">Today ${kTokens(used)}${of} tokens · ${t.requests} requests</span>`);
-  }
-  $("#usageLine").innerHTML = parts.join('<span class="sep">·</span>');
-  const fill = $("#usageLine .bar i"); if (fill) fill.style.width = pct + "%";  // CSSOM: allowed by the page's CSP
+  renderBalanceBadge(); renderToday();
+  const chat = state.chat; $("#chatMeta").hidden = !chat; if (!chat) return;
+  const c = chat.context; const u = chat.usage;
+  const limit = c?.limit || 0; const used = c?.used || 0; const pct = limit ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+  const g = $("#ctxGauge"); g.style.setProperty("--pct", pct);  // CSSOM: allowed by the page's CSP
+  g.classList.toggle("warn", pct >= 70 && pct < 90); g.classList.toggle("full", pct >= 90);
+  $("#ctxText").textContent = limit ? `${kTokens(used)} / ${kTokens(limit)}` : "– / –";
+  const notes = [];
+  if (c?.omittedMessages) notes.push(`${c.omittedMessages} older message${c.omittedMessages > 1 ? "s were" : " was"} left out to fit`);
+  if (c?.summarizedMessages) notes.push(`${c.summarizedMessages} earlier messages are a summary`);
+  g.title = limit ? `Context: the last request used ${used.toLocaleString()} of this model's ${limit.toLocaleString()} tokens (${pct}%).${notes.length ? " " + notes.join("; ") + "." : ""}` : "Context use appears after the first reply.";
+  const userTurns = (chat.messages || []).filter((m) => m.role === "user" && !m.auto).length;
+  $("#compactBtn").disabled = busy() || userTurns < 2;
+  const cached = u?.cachedTokens ? Math.round((u.cachedTokens / Math.max(1, u.promptTokens)) * 100) : 0;
+  $("#tokenLine").textContent = `${kTokens(u?.promptTokens || 0)} in · ${kTokens(u?.outputTokens || 0)} out`;
+  $("#tokenLine").title = `Tokens this chat sent and received${cached ? `. ${cached}% of the input came from Ollama's cache (billed at the cheaper cached rate)` : ""}.`;
+}
+function renderToday() {
+  const t = state.today; const box = $("#todayUsage"); if (!box) return;
+  const used = t ? t.promptTokens + t.outputTokens : 0; const lim = state.limits?.dailyTokenLimit || 0;
+  const stat = (v, l, cls) => `<div class="stat"><div class="v ${cls || ""}">${v}</div><div class="l">${l}</div></div>`;
+  box.innerHTML = stat(kTokens(used) + (lim ? ` / ${kTokens(lim)}` : ""), "Tokens today", lim && used >= lim * 0.8 ? "amber" : "")
+    + stat(kTokens(t?.cachedTokens || 0), "Input from cache") + stat(t?.requests || 0, "Requests");
 }
 // Balance level: "low" at or below the pause amount, "warn" within 50 cents of it
 function balanceLevel() {
@@ -228,16 +290,17 @@ function balanceLevel() {
 }
 function renderBalanceBadge() {
   const badge = $("#connBadge"); const b = state.balance?.balance; const min = state.balance?.minimumUsd || 0;
-  let text = "Ollama Cloud", tip = "Ollama balance. Click to check now.";
+  let text = "$ –", sub = "Ollama balance", tip = "Ollama balance. Click to check now.";
   if (b && "totalUsd" in b) {
     text = "$" + b.totalUsd.toFixed(2);
+    sub = balanceLevel() === "low" ? `Paused at $${min.toFixed(2)}` : min ? `Pauses at $${min.toFixed(2)}` : "Ollama balance";
     tip = `Ollama balance: $${b.purchasedUsd.toFixed(2)} purchased + $${b.includedUsd.toFixed(2)} plan allowance` + (min ? `. Replies pause at $${min.toFixed(2)}.` : ".") + " Click to check now.";
-  } else if (b && b.error) { text = "$ –"; tip = "Balance unavailable: " + b.error; }
-  badge.className = "badge " + (balanceLevel() || (b && b.error && min ? "warn" : ""));
-  badge.querySelector("span").textContent = text; badge.title = tip;
+  } else if (b && b.error) { sub = "Balance unavailable"; tip = "Balance unavailable: " + b.error; }
+  badge.className = "balance-btn " + (balanceLevel() || (b && b.error && min ? "warn" : ""));
+  badge.querySelector(".b-amt").textContent = text; badge.querySelector(".b-sub").textContent = sub; badge.title = tip;
 }
 async function loadUsage() { try { const u = await api("/api/usage"); state.today = u.today; state.limits = u.limits; renderUsage(); } catch {} }
-function setStatusBar(text) { $("#statusBar").hidden = !text; $("#statusText").textContent = text || ""; }
+function setStatusBar(text) { state.compacting = Boolean(text); updateWorking(); }
 // Replies in this chat that still have file changes to undo (see undo.py)
 async function loadUndoRuns() {
   const chat = state.chat; if (!chat) { state.undoRuns = []; return; }
@@ -248,7 +311,7 @@ function newChat() {
   state.navSeq++; subscribe(null); state.chat = null; state.pause = null; renderPause(); state.draftFolders = []; state.editIndex = null; closeApproval(); setRunStatus("idle");
   state.selectedModel = state.config.defaultModel || state.models[0]?.name || "";
   state.undoRuns = []; setStatusBar("");
-  renderMessages(); renderChatList(); updateModelBtn(); updateFolderBtn(); updateUntrustedBadge(); toggleFolderPop(false); renderUsage(); $("#title").textContent = ""; $("#input").focus();
+  renderMessages(); renderChatList(); updateModelBtn(); updateFolderBtn(); updateUntrustedBadge(); toggleFolderPop(false); renderUsage(); setTitle(""); $("#input").focus();
   if (typeof onChatChanged === "function") onChatChanged();
 }
 async function openChat(id) {
@@ -257,7 +320,7 @@ async function openChat(id) {
   if (ticket !== state.navSeq) return;
   closeApproval(); state.pause = null; renderPause(); state.editIndex = null; state.chat = chat; state.selectedModel = chat.model; setRunStatus(state.runs[id] || "idle");
   state.undoRuns = []; setStatusBar("");
-  updateModelBtn(); renderMessages(); renderChatList(); updateFolderBtn(); updateUntrustedBadge(); toggleFolderPop(false); renderUsage(); $("#title").textContent = titleFor(chat); scrollBottom(true);
+  updateModelBtn(); renderMessages(); renderChatList(); updateFolderBtn(); updateUntrustedBadge(); toggleFolderPop(false); renderUsage(); setTitle(titleFor(chat)); scrollBottom(true);
   subscribe(id);  // the snapshot that follows brings any live run state
   loadUndoRuns().then(() => { if (state.chat?.id === chat.id) renderMessages(); });
   if (typeof onChatChanged === "function") onChatChanged();
@@ -364,6 +427,22 @@ function renderMessages() {
   }
   shown.count = msgs.length;
 }
+// One message changed or was added: redraw just it (and the previous last message, which loses its "last" buttons)
+function updateMessage(i, isNew) {
+  const box = $("#messages"); const msgs = state.chat?.messages || [];
+  if (!box.querySelector("[data-idx]") || (state.chat?.compaction?.upTo || -1) === i) { renderMessages(); return; }
+  turnMeta = computeTurns(msgs);
+  const swap = (j) => {
+    const el = box.querySelector(`:scope > [data-idx="${j}"]`); const html = msgHTML(msgs[j], j, j === msgs.length - 1);
+    if (el) { if (html) el.outerHTML = html; else el.remove(); return true; }
+    return !html;
+  };
+  if (isNew) {
+    if (i > 0 && !swap(i - 1)) { renderMessages(); return; }
+    const html = msgHTML(msgs[i], i, i === msgs.length - 1); if (html) box.insertAdjacentHTML("beforeend", html);
+    shown.times ||= {}; shown.times[i] = performance.now(); shown.count = msgs.length;
+  } else if (!swap(i)) renderMessages();
+}
 function renderLive() {
   const msgs = state.chat.messages; const i = msgs.length - 1; const el = $(`#messages .msg[data-idx="${i}"]`);
   if (!el) { renderMessages(); return; }
@@ -374,7 +453,10 @@ function renderLive() {
   const th = el.querySelector("details.thinking"); if (th && open !== undefined && !msgs[i].content) th.open = open;
   const tb = el.querySelector(".tbody"); if (tb) tb.scrollTop = tb.scrollHeight;
 }
-function nearBottom() { const s = $("#scroller"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
+// After you send, the chat follows the reply to the bottom until you scroll up to read something
+function nearBottom() { const s = $("#scroller"); return state.follow || s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
+$("#scroller").addEventListener("wheel", (e) => { if (e.deltaY < 0) state.follow = false; }, { passive: true });
+$("#scroller").addEventListener("keydown", (e) => { if (["PageUp", "ArrowUp", "Home"].includes(e.key)) state.follow = false; });
 function scrollBottom(force) { const s = $("#scroller"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; }
 function updateSendBtn() {
   const b = $("#sendBtn");
@@ -396,9 +478,9 @@ async function send(override) {
     if (!state.chat) {
       const title = (text || docs[0]?.name || "Image").slice(0, 60).replace(/\s+/g, " ");
       const chat = await api("/api/chats", { method: "POST", body: JSON.stringify({ title, model, folders: state.draftFolders, projectId: state.projectFilter || undefined }) });
-      state.draftFolders = []; state.chat = chat; shown.chatId = chat.id; shown.count = 0; $("#title").textContent = chat.title; updateChatMeta(chat); subscribe(chat.id);
+      state.draftFolders = []; state.chat = chat; shown.chatId = chat.id; shown.count = 0; setTitle(chat.title); updateChatMeta(chat); subscribe(chat.id);
     }
-    const chat = state.chat; setRunStatus("running");
+    const chat = state.chat; state.runStarted = Date.now(); state.follow = true; setRunStatus("running"); scrollBottom(true);
     if (override === undefined) { $("#input").value = ""; autoGrow(); state.attachments = []; renderAttachments(); state.documents = []; renderDocs(); setPlan(false); }
     state.editIndex = null; updateEditBanner();
     await api("/api/runs", { method: "POST", body: JSON.stringify({ chatId: chat.id, text, images, truncateAt, think: thinkOption(), plan,
@@ -408,7 +490,9 @@ async function send(override) {
     if (override === undefined && !$("#input").value) { $("#input").value = text; state.attachments = images; state.documents = docs; renderAttachments(); renderDocs(); autoGrow(); }
   }
 }
-function setPlan(on) { state.plan = Boolean(on); $("#planBtn").setAttribute("aria-pressed", String(state.plan)); $("#input").placeholder = state.plan ? "Describe the task: the model investigates and proposes a plan, without changing anything…" : "Ask anything, or describe a task…"; }
+function setPlan(on) {
+  state.plan = Boolean(on); $("#planBtn").setAttribute("aria-pressed", String(state.plan));
+  $("#planBtn .m-name").textContent = state.plan ? "Plan" : "Act"; $("#planBtn use").setAttribute("href", state.plan ? "#i-plan" : "#i-bolt"); $("#input").placeholder = state.plan ? "Describe the task: the model investigates and proposes a plan, without changing anything…" : "Ask anything, or describe a task…"; }
 
 // Documents: the server reads their text (documents.py); it goes to the model with the message
 async function addDocument(file) {
@@ -427,13 +511,15 @@ function renderDocs() {
 }
 function stop() { if (state.chat && busy()) api("/api/runs/stop", { method: "POST", body: JSON.stringify({ chatId: state.chat.id }) }).catch((e) => toast(e.message)); }
 async function regenerate() {
-  if (busy() || !state.chat) return; setRunStatus("running");
+  if (busy() || !state.chat) return; state.follow = true; setRunStatus("running");
   try { await api("/api/runs", { method: "POST", body: JSON.stringify({ chatId: state.chat.id, regenerate: true, think: thinkOption() }) }); }
   catch (e) { toast(e.message); setRunStatus("idle"); }
 }
 function editMessage(idx) {
   if (busy()) return; const m = state.chat.messages[idx];
   $("#input").value = m.content; autoGrow(); state.attachments = (m.images || []).slice(); renderAttachments();
+  state.documents = (m.attachments || []).map((a) => ({ name: a.name, text: a.text || "", note: a.note || "", chars: a.chars || (a.text || "").length, loading: false }));
+  renderDocs(); setPlan(Boolean(m.plan));
   state.editIndex = idx; updateEditBanner(); $("#input").focus();
 }
 function updateEditBanner() {
@@ -536,7 +622,10 @@ async function addFiles(files) {
 }
 
 // Settings and updates
-function openSettings() {
+const SET_TITLES = { secConn: "Connection", secLimits: "Usage & limits", secMemory: "Memory", secCmds: "Commands", secSkills: "Skills", secProjects: "Projects",
+  secSchedules: "Scheduled tasks", secActivity: "Activity", secTrash: "Trash", secUpdates: "App & updates" };
+const CONFIG_TABS = new Set(["secConn", "secLimits", "secMemory", "secCmds", "secUpdates"]);  // saved with "Save changes"
+function openSettings(tab, opts) {
   const c = state.config; state.clearKey = false; state.updateUrl = ""; $("#apiKey").value = "";
   $("#apiKey").placeholder = c.hasApiKey ? `Saved ${c.apiKeyHint || "(from OLLAMA_API_KEY)"} - leave blank to keep` : "Paste key…";
   $("#clearKey").disabled = !c.hasApiKey; $("#versionLabel").textContent = `Open AY Desktop ${c.version || ""}`;
@@ -544,15 +633,18 @@ function openSettings() {
   $("#dailyLimit").value = c.dailyTokenLimit || 0; $("#chatLimit").value = c.chatTokenLimit || 0; $("#maxRuns").value = c.maxConcurrentRuns || 4; $("#allowedCommands").value = (c.allowedCommands || []).join("\n"); $("#minBalance").value = c.minBalanceUsd ?? 1;
   $("#setVer").textContent = c.version ? "Version " + c.version : "";
   $("#keyState").className = "key-state" + (c.hasApiKey ? " ok" : ""); $("#keyState").textContent = c.hasApiKey ? `Saved ${c.apiKeyHint || "(from OLLAMA_API_KEY)"}` : "Not set";
-  renderSettingsBalance(); showSettingsSection("secConn", false);
+  renderSettingsBalance(); renderToday();
   setBudgetButtons(c.contextBudget || "full");
   $("#autoUpdate").checked = c.autoUpdate !== false; $("#quickEntry").checked = c.quickEntry !== false;
   $("#quickEntry").closest(".perm").hidden = !window.openay?.isElectron;
+  $("#keepInTray").checked = c.keepInTray === true; $("#startAtLogin").checked = c.startAtLogin === true;
+  for (const id of ["#keepInTray", "#startAtLogin"]) $(id).closest(".perm").hidden = !window.openay?.setBackground;
   $("#globalMemory").value = ""; state.memoryLoaded = null;
   api("/api/memory?scope=global").then((r) => { $("#globalMemory").value = r.text; state.memoryLoaded = r.text; }).catch(() => {});
   if (window.openay?.updates) window.openay.updates.state().then(renderUpdateState).catch(() => {});
-  populateDefaultModels(); $("#modalBack").classList.add("open");
+  populateDefaultModels(); $("#modalBack").classList.add("open"); showSettingsSection(typeof tab === "string" ? tab : "secConn", opts || {});
 }
+function closeSettings() { $("#modalBack").classList.remove("open"); clearInterval(activityTimer); }
 function setBudgetButtons(name) { document.querySelectorAll("#ctxBudget [data-budget]").forEach((b) => b.classList.toggle("primary", b.dataset.budget === name)); }
 document.querySelector("#ctxBudget").addEventListener("click", (e) => { const b = e.target.closest("[data-budget]"); if (b) setBudgetButtons(b.dataset.budget); });
 // In the Electron app, updates install from GitHub Releases (electron/main.js); in a browser window the
@@ -583,11 +675,19 @@ function renderSettingsBalance() {
     meter.querySelector("i").style.width = "0";
   }
 }
-function showSettingsSection(id, scroll) {
+function showSettingsSection(id, opts = {}) {
+  state.setTab = id;
   document.querySelectorAll(".set-nav [data-sec]").forEach((b) => b.classList.toggle("on", b.dataset.sec === id));
-  if (scroll) $("#" + id).scrollIntoView({ block: "start", behavior: "smooth" }); else $("#setBody").scrollTop = 0;
+  document.querySelectorAll(".set-page").forEach((pg) => { pg.hidden = pg.id !== id; });
+  $("#setHeading").textContent = SET_TITLES[id] || "Settings"; $("#setFoot").hidden = !CONFIG_TABS.has(id);
+  clearInterval(activityTimer);
+  if (id === "secSkills") loadSkills().then(() => { if (!skillsUi.current) editSkill(null); });
+  else if (id === "secProjects") showProjects(opts.project);
+  else if (id === "secSchedules") showSchedules();
+  else if (id === "secActivity") { renderActivity.seen = false; renderActivity(); activityTimer = setInterval(renderActivity, 2000); }
+  else if (id === "secTrash") renderTrash();
 }
-document.querySelector(".set-nav").addEventListener("click", (e) => { const b = e.target.closest("[data-sec]"); if (b) showSettingsSection(b.dataset.sec, true); });
+document.querySelector(".set-nav").addEventListener("click", (e) => { const b = e.target.closest("[data-sec]"); if (b) showSettingsSection(b.dataset.sec); });
 function populateDefaultModels() {
   const select = $("#defaultModel"); const selected = state.config.defaultModel || "";
   const names = [...new Set([selected, ...state.models.map((m) => m.name)].filter(Boolean))];
@@ -609,7 +709,8 @@ async function saveSettings() {
   const body = { defaultModel: $("#defaultModel").value, dailyTokenLimit: Number($("#dailyLimit").value || 0),
                  chatTokenLimit: Number($("#chatLimit").value || 0), maxConcurrentRuns: Number($("#maxRuns").value || 4), minBalanceUsd: Number($("#minBalance").value || 0),
                  allowedCommands: $("#allowedCommands").value.split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
-                 contextBudget: budget, autoUpdate: $("#autoUpdate").checked, quickEntry: $("#quickEntry").checked };
+                 contextBudget: budget, autoUpdate: $("#autoUpdate").checked, quickEntry: $("#quickEntry").checked,
+                 keepInTray: $("#keepInTray").checked, startAtLogin: $("#startAtLogin").checked };
   const key = $("#apiKey").value.trim(); if (key) body.apiKey = key;
   if (state.clearKey && !key) body.clearApiKey = true;
   try {
@@ -617,8 +718,9 @@ async function saveSettings() {
       await api("/api/memory", { method: "POST", body: JSON.stringify({ scope: "global", text: $("#globalMemory").value }) });
     const saved = await api("/api/config", { method: "POST", body: JSON.stringify(body) }); const oldDefault = state.config.defaultModel; state.config = saved;
     if (window.openay?.updates) { window.openay.updates.setAuto(saved.autoUpdate !== false); window.openay.setQuickEntry(saved.quickEntry !== false); }
+    if (window.openay?.setBackground) window.openay.setBackground({ keepInTray: saved.keepInTray === true, startAtLogin: saved.startAtLogin === true });
     if (!state.chat && oldDefault !== saved.defaultModel) { state.selectedModel = saved.defaultModel || state.models[0]?.name || ""; renderMessages(); updateModelBtn(); }
-    $("#modalBack").classList.remove("open"); await loadModels(); loadUsage(); toast("Settings saved");
+    closeSettings(); await loadModels(); loadUsage(); toast("Settings saved");
   } catch (e) { toast(e.message); }
 }
 
@@ -665,7 +767,7 @@ async function saveSession() {
   try {
     if (title !== state.chat.title) {
       const result = await api("/api/session/rename", { method: "POST", body: JSON.stringify({ chatId: state.chat.id, title }) });
-      state.chat.title = result.title; $("#title").textContent = result.title;
+      state.chat.title = result.title; setTitle(result.title);
     }
     const changes = { capabilities: c, projectId: $("#sessionProject").value || null }; if (document.querySelector("#sessionSkills [data-skill]")) changes.skills = skillIds;
     await savePermissions(state.chat, changes); await loadChats();
@@ -674,7 +776,7 @@ async function saveSession() {
 }
 
 // Trash: files the model deleted, and earlier versions kept before every overwrite or edit
-async function openTrash() { $("#trashBack").classList.add("open"); await renderTrash(); }
+function openTrash() { openSettings("secTrash"); }
 async function renderTrash() {
   let r; try { r = await api("/api/trash"); } catch (e) { $("#trashList").innerHTML = `<div class="menu-note">${esc(e.message)}</div>`; return; }
   const items = r.items || []; $("#trashEmpty").disabled = !items.length;
@@ -693,9 +795,6 @@ async function renderTrash() {
       <button class="icon-btn sm" data-trash="purge" type="button" title="Delete permanently" aria-label="Delete permanently">${ic("x", "sm")}</button><button class="btn sm" data-trash="restore" type="button">${ic("restore", "sm")}${m.kind === "version" ? "Restore version" : "Restore"}</button></div>`;
   }).join("") || '<div class="empty-note">Files a session deletes, and earlier versions of files it edits, appear here.</div>';
 }
-$("#trashBtn").addEventListener("click", openTrash);
-$("#trashClose").addEventListener("click", () => $("#trashBack").classList.remove("open"));
-$("#trashBack").addEventListener("click", (e) => { if (e.target.id === "trashBack") $("#trashBack").classList.remove("open"); });
 $("#trashList").addEventListener("click", async (e) => {
   const b = e.target.closest("[data-trash]"); if (!b) return; const id = b.closest(".trash-row").dataset.id;
   const path = b.closest(".trash-row").querySelector(".p").title;
@@ -713,13 +812,14 @@ $("#trashEmpty").addEventListener("click", async () => {
 
 // Activity: running replies in every chat (subtasks included), plus recently finished ones
 let activityTimer = 0;
-async function openActivity() { $("#activityBack").classList.add("open"); renderActivity.seen = false; await renderActivity(); clearInterval(activityTimer); activityTimer = setInterval(renderActivity, 2000); }
-function closeActivity() { clearInterval(activityTimer); $("#activityBack").classList.remove("open"); }
+function openActivity() { openSettings("secActivity"); }
+function closeActivity() { closeSettings(); }
 const ago = (s) => s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
 function activityRow(a, live) {
   const parent = a.parentId && state.chats.find((c) => c.id === a.parentId);
-  const label = live ? (a.approval ? "waiting for you" : a.status === "paused" ? "paused: low balance" : a.status) : a.status;
-  const cls = live ? (a.approval ? "waiting" : a.status === "paused" ? "paused" : "running") : a.status === "idle" || a.status === "done" ? "done" : a.status;
+  const LIVE = { paused: ["paused: low balance", "paused"], wrapping: ["wrapping up", "waiting"], asking: ["asking the parent chat", "waiting"], waiting: ["waiting for you", "waiting"] };
+  const [label, cls] = !live ? [a.status, a.status === "idle" || a.status === "done" ? "done" : a.status]
+    : a.approval ? ["waiting for you", "waiting"] : LIVE[a.status] || [a.status, "running"];
   const meta = [a.model, ago(a.seconds), `${a.steps} step${a.steps === 1 ? "" : "s"}`, `${kTokens(a.tokens)} tokens`];
   if (parent) meta.push("subtask of " + parent.title); if (a.children?.length) meta.push(`${a.children.length} subtask${a.children.length > 1 ? "s" : ""}`);
   const busyRow = live && cls === "running" ? " busy" : "";
@@ -727,7 +827,7 @@ function activityRow(a, live) {
     <button class="btn sm" data-act="open" type="button">${a.approval ? "Review" : "Open"}</button>${live ? '<button class="btn sm danger" data-act="stop" type="button">Stop</button>' : ""}</div>`;
 }
 async function renderActivity() {
-  if (!$("#activityBack").classList.contains("open")) { clearInterval(activityTimer); return; }
+  if (!$("#modalBack").classList.contains("open") || state.setTab !== "secActivity") { clearInterval(activityTimer); return; }
   let r; try { r = await api("/api/activity"); } catch (e) { $("#activityList").innerHTML = `<div class="menu-note">${esc(e.message)}</div>`; return; }
   const waiting = r.active.filter((a) => a.approval).length; const running = r.active.length - waiting;
   const t = state.today; const used = t ? t.promptTokens + t.outputTokens : 0; const lim = state.limits?.dailyTokenLimit || 0;
@@ -740,10 +840,7 @@ async function renderActivity() {
   $("#activityList").innerHTML = rows(r.active, true, "Nothing is running.");
   $("#activityRecent").innerHTML = rows(r.recent, false, "Nothing yet since the app started.");
 }
-$("#activityBtn").addEventListener("click", openActivity);
-$("#activityClose").addEventListener("click", closeActivity);
-$("#activityBack").addEventListener("click", async (e) => {
-  if (e.target.id === "activityBack") { closeActivity(); return; }
+$("#secActivity").addEventListener("click", async (e) => {
   const b = e.target.closest("[data-act]"); if (!b) return; const id = b.closest(".act-row").dataset.chat;
   if (b.dataset.act === "open") { closeActivity(); openChat(id); }
   else { try { await api("/api/runs/stop", { method: "POST", body: JSON.stringify({ chatId: id }) }); } catch (err) { toast(err.message); } renderActivity(); }
@@ -751,7 +848,7 @@ $("#activityBack").addEventListener("click", async (e) => {
 
 // Skills: Markdown instructions or skill folders stored in data/skills, turned on per chat in Session settings
 const skillsUi = { list: [], current: null };
-async function openSkills() { $("#skillsBack").classList.add("open"); await loadSkills(); if (!skillsUi.current) editSkill(null); }
+function openSkills() { openSettings("secSkills"); }
 async function loadSkills() {
   try { skillsUi.list = (await api("/api/skills")).skills; } catch (e) { toast(e.message); skillsUi.list = []; }
   $("#skillsList").innerHTML = skillsUi.list.map((s) => `<button class="skill-item ${skillsUi.current === s.id ? "sel" : ""}" data-skill-id="${esc(s.id)}" type="button"><span class="av c${hashIndex(s.id, 4)}">${esc(initials(s.name))}</span><span class="tx"><div class="n">${esc(s.name)}${s.folder ? ` <span class="pkg-tag">${ic("folder", "sm")}${s.files} file${s.files === 1 ? "" : "s"}</span>` : ""}</div><div class="d">${esc(s.description || "")}</div></span></button>`).join("")
@@ -817,9 +914,6 @@ function importSkill(file) {
   };
   rd.readAsText(file);
 }
-$("#skillsBtn").addEventListener("click", openSkills);
-$("#skillsClose").addEventListener("click", () => $("#skillsBack").classList.remove("open"));
-$("#skillsBack").addEventListener("click", (e) => { if (e.target.id === "skillsBack") $("#skillsBack").classList.remove("open"); });
 $("#skillsList").addEventListener("click", (e) => { const b = e.target.closest("[data-skill-id]"); if (b) editSkill(b.dataset.skillId); });
 $("#skillNew").addEventListener("click", () => editSkill(null)); $("#skillSave").addEventListener("click", saveSkill); $("#skillDelete").addEventListener("click", deleteSkill);
 $("#skillImport").addEventListener("click", () => $("#skillFile").click()); $("#skillImportFolder").addEventListener("click", importSkillFolder);
@@ -857,8 +951,9 @@ function addFolder(raw) {
   if (!list.some((f) => f.path.toLowerCase() === p.toLowerCase())) list.push({ path: p, write: false }); $("#folderPath").value = ""; foldersChanged();
 }
 function updateFolderBtn() {
-  const b = $("#folderBtn"); const n = chatFolders().length; b.classList.toggle("on", n > 0); b.querySelector(".count").textContent = n;
-  b.title = n ? `This chat can access ${n} folder${n > 1 ? "s" : ""}` : "Give this chat access to folders";
+  const b = $("#folderBtn"); const list = chatFolders(); const n = list.length; b.classList.toggle("on", n > 0);
+  $("#folderLabel").textContent = n ? baseName(list[0].path) + (n > 1 ? ` +${n - 1}` : "") : "Add a folder";
+  b.title = n ? "This chat can access:\n" + list.map((f) => `${f.path} (${f.write ? "edits allowed" : "read-only"})`).join("\n") : "Give this chat access to folders";
   updateSubtitle();
 }
 function toggleFolderPop(open) { $("#folderPop").classList.toggle("open", open); if (open) { renderFolderList(); $("#folderPath").focus(); } }
@@ -877,6 +972,7 @@ $("#browseFolder").addEventListener("click", async () => {
   } catch (e) { toast(e.message); }
   finally { b.disabled = false; b.textContent = "Browse…"; }
 });
+$("#folderSession").addEventListener("click", () => { toggleFolderPop(false); openSession(); });
 $("#folderList").addEventListener("click", (e) => {
   const row = e.target.closest(".folder-row"); if (!row) return; const i = +row.dataset.i; const list = chatFolders();
   if (e.target.closest(".fdel")) { list.splice(i, 1); foldersChanged(); } else if (e.target.classList.contains("fw")) { list[i].write = e.target.checked; foldersChanged(); }
@@ -906,21 +1002,27 @@ function renameInPlace(el, id) {
   const chat = state.chats.find((c) => c.id === id) || (state.chat?.id === id ? state.chat : null); if (!chat || state.renaming) return;
   const input = document.createElement("input"); input.className = "input rename-input"; input.value = chat.title; input.maxLength = 100;
   input.setAttribute("aria-label", "Chat name");
-  const before = el.textContent; el.textContent = ""; el.append(input); state.renaming = id; input.focus(); input.select();
+  const titleMode = el.id === "title"; const before = el.textContent;
+  if (titleMode) { $("#titleMenu").classList.remove("open"); $("#titleBtn").hidden = true; $("#titleWrap").prepend(input); }
+  else { el.textContent = ""; el.append(input); }
+  state.renaming = id; input.focus(); input.select();
   let done = false;
   const finish = async (save) => {
     if (done) return; done = true; const title = input.value.trim(); state.renaming = null;
     if (save && title && title !== chat.title) {
       try {
         const r = await api("/api/session/rename", { method: "POST", body: JSON.stringify({ chatId: id, title }) });
-        chat.title = r.title; if (state.chat?.id === id) { state.chat.title = r.title; $("#title").textContent = r.title; }
+        chat.title = r.title; if (state.chat?.id === id) { state.chat.title = r.title; setTitle(r.title); }
         toast("Renamed");
       } catch (e) { toast(e.message); }
     }
-    if (el.id === "title") el.textContent = state.chat?.title || before;
+    if (titleMode) { input.remove(); $("#titleBtn").hidden = false; setTitle(state.chat?.title || before); }
     await loadChats();
   };
-  input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); finish(true); } else if (e.key === "Escape") { e.preventDefault(); finish(false); } });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); finish(true); }
+    else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); finish(false); }  // only the rename: never Stop
+  });
   input.addEventListener("blur", () => finish(true));
   input.addEventListener("click", (e) => e.stopPropagation());
 }
@@ -945,10 +1047,29 @@ $("#chatList").addEventListener("contextmenu", (e) => {
   e.preventDefault(); showChatMenu(e.clientX, e.clientY, item.dataset.id);
 });
 $("#chatList").addEventListener("dblclick", (e) => { const item = e.target.closest(".chat-item"); if (item && !e.target.closest(".del")) renameInPlace(item.querySelector(".t"), item.dataset.id); });
-$("#title").addEventListener("dblclick", () => { if (state.chat) renameInPlace($("#title"), state.chat.id); });
-$("#title").title = "Double-click to rename";
+// The chat's name in the header: a menu (rename, session settings, terminal and preview, delete); double-click renames
+$("#titleBtn").addEventListener("click", (e) => {
+  e.stopPropagation(); if (!state.chat) { toast("Send a first message to start this chat"); return; }
+  $("#titleMenu").classList.toggle("open");
+});
+$("#titleBtn").addEventListener("dblclick", () => { if (state.chat) renameInPlace($("#title"), state.chat.id); });
+$("#titleMenu").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-title-act]"); if (!b || !state.chat) return; $("#titleMenu").classList.remove("open");
+  const act = b.dataset.titleAct;
+  if (act === "rename") renameInPlace($("#title"), state.chat.id);
+  else if (act === "session") openSession();
+  else if (act === "panel") togglePanel(true);
+  else if (act === "delete") deleteChat(state.chat.id);
+});
+document.addEventListener("click", (e) => { if (!e.target.closest("#titleWrap")) $("#titleMenu").classList.remove("open"); });
 document.addEventListener("pointerdown", (e) => { if (!e.target.closest("#chatMenu")) closeChatMenu(); });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeChatMenu(); });
+// Compact: summarize older messages now (the server runs it like a short reply, see runs.manual_compact)
+$("#compactBtn").addEventListener("click", async () => {
+  const chat = state.chat; if (!chat || busy()) return;
+  state.runStarted = Date.now(); setRunStatus("running"); setStatusBar("Summarizing earlier messages");
+  try { await api("/api/runs", { method: "POST", body: JSON.stringify({ chatId: chat.id, compact: true }) }); }
+  catch (e) { toast(e.message); setRunStatus("idle"); }
+});
 window.addEventListener("blur", closeChatMenu);
 $("#toggleSide").addEventListener("click", () => $("#sidebar").classList.toggle("hidden"));
 $("#modelBtn").addEventListener("click", (e) => { e.stopPropagation(); openModelMenu(!$("#modelMenu").classList.contains("open")); });
@@ -961,7 +1082,7 @@ $("#modelFilter").addEventListener("keydown", (e) => {
   else if (e.key === "Escape") { e.stopPropagation(); openModelMenu(false); $("#input").focus(); }
 });
 $("#modelOptions").addEventListener("click", (e) => { const o = e.target.closest(".opt"); if (!o) return; setModel(o.dataset.name); openModelMenu(false); if (!state.chat) renderMessages(); $("#input").focus(); });
-document.addEventListener("click", (e) => { if (!e.target.closest(".picker")) openModelMenu(false); });
+document.addEventListener("click", (e) => { if (!e.target.closest("#modelPicker")) openModelMenu(false); });
 $("#thinkSel").addEventListener("change", (e) => api("/api/config", { method: "POST", body: JSON.stringify({ think: e.target.value }) }).catch(() => {}));
 // Close buttons (×) in dialog headers. "Later" semantics: approvals keep waiting on the server.
 document.addEventListener("click", (e) => { const b = e.target.closest("[data-close]"); if (b) b.closest(".back")?.classList.remove("open"); });
@@ -992,21 +1113,28 @@ $("#aaLater").addEventListener("click", hideApprovalDialogs); $("#aaDeny").addEv
 $("#previewLater").addEventListener("click", hideApprovalDialogs); $("#maLater").addEventListener("click", hideApprovalDialogs);
 $("#previewDiff").addEventListener("click", () => { if (state.approval) { state.approval.mode = "diff"; openApprovalPreview(); } });
 $("#previewContent").addEventListener("click", () => { if (state.approval) { state.approval.mode = "content"; openApprovalPreview(); } });
-$("#settingsBtn").addEventListener("click", openSettings); $("#sessionBtn").addEventListener("click", openSession);
+$("#settingsBtn").addEventListener("click", () => openSettings());
 $("#cancelSession").addEventListener("click", () => $("#sessionBack").classList.remove("open")); $("#saveSession").addEventListener("click", saveSession);
 $("#sessionBack").addEventListener("click", (e) => { if (e.target.id === "sessionBack") $("#sessionBack").classList.remove("open"); });
 $("#clearKey").addEventListener("click", () => { state.clearKey = true; $("#apiKey").value = ""; $("#apiKey").placeholder = "Saved key will be cleared when you Save"; $("#clearKey").disabled = true; });
 $("#checkUpdates").addEventListener("click", checkUpdates);
 $("#openUpdate").addEventListener("click", () => { if (state.updateUrl.startsWith("https://github.com/arothm/OpenAYDesktop/releases/")) window.open(state.updateUrl, "_blank", "noopener"); });
-$("#cancelSet").addEventListener("click", () => $("#modalBack").classList.remove("open")); $("#saveSet").addEventListener("click", saveSettings);
-$("#modalBack").addEventListener("click", (e) => { if (e.target.id === "modalBack") $("#modalBack").classList.remove("open"); });
+$("#cancelSet").addEventListener("click", closeSettings); $("#saveSet").addEventListener("click", saveSettings);
+$("#modalBack").addEventListener("click", (e) => { if (e.target.id === "modalBack") closeSettings(); });
 addEventListener("keydown", (e) => {
   if (e.ctrlKey && e.key.toLowerCase() === "n") { e.preventDefault(); newChat(); }
   else if (e.ctrlKey && e.key.toLowerCase() === "b") { e.preventDefault(); $("#sidebar").classList.toggle("hidden"); }
   else if (e.key === "Escape") {
-    if ($("#modelApproveBack").classList.contains("open") || $("#previewBack").classList.contains("open") || $("#actionApproveBack").classList.contains("open")) hideApprovalDialogs(); else if ($("#activityBack").classList.contains("open")) closeActivity(); else if ($("#skillsBack").classList.contains("open")) $("#skillsBack").classList.remove("open"); else if ($("#trashBack").classList.contains("open")) $("#trashBack").classList.remove("open"); else if ($("#sessionBack").classList.contains("open")) $("#sessionBack").classList.remove("open");
-    else if (document.querySelector("#projectsBack.open, #schedBack.open, #undoBack.open")) document.querySelectorAll("#projectsBack, #schedBack, #undoBack").forEach((b) => b.classList.remove("open"));
-    else if ($("#folderPop").classList.contains("open")) toggleFolderPop(false); else if ($("#modalBack").classList.contains("open")) $("#modalBack").classList.remove("open"); else if (state.editIndex !== null) { state.editIndex = null; updateEditBanner(); } else if (busy()) stop();
+    if (e.defaultPrevented) return;  // a text box (rename, filters) already handled it
+    if (document.getElementById("chatMenu") || document.querySelector(".menu.open, #modelMenu.open") || $("#folderPop").classList.contains("open")) {
+      closeChatMenu(); document.querySelectorAll(".menu.open, #modelMenu.open").forEach((m) => m.classList.remove("open")); toggleFolderPop(false); return;
+    }
+    if ($("#modelApproveBack").classList.contains("open") || $("#previewBack").classList.contains("open") || $("#actionApproveBack").classList.contains("open")) hideApprovalDialogs();
+    else if ($("#undoBack").classList.contains("open")) $("#undoBack").classList.remove("open");
+    else if ($("#sessionBack").classList.contains("open")) $("#sessionBack").classList.remove("open");
+    else if ($("#modalBack").classList.contains("open")) closeSettings();
+    else if (state.editIndex !== null) { state.editIndex = null; updateEditBanner(); }
+    else if (busy() && [$("#input"), document.body, null].includes(document.activeElement)) stop();
   }
 });
 setInterval(() => fetch("/api/ping").catch(() => {}), 5000); fetch("/api/ping").catch(() => {});
@@ -1025,7 +1153,7 @@ function renderPause() {
 $("#pauseCheck").addEventListener("click", () => loadBalance(true));
 $("#pauseStop").addEventListener("click", stop);
 $("#pauseRecharge").addEventListener("click", () => window.open("https://ollama.com/settings", "_blank", "noopener"));
-$("#editCancel").addEventListener("click", () => { state.editIndex = null; updateEditBanner(); $("#input").value = ""; state.attachments = []; renderAttachments(); autoGrow(); });
+$("#editCancel").addEventListener("click", () => { state.editIndex = null; updateEditBanner(); $("#input").value = ""; state.attachments = []; renderAttachments(); state.documents = []; renderDocs(); setPlan(false); autoGrow(); });
 
 // Undo this reply: shows what will be put back, then does it (undo.py on the server)
 async function openUndo(runId) {

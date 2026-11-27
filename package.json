@@ -1,7 +1,7 @@
 {
   "name": "open-ay-desktop",
   "productName": "Open AY Desktop",
-  "version": "1.14.2",
+  "version": "1.15.0",
   "description": "Desktop chat for Ollama Cloud models",
   "author": "arothm",
   "homepage": "https://github.com/arothm/OpenAYDesktop",

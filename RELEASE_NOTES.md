@@ -1,3 +1,46 @@
+# Open AY Desktop 1.15.0
+
+A new layout, a working indicator, Compact, background mode, and fixes from a full review.
+
+## New layout
+- **Sidebar:** New chat, search, projects and your sessions; at the bottom, your Ollama balance and Settings.
+- **Top:** the chat's name, with a menu (rename, session settings, terminal and preview, delete), and **Export** on the right.
+- **Message box:** attach, **Act / Plan** mode, dictation and send.
+- **Under the message box:** the chat's folders, Git level, a context gauge (used / window), **Compact**, tokens in and out, and the model. Click the model to change it; the menu also holds the Thinking setting.
+- **Settings** has one page per tab. Skills, Projects, Scheduled tasks, Activity and Trash now live there.
+
+## New
+- **Working line:** while a reply runs, a line above the message box shows what it's doing (thinking, writing, reading a file, running a command, waiting for you) and for how long.
+- **Compact:** summarize the older part of a chat now, keeping the latest messages word for word.
+- **Background mode** (Settings > App & updates):
+  - **Keep running in the tray** when you close the window;
+  - **Start with Windows**, in the tray, so scheduled tasks run with the window closed.
+- **Terminal:** command output appears as it runs, and a Stop button ends it.
+- **Retries:** when Ollama is busy, has a server error, or the connection drops before a reply finishes, the step is tried again (after 3, 10 and 30 seconds) instead of ending the reply.
+
+## Fixed
+- **Escape stopped a running reply** when you closed the right-click menu or cancelled a rename. Escape now closes only the menu, dialog or rename; it stops a reply only from the message box.
+- **Security: Git hooks.** The model could write a Git hook and have it run through a commit or a subtask's worktree, without "Run commands". Hooks no longer run for Git commands the app runs, and the file tools can't change files inside `.git`.
+- **Reading a one-line file** (minified code, one-line JSON) returned all of it into the chat. It's now cut at the normal read limit.
+- **Edit and resend** dropped the message's attached documents and its Plan mode.
+- **Preview** showed the old location of a copied or moved file.
+- **Scheduled tasks** that came due while the most replies were running left an empty chat and didn't run. They now wait and start when a reply finishes.
+- **Activity** didn't show "wrapping up" or a subtask waiting for its parent's answer.
+- **The chat didn't scroll** to a new reply when it started.
+
+## Faster
+- Long chats redraw only what changed, without re-rendering every message.
+- The chat list re-reads only chats that changed.
+- Quitting stops all replies at once.
+- Replies that ended a while ago, and their live updates, are cleared from memory.
+
+## Verification
+- 183 automated tests (16 new).
+- A live check in the window with a slow fake model: the working line, Escape with a menu open, every Settings tab, Compact, the model menu, terminal output and Stop, dark and light.
+- The packaged-app smoke test.
+
+---
+
 # Open AY Desktop 1.14.2
 
 A more reliable update check.

@@ -28,6 +28,13 @@ class ScheduleError(Exception):
     pass
 
 
+class Busy(Exception):
+    """The task couldn't start yet (the most replies are already running): it is tried again shortly."""
+
+
+BUSY_RETRY_FOR = 3600  # seconds a due task keeps waiting for a free slot before it counts as failed
+
+
 def path(data_dir):
     return os.path.join(data_dir, "schedules.json")
 
@@ -171,6 +178,7 @@ class Scheduler:
         self.data_dir_fn, self.start_fn = data_dir_fn, start_fn
         self.checked = datetime.now() - timedelta(hours=12)  # one catch-up for tasks missed while the app was closed
         self.thread = None
+        self.waiting = {}  # task id -> (task, first try): due tasks waiting for a free reply slot
 
     def run_in_background(self):
         self.thread = threading.Thread(target=self._loop, daemon=True, name="scheduler")
@@ -200,6 +208,11 @@ class Scheduler:
             if due:
                 _save(data_dir, items)
         self.checked = now
+        for tid, (t, since) in list(self.waiting.items()):  # tasks that were due while too many replies ran
+            if not any(x["id"] == tid and x.get("enabled", True) for x in load(data_dir)):
+                self.waiting.pop(tid, None)
+            elif tid not in {x["id"] for x in due}:
+                due.append(t)
         for t in due:
             self.run_task(t)
 
@@ -208,7 +221,17 @@ class Scheduler:
         try:
             chat_id = self.start_fn(task)
             result = {"lastChat": chat_id, "lastError": ""}
+            self.waiting.pop(task["id"], None)
+        except Busy as e:
+            first = self.waiting.get(task["id"], (task, time.time()))[1]
+            if time.time() - first < BUSY_RETRY_FOR:
+                self.waiting[task["id"]] = (task, first)
+                result = {"lastError": "Waiting to start: %s" % e}
+            else:
+                self.waiting.pop(task["id"], None)
+                result = {"lastError": "Didn't start: %s for an hour." % str(e).rstrip(".")}
         except Exception as e:  # noqa: BLE001
+            self.waiting.pop(task["id"], None)
             result = {"lastError": str(e)[:300]}
         with _lock:
             items = load(data_dir)

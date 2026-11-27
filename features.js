@@ -27,9 +27,11 @@ $("#projectMenu").addEventListener("click", (e) => {
   toast(state.projectFilter ? "New chats start in this project" : "Showing all chats");
 });
 
-async function openProjects(id) {
-  await loadProjects(); $("#projectsBack").classList.add("open");
-  editProject(id || state.projects[0]?.id || null);
+function openProjects(id) { openSettings("secProjects", { project: id }); }
+async function showProjects(id) {  // Settings > Projects
+  await loadProjects();
+  const pick = [id, proj.current, state.projects[0]?.id].find((x) => x && state.projects.some((p) => p.id === x));
+  editProject(pick || null);
 }
 function renderProjectList() {
   $("#projectList").innerHTML = state.projects.map((p) => `<button class="skill-item ${p.id === proj.current ? "sel" : ""}" data-pid="${esc(p.id)}" type="button"><span class="av c${hashIndex(p.id, 4)}">${esc(initials(p.name))}</span><span class="tx"><div class="n">${esc(p.name)}</div><div class="d">${(p.folders || []).length} folder${(p.folders || []).length === 1 ? "" : "s"}</div></span></button>`).join("")
@@ -81,11 +83,15 @@ $("#projDelete").addEventListener("click", async () => {
   const p = state.projects.find((x) => x.id === proj.current); if (!p || !confirm(`Delete the project "${p.name}" and its memory?\n\nIts chats stay, outside any project. Shared folders aren't touched.`)) return;
   try { await api("/api/projects/" + encodeURIComponent(p.id), { method: "DELETE" }); await loadProjects(); editProject(state.projects[0]?.id || null); loadChats(); toast("Project deleted"); } catch (e) { toast(e.message); }
 });
-$("#projNewChat").addEventListener("click", () => { state.projectFilter = proj.current; renderProjectPicker(); $("#projectsBack").classList.remove("open"); newChat(); renderChatList(); });
+$("#projNewChat").addEventListener("click", () => { state.projectFilter = proj.current; renderProjectPicker(); closeSettings(); newChat(); renderChatList(); });
 
 // ---------------------------------------------------------------- scheduled tasks
 const sched = { current: null, tasks: [] };
-async function openSchedules() { $("#schedBack").classList.add("open"); await loadSchedules(); editSchedule(sched.tasks[0]?.id || null); }
+function openSchedules() { openSettings("secSchedules"); }
+async function showSchedules() {  // Settings > Scheduled tasks
+  await loadSchedules();
+  editSchedule(sched.tasks.some((t) => t.id === sched.current) ? sched.current : sched.tasks[0]?.id || null);
+}
 async function loadSchedules() {
   try { sched.tasks = (await api("/api/schedules")).tasks; } catch (e) { sched.tasks = []; toast(e.message); }
   if (!state.projects.length) await loadProjects();
@@ -133,15 +139,14 @@ $("#schedRunNow").addEventListener("click", async () => {
   try {
     const r = await api("/api/schedules/run", { method: "POST", body: JSON.stringify({ id: sched.current }) });
     if (r.lastError) { toast(r.lastError); return; }
-    $("#schedBack").classList.remove("open"); await loadChats(); openChat(r.lastChat);
+    closeSettings(); await loadChats(); openChat(r.lastChat);
   } catch (e) { toast(e.message); }
 });
-$("#schedulesBtn").addEventListener("click", openSchedules);
 
 // ---------------------------------------------------------------- terminal and preview panel
 const panel = { tab: "terminal", lines: [] };
 function togglePanel(open) {
-  const show = open ?? $("#panel").hidden; $("#panel").hidden = !show; $("#panelBtn").classList.toggle("on", show);
+  const show = open ?? $("#panel").hidden; $("#panel").hidden = !show;
   if (show) { refreshPanel(); if (panel.tab === "terminal") $("#termInput").focus(); }
 }
 function setTab(tab) {
@@ -160,25 +165,49 @@ function refreshPanel() {
 }
 function renderTerminal() {
   const ran = (state.chat?.messages || []).filter((m) => m.tool_name === "run_command" && m.content).slice(-5).map((m) => ({ who: "model", text: m.content }));
-  const items = panel.lines.length ? panel.lines : ran;
-  $("#termOut").innerHTML = items.map((l) => `<div class="term-entry ${l.who}"><div class="who">${l.who === "you" ? "You ran" : "The model ran"}</div><pre>${esc(l.text)}</pre></div>`).join("")
+  const items = panel.lines.length ? panel.lines : ran; const box = $("#termOut");
+  const atEnd = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  box.innerHTML = items.map((l) => `<div class="term-entry ${l.who}${l.running ? " running" : ""}" data-key="${esc(l.key || "")}"><div class="who">${l.who === "you" ? (l.running ? "Running" : "You ran") : "The model ran"}${l.running && l.jobId ? `<button class="btn sm danger" type="button" data-stop-job="${esc(l.jobId)}">Stop</button>` : ""}</div><pre>${esc(l.text)}</pre></div>`).join("")
     || '<div class="empty-note">Commands you run here, and the last commands the model ran in this chat, appear here.</div>';
-  $("#termOut").scrollTop = $("#termOut").scrollHeight;
+  if (atEnd) box.scrollTop = box.scrollHeight;
+}
+async function followJob(entry) {  // output as it arrives, then the final report (exit code, time)
+  while (entry.running) {
+    let r;
+    try { r = await api(`/api/terminal/job?id=${encodeURIComponent(entry.jobId)}&since=${entry.since}`); }
+    catch (e) { entry.running = false; entry.text += "\n" + e.message; break; }
+    entry.live += r.output; entry.since = r.next;
+    if (r.done) { entry.running = false; entry.text = r.result || entry.text; renderTerminal(); }
+    else {  // only the output text changes while it runs, so the Stop button stays put under the pointer
+      entry.text = `$ ${r.line}\n(${r.seconds}s)\n\n${entry.live}`;
+      const box = $("#termOut"); const pre = box.querySelector(`[data-key="${entry.key}"] pre`);
+      if (!pre) renderTerminal();
+      else { const atEnd = box.scrollHeight - box.scrollTop - box.clientHeight < 40; pre.textContent = entry.text; if (atEnd) box.scrollTop = box.scrollHeight; }
+    }
+    if (entry.running) await new Promise((ok) => setTimeout(ok, 400));
+  }
+  renderTerminal();
 }
 $("#termForm").addEventListener("submit", async (e) => {
   e.preventDefault(); const command = $("#termInput").value.trim(); if (!command || !state.chat) return;
   $("#termRun").disabled = true; $("#termInput").value = "";
-  panel.lines.push({ who: "you", text: `$ ${command}\n(running…)` }); renderTerminal(); const entry = panel.lines[panel.lines.length - 1];
-  try { const r = await api("/api/terminal/run", { method: "POST", body: JSON.stringify({ chatId: state.chat.id, cwd: $("#termCwd").value, command }) }); entry.text = r.output; }
-  catch (err) { entry.text = `$ ${command}\n${err.message}`; }
-  $("#termRun").disabled = false; renderTerminal(); $("#termInput").focus();
+  const entry = { who: "you", text: `$ ${command}\n(starting…)`, running: true, jobId: "", since: 0, live: "", key: uid() }; panel.lines.push(entry); renderTerminal();
+  try {
+    const r = await api("/api/terminal/start", { method: "POST", body: JSON.stringify({ chatId: state.chat.id, cwd: $("#termCwd").value, command }) });
+    entry.jobId = r.jobId; entry.text = `$ ${r.line}\n`; renderTerminal(); followJob(entry);
+  } catch (err) { entry.running = false; entry.text = `$ ${command}\n${err.message}`; renderTerminal(); }
+  $("#termRun").disabled = false; $("#termInput").focus();
+});
+$("#termOut").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-stop-job]"); if (!b) return; b.disabled = true;
+  api("/api/terminal/stop", { method: "POST", body: JSON.stringify({ jobId: b.dataset.stopJob }) }).catch((err) => toast(err.message));
 });
 // Preview: files this chat created or edited (from its tool steps), shown sandboxed (see server.preview_file)
 function changedFiles() {
   const out = [];
   for (const m of state.chat?.messages || []) {
     if (!["write_file", "edit_file", "copy_path", "move_path"].includes(m.tool_name) || m.isError) continue;
-    const p = String(m.display || "").trim(); if (p && !out.includes(p)) out.push(p);
+    const p = String(m.target || m.display || "").trim(); if (p && !out.includes(p)) out.push(p);
   }
   return out.reverse();
 }
@@ -209,7 +238,7 @@ async function showPreview() {
 }
 $("#previewPick").addEventListener("change", showPreview); $("#previewReload").addEventListener("click", showPreview);
 $("#tabTerminal").addEventListener("click", () => setTab("terminal")); $("#tabPreview").addEventListener("click", () => setTab("preview"));
-$("#panelBtn").addEventListener("click", () => togglePanel()); $("#panelClose").addEventListener("click", () => togglePanel(false));
+$("#panelClose").addEventListener("click", () => togglePanel(false));
 addEventListener("keydown", (e) => { if (e.ctrlKey && e.key.toLowerCase() === "j") { e.preventDefault(); togglePanel(); } });
 function onChatChanged() { panel.lines = []; renderTerminal(); refreshPanel(); }
 

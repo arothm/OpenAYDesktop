@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It runs as an **Electron** desktop app, with a local Python 3 server (standard library only) doing the work. It can also still open in an Edge or Chrome app window without Electron. There is no frontend framework or build step for the interface itself.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.14.2
+- **Version:** 1.15.0
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -15,8 +15,10 @@ The application was previously named Ollama Desk. Existing chats, folder grants,
   - On npm 11 or newer, Electron's binary isn't downloaded automatically. If `node_modules\electron\dist\electron.exe` is missing afterwards, run `node node_modules\electron\install.js` once.
 - **Start:** double-click **`Open AY Desktop (Electron).cmd`**, or run `npm start`. It uses this folder's `data/`, so your existing chats and settings carry over.
 - **Closing the window:**
-  - with no replies running, it quits;
+  - with **Keep running in the tray** on (Settings > App & updates), it hides to the system tray: replies and scheduled tasks keep running, and the tray icon's menu quits;
+  - otherwise, with no replies running, it quits;
   - with replies running, it asks whether to **keep them running in the background**, from a system-tray icon, or **stop them and quit**.
+- **Start with Windows** (Settings > App & updates) opens the app in the tray when you sign in, so scheduled tasks run without opening the window.
 - **Shutdown:** quitting shuts the local server down. If Electron itself crashes, the server notices and stops within a second.
 - **One copy at a time:** starting the app again brings up the open window. In development it also reuses a server already running from this folder, so two servers never write to the same `data/`.
 - **Locked-down window:** the page has no access to Node or the file system. Only Windows' own folder picker (Browse…) is exposed. Navigation stays inside the app, and https links open in your normal browser.
@@ -48,7 +50,7 @@ The application was previously named Ollama Desk. Existing chats, folder grants,
 The Settings dialog contains only:
 
 1. **Ollama API Key** — a password field, saved-key indication, and Clear button. Leaving the field blank preserves the key; **Clear saved API key** takes effect when you click Save. Create a key at https://ollama.com/settings/keys. Alternatively, set the `OLLAMA_API_KEY` environment variable.
-2. **Default Model** — populated from Ollama Cloud's available models. It applies to new chats. Existing chats retain their selected model, and the header picker can change the current chat's model.
+2. **Default Model** — populated from Ollama Cloud's available models. It applies to new chats. Existing chats retain their selected model, and the model picker under the message box changes the current chat's model.
 3. **Limits**:
    - **Tokens per day** and **Tokens per chat** count tokens sent and generated, as Ollama reports them; 0 turns a limit off. When a limit is reached, replies stop with a message until you raise the limit.
    - **Replies at the same time** (default 4) caps how many replies, subtasks included, can run at once.
@@ -56,10 +58,10 @@ The Settings dialog contains only:
    - **Allowed commands**: see *Running commands* below.
    - **Pause at balance ($)** (default 1, 0 = off): see *Balance guard* below.
 
-   The usage line under the message box shows your Ollama balance and today's tokens against the daily limit.
+   The sidebar shows your Ollama balance; Settings > Usage & limits shows today's tokens against the daily limit.
 4. **Check for Updates** — checks the latest release at https://github.com/arothm/OpenAYDesktop/releases using GitHub's public API. It reports the installed version, update availability, no-published-release state, or a connection error. If an update exists, **Open Latest Release** opens that release page. Nothing is downloaded or installed automatically.
 
-The app no longer supports local Ollama, a custom Ollama URL, or local model discovery. The Ollama desktop app is not required. The header still exposes the model picker and thinking/reasoning effort.
+The app no longer supports local Ollama, a custom Ollama URL, or local model discovery. The Ollama desktop app is not required. The model picker (under the message box) also sets thinking/reasoning effort.
 
 ## Folder access
 Folder access is set per chat. Click the folder icon next to the message box and add folders with **Browse…** or by pasting a path. Only that chat can use them, and new chats start with none. The model gets tools to list, search and read files in those folders and nowhere else.
@@ -82,7 +84,7 @@ In review mode, every change needs explicit approval:
 - If the file changes on disk after you reviewed it, the approved write is refused instead of overwriting the newer content.
 
 ## Trash
-The 🗑 button in the sidebar opens the Trash. It holds two kinds of items:
+Settings > Trash lists it. It holds two kinds of items:
 - **Deleted:** files or folders a session removed with recoverable deletion.
 - **Earlier version:** the content a file had before a session overwrote or edited it.
 
@@ -91,7 +93,7 @@ The 🗑 button in the sidebar opens the Trash. It holds two kinds of items:
 The number on the folder icon shows how many folders the current chat can access. Tool calling needs a compatible model; small models sometimes say they did something without actually calling the tool.
 
 ## Session settings
-The **Session** button in the header opens settings for the current chat only. The server stores them with the chat and checks them on every tool call.
+**Session settings**, in the menu on the chat's name (top left), are for the current chat only. The server stores them with the chat and checks them on every tool call.
 
 A chat's folders, permissions and name are **server-owned**. Normal chat saves from the window can't change them, even from an outdated copy. They change only through the validated `/api/session/permissions` and `/api/session/rename` endpoints. A new chat keeps the folders you picked before its first message, but always starts with the default permissions below.
 
@@ -133,7 +135,7 @@ Web pages are written by strangers and can contain text aimed at steering the mo
 One gap remains: the model could still put private information into a search query. The model is told not to, but the app can't check it, so turn on web search only for chats where that risk is acceptable.
 
 ## Skills
-A skill is a set of instructions you write once and turn on per chat, for example how to review code or the style to write in. Open **✦** in the sidebar to:
+A skill is a set of instructions you write once and turn on per chat, for example how to review code or the style to write in. Open **Settings > Skills** to:
 - create, edit or delete skills;
 - import a Markdown file. An optional `name:` and `description:` header between `---` lines is read;
 - import a **skill folder** in the open Agent Skills format, the same skills Claude, Codex, Cursor and others use. Use **Import folder** for a folder with a `SKILL.md`, or **Import file** for a `.skill` or `.zip` package.
@@ -159,6 +161,7 @@ The **Git and GitHub** session setting gives the model Git tools for repositorie
 
 Safety rules, enforced by the server (`gittools.py`):
 - **Whole repositories only.** A repository is usable only if its **top folder** is inside a shared folder, so sharing a subfolder doesn't open up the whole repository. Committing needs **Allow edits** on that folder.
+- **No hooks.** Git hooks don't run for Git commands the app runs (commits, merges, pushes, subtask worktrees), and the file tools can't change anything inside a `.git` folder. A hook is a program: otherwise the model could plant one and have it run without **Run commands**.
 - **No smuggled options.** Git runs without a shell. Branch, remote and commit names are checked so they can't be read as options, and file paths are passed after `--` and must stay inside the repository.
 - **No hidden programs.** External diff programs, text conversion filters and `core.fsmonitor` are switched off, and Git and GitHub CLI prompts are disabled, so nothing can hang waiting for input.
 - **Nothing changes after review.** If the files change after you've reviewed a commit, or the branch moves after you've reviewed a push or pull request, it's refused and nothing happens.
@@ -204,38 +207,41 @@ With **Allow subtasks** on, the model can hand self-contained pieces of work to 
 - **Stopped and deleted with the parent.** Stopping the parent stops its subtasks, and deleting the parent deletes them.
 
 ## Balance guard
-The app reads your Ollama account balance from `GET https://ollama.com/api/balance`, using your API key. The balance is your remaining plan allowance plus purchased credits, and it's shown in the usage line under the message box, in amber when it's within $0.50 of your pause amount and in red at or below it. The server re-checks it before every model request. The value is cached for 30 seconds and shared by all replies, because Ollama allows about 10 balance checks a minute.
+The app reads your Ollama account balance from `GET https://ollama.com/api/balance`, using your API key. The balance is your remaining plan allowance plus purchased credits, and it's shown at the bottom of the sidebar, in amber when it's within $0.50 of your pause amount and in red at or below it. The server re-checks it before every model request. The value is cached for 30 seconds and shared by all replies, because Ollama allows about 10 balance checks a minute.
 
 When the balance is **at or below the pause amount** set in Settings (default $1):
 - **Every running reply wraps up.** It finishes the step it's on. A reply that has already done some work then makes **one last short request without tools**, asking the model to summarise what it did and what's left. That summary is marked *wrap-up*. A reply that hasn't started yet doesn't spend anything.
 - **The reply pauses.** The chat shows a banner with **Recharge…**, **Check now** and **Stop**, the sidebar shows a red dot, and Activity lists it as *paused: low balance*. New messages also pause until the balance is back up.
 - **It continues by itself.** It re-checks about once a minute, or at once when you click **Check now**. When the balance is above the pause amount again, it adds an automatic note ("continue the work from where you stopped") and carries on.
 
-If the balance can't be read, for example because Ollama changes its API, replies keep working and the usage line says *Balance unavailable*. The wrap-up request itself costs a little, so the pause amount works as a reserve, not a hard cap.
+If the balance can't be read, for example because Ollama changes its API, replies keep working and the sidebar says *Balance unavailable*. The wrap-up request itself costs a little, so the pause amount works as a reserve, not a hard cap.
 
 ## Activity
-**⚡** in the sidebar lists every running reply across all chats, subtasks included. For each one it shows the status (running, or waiting for you), model, time, steps and tokens, with **Open** and **Stop** buttons. Below that are the most recently finished replies and how they ended (done, stopped, or error).
+**Settings > Activity** lists every running reply across all chats, subtasks included. For each one it shows the status (running, waiting for you, wrapping up, paused, or a subtask asking its parent), model, time, steps and tokens, with **Open** and **Stop** buttons. Below that are the most recently finished replies and how they ended (done, stopped, or error).
 
 ## Replies run on the server
 Each reply runs on the app's local server (`runs.py`): the model answers, calls tools, gets their results, and continues, up to 25 steps. The window shows it live through an event stream. As a result:
 - **Switching chats or closing the window doesn't stop a reply.** Reopen the chat to see where it got to. The background server keeps running while any reply is in progress.
 - **Several chats can reply at the same time.** A pulsing dot in the sidebar marks chats that are replying, and an amber dot marks chats waiting for your approval.
-- **Stop** (the ■ button, or Escape) ends the current chat's reply, including one that's waiting for approval.
+- **Above the message box**, a working line shows what the reply is doing (thinking, writing, reading a file, running a command, waiting for you) and for how long.
+- **Stop** (the ■ button, or Escape in the message box) ends the current chat's reply, including one that's waiting for approval. Escape in a menu, a dialog or a rename only closes that.
+- **Temporary Ollama errors are retried.** When Ollama answers "busy" or a server error, or the connection drops before a reply finishes, the step is tried again after 3, 10 and 30 seconds, with a note in the reply. Only then does the reply stop with the error.
 - **Edit and resend** shows a banner. The earlier message and everything after it are replaced only when you send.
 - While a reply runs, its chat's messages and model can't be changed from elsewhere. Folders and permissions can still change, and they take effect at the next tool call.
 
 ## Context, tokens and cost
-Ollama Cloud bills per token, and input it has seen before at the start of a request ("cached input") costs far less, often about a tenth. So the app keeps the start of every request the same from step to step and turn to turn: instructions and tools first, then the history, and anything that changes per request at the end. Ollama reports how much was cached, and the usage line shows it.
+Ollama Cloud bills per token, and input it has seen before at the start of a request ("cached input") costs far less, often about a tenth. So the app keeps the start of every request the same from step to step and turn to turn: instructions and tools first, then the history, and anything that changes per request at the end. Ollama reports how much was cached; hover the token count under the message box to see it.
 
 Before each request the server fits the conversation into the **context budget** (Settings > Usage & context):
 - **Full** (default) uses the model's whole window. **Balanced** (64k tokens) and **Economy** (32k) send less per request; they suit models without cached-input pricing.
 - Everything sent counts: messages, tool definitions and instructions.
 - Tool results from earlier turns are shortened, and the model can call the tool again.
 - Past the budget, the older turns are replaced by a summary the chat's model writes, kept until the next one. Your own earlier messages stay next to it, shortened and in order, so details you gave aren't lost. A "View summary" divider shows where it starts. If a summary can't be made, the oldest turns are left out instead.
-- A file is read up to 800 lines (about 28,000 characters) at a time, with a note saying where to continue.
+- A file is read up to 800 lines (about 28,000 characters) at a time, with a note saying where to continue. A single very long line (minified code, a one-line JSON file) is cut at that length.
+- **Compact** (under the message box) summarizes the older part of the chat now, keeping the latest messages word for word, so the next requests are smaller.
 - Pictures are shrunk to at most 1600 pixels on the long side before sending. Models that bill by resolution use far fewer tokens: one test screenshot went from 5,069 to 1,579 tokens with the same answer.
 
-The line under the message box shows how full the context was, the share of this chat's input that came from the cache, and today's totals (kept in `data/usage.json` for 90 days).
+The row under the message box shows the chat's folders, Git level, a context gauge (tokens in the last request out of the model's window), **Compact**, the tokens this chat sent and received, and the model. Today's totals are in Settings > Usage & limits (kept in `data/usage.json` for 90 days).
 
 ## Projects and memory
 - **Projects** (the switcher under the search box, or Manage projects) group chats. A project has folders, starting permissions, skills, written instructions and its own memory. New chats in the project start with all of them.
@@ -243,25 +249,31 @@ The line under the message box shows how full the context was, the share of this
 - **Instruction files**: `AGENTS.md`, `CLAUDE.md` or `.openay/instructions.md` at the top of a shared folder are followed by the chat (Session settings can turn this off). They can't change permissions.
 
 ## Plan mode, undo and documents
-- **Plan** (next to the folder button) asks for a plan first: the model only gets tools that read, and the server refuses anything else. Then **Carry out this plan**, or reply with changes.
+- **Mode** (next to the paperclip) switches between **Act** and **Plan**. Plan asks for a plan first: the model only gets tools that read, and the server refuses anything else. Then **Carry out this plan**, or reply with changes.
 - **Undo changes** under a reply puts back every file it created, edited, moved or deleted. Files changed again afterwards are skipped and listed, and what undo replaces goes to the Trash, so an undo can be undone. Commands and Git actions can't be undone and are listed as such.
 - **Documents**: attach PDF, Word, Excel, PowerPoint, CSV, JSON, code or text files with the paperclip, by pasting, or by dropping. Their text goes to the model with your message. Scanned PDFs have no text: attach page images instead.
 
 ## Scheduled tasks, terminal and preview
-- **Scheduled tasks** (clock icon) start a new chat with a prompt every day, on weekdays, weekly, every few hours, or once, in a project if you like. They run while the app is open or in the tray. A run missed while the app was closed happens once when it next starts.
-- **Terminal and preview** (Ctrl+J or the panel button): run commands you type in a writable shared folder, and see the commands the model ran. Preview shows files the chat changed: HTML pages run in a sandbox with no access to the app, Markdown is rendered, and images and text are shown.
+- **Scheduled tasks** (Settings > Scheduled tasks) start a new chat with a prompt every day, on weekdays, weekly, every few hours, or once, in a project if you like. They run while the app is open or in the tray (see *Keep running in the tray* and *Start with Windows*). A run missed while the app was closed happens once when it next starts (within 12 hours). When the most replies are already running, a due task waits and starts as soon as one finishes (for up to an hour).
+- **Terminal and preview** (Ctrl+J, or the menu on the chat's name): run commands you type in a writable shared folder, watch their output as it comes, and stop them; see the commands the model ran. Preview shows files the chat changed: HTML pages run in a sandbox with no access to the app, Markdown is rendered, and images and text are shown.
 - **Search** under New chat looks through every chat's messages, not just titles, and jumps to the matching message.
-- **Export** (header button) saves the chat as Markdown.
+- **Export** (top right) saves the chat as a Markdown file.
 - **Quick entry**: Ctrl+Alt+Space opens the app on a new chat from anywhere (Settings > App & updates).
 - **Dictation** (microphone button) uses Windows speech recognition, offline. It needs a speech language installed and microphone access for desktop apps.
 
 ## Software updates
 The installed app checks GitHub Releases at start and every 6 hours (Settings > App & updates > Check now). With **Install updates automatically** on, a new version downloads in the background and installs when the app closes. Otherwise Settings offers Download and Restart. Chats and settings are kept. Version 1.12.0 is the first with the updater, so moving from 1.11 or older needs one manual install.
 
+## The window
+- **Sidebar:** New chat, search, the project switcher, your sessions (subtasks under their parent), and at the bottom the Ollama balance and Settings.
+- **Top:** the chat's name, with a menu (rename, session settings, terminal and preview, delete), and **Export** on the right.
+- **Message box:** attach (paperclip), mode (**Act** or **Plan**), dictation (microphone) and send. Above it, the working line while a reply runs; under it, folders, Git, the context gauge, **Compact**, tokens and the model.
+- **Settings** has one page per tab: Connection, Usage & limits, Memory, Commands, Skills, Projects, Scheduled tasks, Activity, Trash, and App & updates.
+
 ## Features
 Streaming replies, Markdown and code highlighting, collapsible thinking/reasoning panels, image and document attachments, stop, regenerate, edit-and-resend, full-text search, projects, memory, plan mode, undo, scheduled tasks, a terminal and preview panel, export, and server-approved folder tools.
 
-Rename a chat by double-clicking its name in the header or sidebar, or right-click it in the sidebar for Open, Rename and Delete. Right-clicking text or a text box gives Cut, Copy, Paste and Select all, with spelling suggestions.
+Rename a chat by double-clicking its name at the top left or in the sidebar, from the menu on its name, or by right-clicking it in the sidebar (Open, Rename and Delete). Right-clicking text or a text box gives Cut, Copy, Paste and Select all, with spelling suggestions.
 
 **Isolated subtasks**: with Git set to commit or more and subtasks on, the model can start a helper with `isolated: true`. The helper works in its own Git worktree and branch (`openay/<chat id>`), so several helpers can change code at once without touching your working tree. Its work is committed on that branch when it finishes, and `git_merge` brings it in after you approve. Deleting the helper chat removes the worktree; the branch stays.
 

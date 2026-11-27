@@ -89,6 +89,10 @@ SUBTASK_REMINDERS = 2         # times a reply is reminded of unread subtasks bef
 HISTORY = 30                  # finished replies kept for the Activity view
 BALANCE_RECHECK = 60          # seconds between balance checks while paused
 STOP_GRACE = 3                # seconds after Stop before a reply that is still busy is ended anyway
+RETRY_CODES = {408, 425, 429, 500, 502, 503, 504, 529}  # Ollama errors that usually pass: the step is tried again
+RETRY_DELAYS = (3, 10, 30)    # seconds before each retry
+MANUAL_KEEP_TOKENS = 4_000    # "Compact" keeps about this much of the most recent conversation word for word
+IDLE_FORGET = 600             # seconds after a reply ends before the engine forgets it (and its live events)
 SESSION_FIELDS = ("title", "folders", "capabilities", "skills", "projectId", "untrusted", "webUrls")  # changed by the user, not the reply
 STUCK_STEP = "Stopped: this step didn't finish, so the reply was ended when you pressed Stop."
 WRAP_UP_NOTE = ("The user's Ollama balance is nearly used up, so this work must pause now. Do not call any tools. "
@@ -137,9 +141,12 @@ class Channel:
         self.cond = threading.Condition()
         self.events = []
         self.seq = 0
+        self.subscribers = 0       # open windows following this chat (see server._events)
+        self.last = time.time()    # last event, for forgetting idle chats (Engine.prune)
 
     def publish(self, event):
         with self.cond:
+            self.last = time.time()
             self.seq += 1
             self.events.append((self.seq, event))
             if len(self.events) > EVENT_BUFFER:
@@ -182,6 +189,7 @@ class Engine:
     def statuses(self):
         """Every running reply's status: running, waiting (for you), paused (low balance) or wrapping (its last
         request before pausing)."""
+        self.prune()
         return {cid: ("wrapping" if r.wrapping_up and r.status == "running" else r.status)
                 for cid, r in list(self.runs.items()) if r.alive}
 
@@ -214,6 +222,35 @@ class Engine:
             self.runs[chat_id] = run
         run.thread.start()
         return run
+
+    def running_count(self):
+        return sum(1 for r in list(self.runs.values()) if r.alive)
+
+    def prune(self):
+        """Forget replies that ended a while ago, and the live events of chats no window follows, so memory
+        doesn't grow with every chat opened since the app started. A finished subtask is kept while its parent runs."""
+        now = time.time()
+        with self.lock:
+            for cid, r in list(self.runs.items()):
+                if r.alive or not r.ended or now - r.ended < IDLE_FORGET or (r.parent is not None and r.parent.alive):
+                    continue
+                del self.runs[cid]
+            for cid, ch in list(self.channels.items()):
+                if cid not in self.runs and ch.subscribers <= 0 and now - ch.last > IDLE_FORGET:
+                    del self.channels[cid]
+
+    def stop_all(self, wait=5):
+        """Stop every reply at once (quitting), then wait up to `wait` seconds in total for them to end."""
+        stopping = [r for r in list(self.runs.values()) if r.alive]
+        for r in stopping:
+            r.cancel()
+        end = time.time() + wait
+        for r in stopping:
+            r.thread.join(max(0, end - time.time()))
+        for r in stopping:
+            if r.thread.is_alive():
+                r.abandon()
+        return len(stopping)
 
     def balance_changed(self):
         """Wake paused replies so they re-check the balance now."""
@@ -277,6 +314,7 @@ class Run:
         self.response = None
         self.use_tools = True
         self.plan = bool(options.get("plan"))      # plan mode: read-only tools and a plan as the answer
+        self.compact_only = bool(options.get("compact"))  # "Compact": summarize older messages now, no reply
         self.compaction_failed = False             # summarize at most once per failed attempt per reply
         self.run_id = secrets.token_hex(6)         # tags file versions this reply kept, for "Undo this reply"
         think = options.get("think")
@@ -299,6 +337,9 @@ class Run:
                     msgs.pop()
                 if not msgs:
                     raise RunError("There is nothing to regenerate.")
+            elif options.get("compact"):
+                if sum(1 for m in msgs if m.get("role") == "user" and not m.get("auto")) < 2:
+                    raise RunError("There is nothing to compact yet: this chat has only one message from you.")
             else:
                 at = options.get("truncateAt")
                 if at is not None:  # edit and resend: drop that user message and everything after it
@@ -354,7 +395,7 @@ class Run:
         except (OSError, ValueError):
             pass
         return {"type": "snapshot", "chat": chat, "status": self.status, "approval": self.public_approval(),
-                "pause": copy.deepcopy(self.pause)}
+                "pause": copy.deepcopy(self.pause), "started": int(self.started * 1000)}
 
     def refresh_session(self, disk):
         """The user renamed the chat or changed its settings while this reply runs: keep this copy current and
@@ -409,7 +450,7 @@ class Run:
             if self.detached:
                 return
             self.status = status
-            self.publish({"type": "status", "status": status, "model": self.chat.get("model")})
+            self.publish({"type": "status", "status": status, "model": self.chat.get("model"), "started": int(self.started * 1000)})
 
     def save(self):
         """Write messages, model and usage; folders/permissions/title keep what is on disk."""
@@ -436,8 +477,11 @@ class Run:
 
     def summary(self):
         with self.lock:
+            status = self.status if self.alive else (self.outcome or "done")
+            if self.alive and status == "running":
+                status = "wrapping" if self.wrapping_up else "asking" if self.question is not None else status
             return {"chatId": self.chat_id, "title": self.chat.get("title", ""), "parentId": self.chat.get("parentId"),
-                    "model": self.chat.get("model", ""), "status": self.status if self.alive else (self.outcome or "done"),
+                    "model": self.chat.get("model", ""), "status": status,
                     "approval": self.approval["kind"] if self.approval else None, "started": int(self.started * 1000),
                     "pause": copy.deepcopy(self.pause),
                     "seconds": int((self.ended or time.time()) - self.started), "steps": self.steps, "tokens": self.tokens,
@@ -488,6 +532,9 @@ class Run:
             if not srv.api_key(srv.load_config()):
                 self.add({"role": "assistant", "content": "", "model": self.chat.get("model", ""),
                           "error": "Add your Ollama API key in Settings to use Ollama Cloud."})
+                return
+            if self.compact_only:
+                self.manual_compact()
                 return
             for step in range(MAX_STEPS):
                 if self.cancelled.is_set() or not self.balance_gate():
@@ -621,13 +668,13 @@ class Run:
         return body, info
 
     # ------------------------------------------------------------ compaction (see context_budget.py)
-    def compact(self, model, history, compaction, context_tokens, budget_name, overhead):
+    def compact(self, model, history, compaction, context_tokens, budget_name, overhead, keep_budget=None):
         """Summarize older turns with the chat's model so the request fits the context budget.
 
         Big histories are folded chunk by chunk: each request gets the summary so far plus the next
         chunk. On any failure the request falls back to leaving out the oldest turns."""
         srv = self.srv
-        plan = context_budget.plan_compaction(history, compaction, context_tokens, budget_name, overhead)
+        plan = context_budget.plan_compaction(history, compaction, context_tokens, budget_name, overhead, keep_budget=keep_budget)
         if not plan:
             self.compaction_failed = True
             return
@@ -652,6 +699,27 @@ class Run:
             self.compaction_failed = True
         finally:
             self.publish({"type": "compacting", "active": False})
+
+    def manual_compact(self):
+        """The user pressed Compact: summarize everything but the latest messages now, so later requests are smaller."""
+        model = self.chat["model"]
+        with self.lock:
+            history = [m for m in copy.deepcopy(self.chat["messages"]) if not m.get("_live")]
+            compaction = copy.deepcopy(self.chat.get("compaction"))
+        before = (context_budget.valid_compaction(history, compaction) or {}).get("upTo", 0)
+        context_tokens = self.srv.model_info(model).get("context_length")
+        budget_name = self.srv.load_config().get("contextBudget")
+        possible = context_budget.plan_compaction(history, compaction, context_tokens, budget_name, 0, keep_budget=MANUAL_KEEP_TOKENS)
+        if not possible:
+            self.publish({"type": "compact_done", "ok": False, "error": "Nothing older to summarize yet: only the latest messages are left."})
+            return
+        self.compaction_failed = False
+        self.compact(model, history, compaction, context_tokens, budget_name, 0, keep_budget=MANUAL_KEEP_TOKENS)
+        after = (self.chat.get("compaction") or {}).get("upTo", 0)
+        if after > before and not self.compaction_failed:
+            self.publish({"type": "compact_done", "ok": True, "messages": after})
+        else:
+            self.publish({"type": "compact_done", "ok": False, "error": "Couldn't summarize this chat just now. Try again in a moment."})
 
     def summarize(self, model, previous, chunk):
         srv = self.srv
@@ -678,22 +746,58 @@ class Run:
             self.update(idx, error=reason, _live=None, thinking=None)
             return
         self.steps += 1
+        attempt = 0
         while True:
             body, info = self.build_request(model)
             try:
                 r = srv.upstream("/api/chat", body)
-                break
             except urllib.error.HTTPError as e:
                 msg = srv.http_error_text(e)
                 if self.use_tools and "does not support tools" in msg.lower():
                     self.use_tools = False  # retry this step without any tools
                     self.update(idx, notice="This model doesn't support tools, so folder access is off for this reply.")
                     continue
-                self.update(idx, error=msg, _live=None, thinking=None)
+                if e.code in RETRY_CODES and self.retry_wait(idx, attempt, "Ollama Cloud answered %d (%s)" % (e.code, msg[:120])):
+                    attempt += 1
+                    continue
+                self.update(idx, error=msg, _live=None, thinking=None, notice=None)
                 return
             except Exception as e:  # noqa: BLE001
-                self.update(idx, error="Could not reach Ollama Cloud: %s" % e, _live=None, thinking=None)
+                if not self.cancelled.is_set() and self.retry_wait(idx, attempt, "Couldn't reach Ollama Cloud (%s)" % e):
+                    attempt += 1
+                    continue
+                self.update(idx, error="Could not reach Ollama Cloud: %s" % e, _live=None, thinking=None, notice=None)
                 return
+            tool_calls, final, error, broken = self.read_stream(idx, r)
+            if broken and not self.cancelled.is_set() and not tool_calls:
+                # The connection ended before the reply finished: start this step again from the beginning.
+                if self.retry_wait(idx, attempt, "The connection to Ollama ended before the reply finished", reset=True):
+                    attempt += 1
+                    continue
+                error = "The connection to Ollama ended before the reply finished. Send a message to continue."
+            break
+        if attempt:
+            self.update(idx, notice=None)
+        fields = {"_live": None}
+        stats = []
+        if final:
+            stats.append(self.record_usage(final, info))
+        if self.cancelled.is_set():
+            stats.append("stopped")
+        if error:
+            fields["error"] = error
+        if tool_calls and not self.cancelled.is_set():
+            fields["tool_calls"] = tool_calls
+        if stats and any(stats):
+            fields["stats"] = " · ".join(s for s in stats if s)
+        with self.lock:
+            if not self.chat["messages"][idx].get("thinking"):
+                fields["thinking"] = None
+        self.update(idx, **fields)
+
+    def read_stream(self, idx, r):
+        """Stream one model response into message idx. Returns (tool calls, final chunk, error, broken):
+        broken means the connection ended without Ollama's final "done" chunk."""
         with self.lock:
             self.response = r
         tool_calls, final, error = [], None, None
@@ -721,28 +825,27 @@ class Run:
                         tool_calls.extend(msg["tool_calls"])
                     if j.get("done"):
                         final = j
+                        break
         except Exception as e:  # noqa: BLE001 - includes the read failing after Stop closed it
             if not self.cancelled.is_set():
-                error = str(e)
+                return tool_calls, None, None, True
         finally:
             with self.lock:
                 self.response = None
-        fields = {"_live": None}
-        stats = []
-        if final:
-            stats.append(self.record_usage(final, info))
-        if self.cancelled.is_set():
-            stats.append("stopped")
-        if error:
-            fields["error"] = error
-        if tool_calls and not self.cancelled.is_set():
-            fields["tool_calls"] = tool_calls
-        if stats and any(stats):
-            fields["stats"] = " · ".join(s for s in stats if s)
-        with self.lock:
-            if not self.chat["messages"][idx].get("thinking"):
-                fields["thinking"] = None
-        self.update(idx, **fields)
+        return tool_calls, final, error, final is None and error is None and not self.cancelled.is_set()
+
+    def retry_wait(self, idx, attempt, why, reset=False):
+        """Wait before trying a model request again (temporary errors). False when out of retries or stopped."""
+        if attempt >= len(RETRY_DELAYS) or self.cancelled.is_set():
+            return False
+        delay = RETRY_DELAYS[attempt]
+        if reset:  # drop what the broken response streamed, so the retry starts clean
+            with self.lock:
+                if not self.detached:
+                    self.chat["messages"][idx].update(content="", thinking="")
+        self.update(idx, notice="%s. Trying again in %d s (attempt %d of %d)…" % (why, delay, attempt + 2, len(RETRY_DELAYS) + 1))
+        self.cancelled.wait(delay)
+        return not self.cancelled.is_set()
 
     def count_usage(self, prompt, output, cached=0):
         """Add tokens to this chat and today's totals. Returns (chat usage, today).
@@ -1140,7 +1243,10 @@ class Run:
             display = "%s/%s" % (args.get("skill") or "?", str(args.get("path") or ".").lstrip("./") or ".")
         if name == "search_files" and args.get("contains"):
             display = '"%s"%s' % (args["contains"], (" in " + args["path"]) if args.get("path") else "")
-        idx = self.add({"role": "tool", "tool_name": name, "content": "", "display": str(display), "_running": True})
+        message = {"role": "tool", "tool_name": name, "content": "", "display": str(display), "_running": True}
+        if name in ("copy_path", "move_path") and args.get("destination"):  # where the file is now (for Preview)
+            message.update(display="%s → %s" % (args.get("source") or "", args["destination"]), target=str(args["destination"]))
+        idx = self.add(message)
         undo.set_context(self.chat_id, self.run_id)  # file changes made now are journaled for "Undo this reply"
         gittools.set_cancel(self.cancelled)  # Git calls end as soon as Stop is pressed
         try:

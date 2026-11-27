@@ -12,6 +12,9 @@ Safety:
   - Commands run without a shell. Branch, remote and revision names are checked so they can't
     be read as options, and paths are passed after "--".
   - External diff/textconv programs and core.fsmonitor are disabled; terminal prompts are off.
+  - Git hooks never run for Git commands the app runs (core.hooksPath points at an empty folder):
+    a hook is a program, and the model could otherwise plant one (in .husky/, say) and have it run
+    by a commit or a worktree checkout without "Run commands". The file tools can't write inside .git.
   - Git and gh get no stdin, and a timeout stops the whole process tree (see call()).
   - Commits and pushes are fingerprinted when reviewed and refused if anything changed since.
   - Force-push is not offered. Credentials stay with Git / the GitHub CLI.
@@ -22,6 +25,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -106,8 +110,15 @@ def call(cmd, timeout, cwd=None):
         raise subprocess.TimeoutExpired(cmd, timeout)
 
 
+def no_hooks():
+    """-c options that keep Git from running hooks (an empty hooks folder) and fsmonitor."""
+    empty = os.path.join(tempfile.gettempdir(), "openay-no-git-hooks")
+    os.makedirs(empty, exist_ok=True)
+    return ["-c", "core.hooksPath=" + empty, "-c", "core.fsmonitor=false"]
+
+
 def run(repo, *args, timeout=60, check=True):
-    cmd = [_exe("git"), "-c", "core.fsmonitor=false", "-c", "core.pager=cat", "-c", "color.ui=false", "-C", repo, *args]
+    cmd = [_exe("git"), *no_hooks(), "-c", "core.pager=cat", "-c", "color.ui=false", "-C", repo, *args]
     try:
         r = call(cmd, timeout)
     except subprocess.TimeoutExpired:
@@ -267,7 +278,7 @@ def prepare(chat, name, args):
         detail = "Repository: %s\n\nMessage:\n%s\n\nFiles:\n%s\n%s\n%s" % (
             top, message, status.rstrip(), ("\nNew files: " + ", ".join(untracked)) if untracked else "", clip(diff, 40_000))
         return ({"title": "Make this commit?", "detail": detail,
-                 "why": "The commit is made with your Git identity. Nothing is pushed."},
+                 "why": "The commit is made with your Git identity. Nothing is pushed, and Git hooks don't run."},
                 {"top": top, "paths": paths, "message": message, "fingerprint": fp})
     if name == "git_merge":
         top = repo_root(chat, args.get("repo"), write=True)
@@ -344,7 +355,7 @@ def execute(chat, name, args, record):
         raise GitError("The branch moved after you reviewed it, so nothing was sent. Review it again.")
     if name == "git_push":
         try:
-            r = call([_exe("git"), "-c", "core.fsmonitor=false", "-C", top, "push", "--", record["remote"],
+            r = call([_exe("git"), *no_hooks(), "-C", top, "push", "--", record["remote"],
                       "refs/heads/%s:refs/heads/%s" % (record["branch"], record["branch"])], 300)
         except subprocess.TimeoutExpired:
             raise GitError("git push took more than 5 minutes and was stopped.")
