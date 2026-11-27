@@ -1,3 +1,20 @@
+# Open AY Desktop 1.14.2
+
+A more reliable update check.
+
+## Fixed
+- **"Couldn't check for updates … 504".** The update check first opened GitHub's "latest release" page, which sometimes times out on GitHub's side even while downloads work.
+  - The app now reads the newest release's update file straight from its download link.
+  - If that fails, it tries the old way once. You only see an error when both fail.
+- **Note:** the first update through the new route may download the whole installer instead of only the changed parts. Later updates are small again.
+
+## Verification
+- The update check against the live release, from a 1.14.0 starting point: the direct link, and the fallback when the direct link fails.
+- 167 automated tests.
+- The packaged-app smoke test.
+
+---
+
 # Open AY Desktop 1.14.1
 
 Fixes for subtasks, renaming and right-click.

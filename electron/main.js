@@ -221,9 +221,19 @@ app.on("before-quit", (e) => { if (!quitting) { e.preventDefault(); quit(); } })
 // Checks at start and every 6 hours. With "Install updates automatically" on (Settings), a new
 // version downloads in the background and installs when the app quits; otherwise the window
 // offers Download and Restart. The window gets every state change on "update-status".
+//
+// Where to look: first the newest release's latest.yml, straight from its download link. That
+// skips GitHub's "latest release" web page, which the built-in GitHub feed reads first and which
+// sometimes fails on GitHub's side (504) while downloads still work. If the direct link fails,
+// the same check is tried once through the GitHub feed.
+const UPDATE_FEEDS = [
+  { provider: "generic", url: "https://github.com/arothm/OpenAYDesktop/releases/latest/download" },
+  { provider: "github", owner: "arothm", repo: "OpenAYDesktop", releaseType: "release" },
+];
 const updates = {
   state: { state: DEV ? "dev" : "idle", version: app.getVersion() },
   updater: null,
+  quiet: false,  // true while a feed that has a fallback is being tried: its error isn't shown
   send(patch) {
     this.state = { ...this.state, ...patch, version: app.getVersion() };
     if (win && !win.isDestroyed()) win.webContents.send("update-status", this.state);
@@ -238,13 +248,19 @@ const updates = {
     u.on("update-not-available", () => this.send({ state: "current", checkedAt: Date.now() }));
     u.on("download-progress", (p) => this.send({ state: "downloading", percent: Math.round(p.percent || 0) }));
     u.on("update-downloaded", (i) => this.send({ state: "ready", latest: i.version }));
-    u.on("error", (e) => this.send({ state: "error", error: String((e && e.message) || e).split("\n")[0].slice(0, 300) }));
+    u.on("error", (e) => { if (!this.quiet) this.send({ state: "error", error: String((e && e.message) || e).split("\n")[0].slice(0, 300) }); });
     setTimeout(() => this.check(false), 15000);
     setInterval(() => this.check(false), 6 * 3600 * 1000);
   },
   async check(manual) {
     if (!this.updater || ["downloading", "ready"].includes(this.state.state)) return this.state;
-    try { await this.updater.checkForUpdates(); } catch (e) { if (manual) this.send({ state: "error", error: String(e.message || e).slice(0, 300) }); }
+    for (let i = 0; i < UPDATE_FEEDS.length; i++) {
+      const last = i === UPDATE_FEEDS.length - 1;
+      this.updater.setFeedURL(UPDATE_FEEDS[i]);
+      this.quiet = !last;
+      try { await this.updater.checkForUpdates(); this.quiet = false; return this.state; }  // a download uses the feed that answered
+      catch (e) { this.quiet = false; if (last && manual) this.send({ state: "error", error: String(e.message || e).split("\n")[0].slice(0, 300) }); }
+    }
     return this.state;
   },
   async download() {
