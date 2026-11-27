@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It runs as an **Electron** desktop app, with a local Python 3 server (standard library only) doing the work. It can also still open in an Edge or Chrome app window without Electron. There is no frontend framework or build step for the interface itself.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.10.0
+- **Version:** 1.11.0
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -35,7 +35,6 @@ The application was previously named Ollama Desk. Existing chats, folder grants,
 
 ### Without Electron
 - Double-click **`Open AY Desktop.cmd`**. The app opens in its own window. The background server stops about 3 minutes after the last window closes.
-- The old **`Ollama Desk.cmd`** remains as a compatibility launcher.
 - To create or migrate Desktop and Start-menu shortcuts, run:
 
   ```powershell
@@ -253,9 +252,9 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `gittools.py` — Git and GitHub tools: repository checks, the safe command runner, and commit, push and pull request reviews.
 - `skills.py` — skill files: storage, validation and the per-chat prompt.
 - `index.html` — application and dialog markup.
-- `styles.css` — interface styling and light/dark themes.
+- `styles.css` — the Graphite look: colour tokens for dark and light (it follows the Windows setting), components and motion. The page's security policy blocks inline styles, so every look is a class here.
 - `app.js` — the window: live event stream, rendering, approvals, sessions, trash, and settings.
-- `electron/` — the Electron shell: `main.js` (server lifecycle, window, tray, quit), `preload.js` (folder picker only), `icon.png`.
+- `electron/` — the Electron shell: `main.js` (server lifecycle, window, tray, quit), `preload.js` (folder picker only), `icon.png` (app icon), `tray.png` (simplified tray icon).
 - `package.json` — Electron and electron-builder setup (`npm start`, `npm run smoke`, `npm run dist`).
 - `scripts/fetch-python.js` — downloads and verifies the embeddable Python that the installer bundles.
 - `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`, `test_git.py`, `test_commands.py`).

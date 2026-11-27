@@ -1,3 +1,50 @@
+# Open AY Desktop 1.11.0
+
+New look: the Graphite redesign.
+
+## New
+- **Graphite theme:**
+  - graphite surfaces with one periwinkle accent; amber and red are kept for status;
+  - a matching light theme that follows the Windows setting;
+  - line icons everywhere instead of emoji.
+- **Sidebar:**
+  - chats grouped by Today, Yesterday, This week and Earlier;
+  - pulsing, breathing or still dots for running, paused and waiting chats;
+  - your Ollama balance as a coloured badge (click to check now).
+- **Header:** shows the chat's model, folders and Git level under its title.
+- **New chat screen:** three starting suggestions.
+- **Messages:**
+  - tool steps are cards with an icon per tool;
+  - approval cards show the kind of risk at a glance;
+  - new messages slide in;
+  - live thinking shimmers.
+- **Review file edit:** shows a coloured diff with added and removed line counts, plus a Changes / Full file switch.
+- **Session settings:** opens as a drawer, grouped into Files, Model, Tools and Skills, with switches.
+- **Settings:** has a section list, a balance meter, and a clearer API key state.
+- **Activity:** shows totals for running, waiting, replies at once and tokens today.
+- **Trash:** groups items by day.
+- **Skills:** gives each skill a coloured monogram and shows a character count.
+- **Motion:**
+  - presses shrink slightly;
+  - dialogs rise in and the session drawer slides in;
+  - the sidebar collapses smoothly;
+  - with Windows animations turned off, everything is instant.
+- **New app icon** (an arch with two eyes) and a simplified tray icon.
+
+## Unchanged
+- Every permission, approval and server check works as before. This release changes only the interface files and the icons.
+
+## Removed
+- The legacy `Ollama Desk.cmd` launcher from before the rename. Use `Open AY Desktop.cmd` or the installed app.
+
+## Verification
+- 112 automated tests.
+- `python verify_static.py`.
+- A live check of every screen in dark, light and phone width on demo data.
+- A simulated reply streaming in.
+
+---
+
 # Open AY Desktop 1.10.0
 
 Running commands (completes Phase 5).

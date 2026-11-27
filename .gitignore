@@ -33,5 +33,3 @@ dist/
 *.exe
 *.msi
 
-# One-time working-copy transfer helper; not part of the app
-Copy-From-Working-App.ps1

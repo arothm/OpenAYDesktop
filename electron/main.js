@@ -8,7 +8,7 @@
 //   - keeps replies running from the tray when the window closes, if you choose,
 //   - shuts the server down when you quit. The server also exits by itself if this process dies,
 //     because it watches its stdin (--exit-with-stdin).
-const { app, BrowserWindow, Tray, Menu, dialog, shell, ipcMain, nativeImage, session } = require("electron");
+const { app, BrowserWindow, Tray, Menu, dialog, shell, ipcMain, nativeImage, nativeTheme, session } = require("electron");
 const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
 const net = require("net");
@@ -18,6 +18,7 @@ const SMOKE = process.argv.includes("--smoke");          // npm run smoke: start
 const DEV = !app.isPackaged;
 const SERVER_DIR = DEV ? path.join(__dirname, "..") : path.join(process.resourcesPath, "app-server");
 const ICON = path.join(__dirname, "icon.png");
+const TRAY_ICON = path.join(__dirname, "tray.png");  // simplified arch: the eyes blur at 16 px
 const APP_SLUG = "open-ay-desktop";
 
 let server = null;     // the Python process, when this shell started it
@@ -113,7 +114,7 @@ async function startServer() {
 function createWindow() {
   win = new BrowserWindow({
     width: 1200, height: 820, minWidth: 720, minHeight: 520, title: "Open AY Desktop", icon: ICON,
-    show: false, backgroundColor: "#1b1b1d", autoHideMenuBar: true,
+    show: false, backgroundColor: nativeTheme.shouldUseDarkColors ? "#0E0F12" : "#F7F8FA", autoHideMenuBar: true,
     webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, sandbox: true, nodeIntegration: false },
   });
   win.removeMenu();
@@ -134,7 +135,7 @@ function showWindow() {
 
 function ensureTray() {
   if (tray) return;
-  tray = new Tray(nativeImage.createFromPath(ICON).resize({ width: 16, height: 16 }));
+  tray = new Tray(nativeImage.createFromPath(TRAY_ICON).resize({ width: 16, height: 16 }));
   tray.setToolTip("Open AY Desktop: replies running in the background");
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: "Open Open AY Desktop", click: showWindow },
