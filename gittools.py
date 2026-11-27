@@ -22,6 +22,8 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 
 import capabilities
 import commands
@@ -37,6 +39,18 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 class GitError(Exception):
     pass
+
+
+class Stopped(GitError):
+    """The user pressed Stop while Git was running."""
+
+
+_context = threading.local()  # the Stop signal of the reply running on this thread
+
+
+def set_cancel(event):
+    """Make Git calls on this thread end as soon as `event` is set (None: no Stop signal)."""
+    _context.cancel = event
 
 
 def level(pol):
@@ -68,19 +82,28 @@ def call(cmd, timeout, cwd=None):
     stdin is DEVNULL: the installed app's server keeps a thread reading its own stdin (to notice when the window
     closes), and on Windows a child that inherits that pipe can block forever on it (Git for Windows does, at
     start-up). On timeout the whole process tree is stopped: Git's launcher (cmd/git.exe) starts the real git.exe,
-    and killing only the launcher left the real one holding the output pipes, so the wait never ended."""
+    and killing only the launcher left the real one holding the output pipes, so the wait never ended.
+    Pressing Stop (see set_cancel) ends it the same way, within a fraction of a second, and raises Stopped."""
+    cancel = getattr(_context, "cancel", None)
     proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             encoding="utf-8", errors="replace", env=_env(), creationflags=NO_WINDOW)
-    try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    deadline = time.time() + timeout
+    while True:
+        try:
+            out, err = proc.communicate(timeout=0.25)  # retrying communicate() after a timeout loses no output
+            return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+        except subprocess.TimeoutExpired:
+            stopped = cancel is not None and cancel.is_set()
+            if not stopped and time.time() < deadline:
+                continue
         commands._kill_tree(proc)
         try:
             proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
             pass  # something outside the tree still holds the pipes; don't wait for it
-        raise
-    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+        if stopped:
+            raise Stopped("Stopped: you pressed Stop while %s was running." % os.path.basename(cmd[0]).split(".")[0])
+        raise subprocess.TimeoutExpired(cmd, timeout)
 
 
 def run(repo, *args, timeout=60, check=True):

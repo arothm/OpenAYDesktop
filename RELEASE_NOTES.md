@@ -1,3 +1,19 @@
+# Open AY Desktop 1.13.1
+
+Stop now always works.
+
+## Fixed
+- **Stop did nothing while a step was stuck.** It only took effect between steps, so a step that never finished (like the Git status hang fixed in 1.13.0) kept the chat busy for good.
+  - Git and GitHub CLI calls now end within a fraction of a second when you press Stop.
+  - If any step is still busy 3 seconds after Stop, the reply is ended anyway. The step shows "Stopped: this step didn't finish", the chat is saved, and you can send a new message straight away. A late result from that step is ignored.
+
+## Verification
+- 157 automated tests (4 new). The stuck-step test fails without the fix.
+- A live check in the window: a Git status step that never returns, ended with Stop.
+- The packaged-app smoke test.
+
+---
+
 # Open AY Desktop 1.13.0
 
 Skill folders in the open Agent Skills format, a fix for Git steps that never finished, and a new icon set.

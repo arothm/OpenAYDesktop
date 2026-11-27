@@ -28,6 +28,12 @@ parent starts all subtasks requested in one step, then waits for them and return
 child's final answer as that tool call's result. Stopping a parent stops its children.
 The engine is created by server.py with the server module as `srv`, which provides
 storage, tools, approvals and the Ollama Cloud connection.
+
+Stop: cancel() sets the run's Stop signal. Model requests, approvals, the balance pause, commands
+and Git calls watch it and end at once. If the reply's thread still hasn't finished STOP_GRACE
+seconds later (a step that can't be interrupted), the engine ends the reply anyway (abandon()):
+the stuck step is marked as stopped, the chat is saved and free again, and anything that thread
+does afterwards is ignored.
 """
 
 import collections
@@ -65,6 +71,8 @@ CHANGING_TOOLS = {"write_file", "edit_file", "create_folder", "copy_path", "move
 SUBTASK_RESULT_CHARS = 20_000
 HISTORY = 30                  # finished replies kept for the Activity view
 BALANCE_RECHECK = 60          # seconds between balance checks while paused
+STOP_GRACE = 3                # seconds after Stop before a reply that is still busy is ended anyway
+STUCK_STEP = "Stopped: this step didn't finish, so the reply was ended when you pressed Stop."
 WRAP_UP_NOTE = ("The user's Ollama balance is nearly used up, so this work must pause now. Do not call any tools. "
                 "Write a short summary: what you have done so far, what is left to do, and anything the user should know. "
                 "The work will continue later from this point.")
@@ -195,7 +203,13 @@ class Engine:
             run.cancel()
             if wait:
                 run.thread.join(wait)
+            threading.Thread(target=self._end_if_stuck, args=(run,), daemon=True, name="stop-%s" % chat_id).start()
         return bool(run)
+
+    def _end_if_stuck(self, run):
+        run.thread.join(STOP_GRACE)
+        if run.thread.is_alive():
+            run.abandon()
 
     def decide(self, chat_id, approval_id, approve):
         run = self.active(chat_id)
@@ -218,6 +232,8 @@ class Run:
         self.cancelled = threading.Event()
         self.status = "running"
         self.alive = True
+        self.finishing = False     # the reply is being ended (normally, or by abandon())
+        self.detached = False      # ended by abandon(): this run's thread may still be stuck; ignore what it does
         self.approval = None
         self.response = None
         self.use_tools = True
@@ -290,10 +306,13 @@ class Run:
                 "pause": copy.deepcopy(self.pause)}
 
     def publish(self, event):
-        self.engine.channel(self.chat_id).publish(event)
+        if not self.detached:
+            self.engine.channel(self.chat_id).publish(event)
 
     def add(self, message):
         with self.lock:
+            if self.detached:  # a stuck step returned after Stop ended the reply: keep it out of the chat
+                return len(self.chat["messages"]) - 1
             self.chat["messages"].append(message)
             idx = len(self.chat["messages"]) - 1
             self.publish({"type": "message", "index": idx, "message": copy.deepcopy(message)})
@@ -302,6 +321,8 @@ class Run:
     def update(self, idx, **fields):
         """Set fields on a message; a value of None removes that field."""
         with self.lock:
+            if self.detached:
+                return
             m = self.chat["messages"][idx]
             for key, value in fields.items():
                 if value is None:
@@ -312,6 +333,8 @@ class Run:
 
     def delta(self, idx, content, thinking):
         with self.lock:
+            if self.detached:
+                return
             m = self.chat["messages"][idx]
             m["content"] = (m.get("content") or "") + content
             m["thinking"] = (m.get("thinking") or "") + thinking
@@ -319,11 +342,17 @@ class Run:
 
     def set_status(self, status):
         with self.lock:
+            if self.detached:
+                return
             self.status = status
             self.publish({"type": "status", "status": status, "model": self.chat.get("model")})
 
     def save(self):
         """Write messages, model and usage; folders/permissions/title keep what is on disk."""
+        if not self.detached:
+            self._write()
+
+    def _write(self):
         srv = self.srv
         with self.lock:
             msgs = copy.deepcopy(self.chat["messages"])
@@ -425,19 +454,48 @@ class Run:
             self.add({"role": "assistant", "content": "", "model": self.chat.get("model", ""), "error": "Unexpected error: %s" % e})
         finally:
             with self.lock:
-                for m in self.chat["messages"]:
-                    for flag in ("_live", "_running", "_approval", "_modelApproval", "_actionApproval"):
-                        m.pop(flag, None)
-                last = self.chat["messages"][-1] if self.chat["messages"] else {}
-                self.outcome = "stopped" if self.cancelled.is_set() else "error" if last.get("error") else "done"
-                self.ended = time.time()
-            try:
-                self.save()  # before the run counts as finished, so a new reply can't start from an older file
-            finally:
-                with self.lock:
-                    self.alive = False
-                self.engine.finished(self)
-                self.set_status("idle")
+                ending = not self.finishing  # False when Stop already ended this reply (abandon)
+                self.finishing = True
+            if ending:
+                self._finish()
+
+    def abandon(self):
+        """End a stopped reply whose thread is stuck in a step that can't be interrupted. The step is marked as
+        stopped and the chat is saved and freed; whatever the stuck thread does later is ignored."""
+        with self.lock:
+            if self.finishing or not self.alive:
+                return False
+            self.finishing = True
+            for m in self.chat["messages"]:
+                if m.get("_running"):
+                    m.update(content=STUCK_STEP, isError=True)
+        self._finish(detach=True)
+        return True
+
+    def _finish(self, detach=False):
+        """Clear live flags, save, and mark the reply finished (status "idle")."""
+        with self.lock:
+            for m in self.chat["messages"]:
+                for flag in ("_live", "_running", "_approval", "_modelApproval", "_actionApproval"):
+                    m.pop(flag, None)
+            last = self.chat["messages"][-1] if self.chat["messages"] else {}
+            self.outcome = "stopped" if self.cancelled.is_set() else "error" if last.get("error") else "done"
+            self.ended = time.time()
+            self.approval = None
+            if detach:
+                self.detached = True  # from here on, the stuck thread's writes are ignored
+        channel = self.engine.channel(self.chat_id)
+        if detach:
+            with self.lock:
+                channel.publish(self.snapshot_event())  # windows drop the stuck step's live state
+        try:
+            self._write()  # before the run counts as finished, so a new reply can't start from an older file
+        finally:
+            with self.lock:
+                self.alive = False
+                self.status = "idle"
+            self.engine.finished(self)
+            channel.publish({"type": "status", "status": "idle", "model": self.chat.get("model")})
 
     def build_request(self, model):
         """The request for one model step. Its start (instructions, tools, summary, history) stays the same
@@ -781,6 +839,7 @@ class Run:
             display = '"%s"%s' % (args["contains"], (" in " + args["path"]) if args.get("path") else "")
         idx = self.add({"role": "tool", "tool_name": name, "content": "", "display": str(display), "_running": True})
         undo.set_context(self.chat_id, self.run_id)  # file changes made now are journaled for "Undo this reply"
+        gittools.set_cancel(self.cancelled)  # Git calls end as soon as Stop is pressed
         try:
             if self.plan and name not in srv.READ_ONLY_TOOLS:
                 raise srv.ToolError("Plan mode: nothing can be changed yet. Finish the plan; the user will ask you to carry it out.")
@@ -865,6 +924,7 @@ class Run:
             self.update(idx, content="Error: %s" % e, isError=True, _running=None)
         finally:
             undo.set_context(None, None)
+            gittools.set_cancel(None)
 
     def ask(self, idx, data, denied_text):
         """Ask the user to approve a gated action; raises Denied unless they allow it."""
