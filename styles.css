@@ -618,3 +618,7 @@ label.perm { cursor: pointer; }
 @media (max-width: 720px) { .side-list { width: auto; max-height: 30vh; box-shadow: inset 0 -1px 0 var(--line); } }
 .reply-foot { display: flex; align-items: center; gap: 4px; margin-top: 10px; } .reply-foot .help { margin: 0; }
 .field > label.perm { display: flex; font-weight: 400; margin-bottom: 0; }
+
+/* Messages from the parent chat, in a subtask chat */
+.msg.from-parent .bubble { white-space: pre-wrap; }
+.msg.from-parent .from { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; font-size: 11.5px; font-weight: 600; color: var(--accent); }

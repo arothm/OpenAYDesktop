@@ -262,8 +262,8 @@ async function deleteChat(id) {
 }
 
 // Rendering
-const TOOL_LABEL = { list_directory: "Listed folder", read_file: "Read file", search_files: "Searched files", write_file: "Wrote file", edit_file: "Edited file", create_folder: "Created folder", copy_path: "Copied item", move_path: "Moved/renamed item", delete_path: "Moved to trash", restore_path: "Restored item", set_session_model: "Changed model", web_search: "Searched the web", web_fetch: "Read web page", start_subtask: "Subtask", git_status: "Git status", git_diff: "Git diff", git_log: "Git log", git_show: "Git show", git_branches: "Git branches", git_commit: "Git commit", git_push: "Git push", gh_pr_list: "Pull requests", gh_pr_create: "Opened pull request", run_command: "Ran command" };
-const TOOL_ICON = { list_directory: "folder", read_file: "file", search_files: "search", write_file: "edit", edit_file: "edit", create_folder: "folder", copy_path: "copy", move_path: "file", delete_path: "trash", restore_path: "restore", set_session_model: "model", web_search: "globe", web_fetch: "globe", start_subtask: "subtask", run_command: "terminal" };
+const TOOL_LABEL = { list_directory: "Listed folder", read_file: "Read file", search_files: "Searched files", write_file: "Wrote file", edit_file: "Edited file", create_folder: "Created folder", copy_path: "Copied item", move_path: "Moved/renamed item", delete_path: "Moved to trash", restore_path: "Restored item", set_session_model: "Changed model", web_search: "Searched the web", web_fetch: "Read web page", start_subtask: "Subtask", message_subtask: "Messaged subtask", wait_subtasks: "Waited for subtasks", message_parent: "Messaged parent chat", read_skill_file: "Read skill file", git_status: "Git status", git_diff: "Git diff", git_log: "Git log", git_show: "Git show", git_branches: "Git branches", git_commit: "Git commit", git_push: "Git push", gh_pr_list: "Pull requests", gh_pr_create: "Opened pull request", run_command: "Ran command" };
+const TOOL_ICON = { list_directory: "folder", read_file: "file", search_files: "search", write_file: "edit", edit_file: "edit", create_folder: "folder", copy_path: "copy", move_path: "file", delete_path: "trash", restore_path: "restore", set_session_model: "model", web_search: "globe", web_fetch: "globe", start_subtask: "subtask", message_subtask: "subtask", wait_subtasks: "subtask", message_parent: "subtask", read_skill_file: "skills", run_command: "terminal" };
 const toolIcon = (name) => TOOL_ICON[name] || (/^(git|gh)_/.test(name || "") ? "git" : "settings");
 // Messages added since the chat was opened slide in; re-rendering an existing message never animates it again.
 const shown = { chatId: null, count: 0 };
@@ -276,13 +276,14 @@ function toolHTML(m, idx) {
     return approvalCard(idx, k.icon, k.tint, esc(t), "Nothing has happened yet. This needs your approval.", `<button class="btn" data-action-approve="no" type="button">Deny</button><button class="btn primary" data-action-review="yes" type="button">Review</button>`); }
   if (m._modelApproval) return approvalCard(idx, "model", "teal", `Switch this session to ${esc(m._modelApproval.model)}?`, "Nothing has changed yet. The model is waiting for your approval.", `<button class="btn" data-model-approve="no" type="button">Keep current</button><button class="btn primary" data-model-review="yes" type="button">Review change</button>`);
   if (m._approval) return approvalCard(idx, "edit", "", `Review change to <span class="mono">${esc(m._approval.path.split(/[\\/]/).pop())}</span>`, `Nothing has been written. <span class="mono">${esc(m._approval.path)}</span>`, `<button class="btn" data-approve="no" type="button">Deny</button><button class="btn primary" data-review="yes" type="button">Review change</button>`);
-  const status = m._running ? "running…" : m.isError ? "failed" : "";
+  const status = m._waitingParent ? "waiting for the parent…" : m._running ? "running…" : m.isError ? "failed" : "";
   const open = m.subtaskId ? `<button class="btn sm open-sub" data-open-chat="${esc(m.subtaskId)}" type="button">Open</button>` : "";
   return `<details class="tool${m.isError ? " err" : ""}${m._running ? " running" : ""}${enterCls(idx)}" data-idx="${idx}"><summary>${ic(toolIcon(m.tool_name))}<b>${esc(TOOL_LABEL[m.tool_name] || m.tool_name || "Tool")}</b><span class="arg">${esc(m.display || "")}</span><span class="st">${status}</span>${open}${ic("chevron", "sm chev")}</summary><div class="out">${esc(m.content || "")}</div></details>`;
 }
 function msgHTML(m, idx, isLast) {
   if (m.role === "system") return ""; if (m.role === "tool") return toolHTML(m, idx);
   const enter = enterCls(idx);
+  if (m.role === "user" && m.fromParent) return `<div class="msg user auto from-parent${enter}" data-idx="${idx}"><div class="bubble"><span class="from">${ic("subtask", "sm")}From the parent chat</span>${esc(String(m.content).replace(/^\[Message from the parent chat\]\n?/, ""))}</div></div>`;
   if (m.role === "user" && m.auto) return `<div class="msg user auto${enter}" data-idx="${idx}"><div class="bubble">${esc(m.content)}</div></div>`;
   if (m.role === "user") {
     const imgs = (m.images || []).map((b) => `<img src="data:image/*;base64,${b}" alt="">`).join("");

@@ -26,6 +26,17 @@ above the minimum again. If the balance can't be read, replies keep working.
 Subtasks: a reply can start child chats (start_subtask). Each runs as its own Run; the
 parent starts all subtasks requested in one step, then waits for them and returns each
 child's final answer as that tool call's result. Stopping a parent stops its children.
+
+Messages between a parent and its subtasks:
+  message_parent (child)    a note to the parent, or a question (wait_for_reply) that pauses
+                            the child until the parent answers
+  message_subtask (parent)  an answer to a child's question, or a follow-up the child reads
+                            before its next step; a finished child continues with it as a new reply
+  wait_subtasks (parent)    wait for results and messages
+A parent waiting for its subtasks stops waiting as soon as one asks a question, so the model can
+answer it. A reply that ends while its subtasks are still running or unread gets a reminder
+(at most SUBTASK_REMINDERS times); subtasks still running when it ends are stopped. Messages
+from a subtask that read web content make the parent untrusted, and the other way round.
 The engine is created by server.py with the server module as `srv`, which provides
 storage, tools, approvals and the Ollama Cloud connection.
 
@@ -69,6 +80,12 @@ MAX_SUBTASKS_PER_REPLY = 6
 MAX_DOCUMENTS = 10
 CHANGING_TOOLS = {"write_file", "edit_file", "create_folder", "copy_path", "move_path", "delete_path", "restore_path"}
 SUBTASK_RESULT_CHARS = 20_000
+MAX_SUBTASK_MESSAGE = 8_000   # characters in one message between a parent and a subtask
+MAX_MESSAGES = 30             # messages one reply can send to its parent or subtasks
+QUESTION_WAIT = 1800          # seconds a subtask waits for the parent's answer
+WAIT_SUBTASKS = 600           # default and
+MAX_WAIT_SUBTASKS = 1800      # longest wait_subtasks call, in seconds
+SUBTASK_REMINDERS = 2         # times a reply is reminded of unread subtasks before it may end
 HISTORY = 30                  # finished replies kept for the Activity view
 BALANCE_RECHECK = 60          # seconds between balance checks while paused
 STOP_GRACE = 3                # seconds after Stop before a reply that is still busy is ended anyway
@@ -89,6 +106,14 @@ PLAN_NOTE = (
     "Plan mode: the user wants a plan before anything changes. Investigate with the read-only tools you have, then "
     "reply with a clear, numbered step-by-step plan (files to change, commands to run, risks, and questions for the "
     "user). Do not make any changes. The user will review the plan and then ask you to carry it out.")
+
+
+class _Done:
+    alive = False
+    question = None
+
+
+_DONE = _Done()  # stands in for a subtask that has no running reply
 
 
 class RunError(Exception):
@@ -234,6 +259,14 @@ class Run:
         self.alive = True
         self.finishing = False     # the reply is being ended (normally, or by abandon())
         self.detached = False      # ended by abandon(): this run's thread may still be stuck; ignore what it does
+        self.news = threading.Condition()  # subtasks' messages and finishes wake this run when it waits for them
+        self.updates = []          # messages from subtasks the model hasn't seen yet
+        self.pending = {}          # subtask chat id -> title: subtasks whose final result the model hasn't seen
+        self.inbox = []            # messages from the parent, delivered before this run's next model step
+        self.inbox_closed = False  # this reply is ending: new messages from the parent start a new reply instead
+        self.question = None       # this subtask's question while it waits for the parent's answer
+        self.sent = 0              # messages this reply sent to its parent or subtasks
+        self.reminders = 0
         self.approval = None
         self.response = None
         self.use_tools = True
@@ -286,6 +319,8 @@ class Run:
                                                "chars": len(d["text"]), "note": str(d.get("note") or "")[:300]} for d in docs]
                 if options.get("plan"):
                     message["plan"] = True
+                if options.get("fromParent"):  # a message from the parent chat continues a finished subtask
+                    message["auto"] = message["fromParent"] = True
                 msgs.append(message)
             if not chat.get("model"):
                 raise RunError("Pick a model for this chat first.")
@@ -428,10 +463,19 @@ class Run:
             for step in range(MAX_STEPS):
                 if self.cancelled.is_set() or not self.balance_gate():
                     break
+                self.read_inbox()
                 idx = self.add({"role": "assistant", "content": "", "thinking": "", "model": self.chat["model"], "_live": True})
                 self.stream_step(idx)
                 reply = self.chat["messages"][idx]
-                if self.cancelled.is_set() or reply.get("error") or not reply.get("tool_calls"):
+                if self.cancelled.is_set() or reply.get("error"):
+                    break
+                if not reply.get("tool_calls"):
+                    if self.remind_subtasks():
+                        continue
+                    with self.lock:  # a message from the parent that came in during this step gets one more step
+                        if self.inbox:
+                            continue
+                        self.inbox_closed = True
                     break
                 started = []  # subtasks requested in this step run at the same time
                 for call in reply["tool_calls"]:
@@ -444,8 +488,8 @@ class Run:
                             started.append(launched)
                     else:
                         self.run_tool_call(call)
-                for idx_child in started:
-                    self.finish_subtask(*idx_child)
+                if started:
+                    self.finish_subtasks(started)
                 self.save()
             else:
                 self.add({"role": "assistant", "content": "", "model": self.chat["model"],
@@ -456,7 +500,9 @@ class Run:
             with self.lock:
                 ending = not self.finishing  # False when Stop already ended this reply (abandon)
                 self.finishing = True
+                self.inbox_closed = True
             if ending:
+                self.stop_own_subtasks()
                 self._finish()
 
     def abandon(self):
@@ -496,6 +542,9 @@ class Run:
                 self.status = "idle"
             self.engine.finished(self)
             channel.publish({"type": "status", "status": "idle", "model": self.chat.get("model")})
+            if self.parent is not None:  # a parent waiting for this subtask wakes up
+                with self.parent.news:
+                    self.parent.news.notify_all()
 
     def build_request(self, model):
         """The request for one model step. Its start (instructions, tools, summary, history) stays the same
@@ -504,6 +553,8 @@ class Run:
         srv = self.srv
         fcfg = srv.saved_tool_config(self.chat_id)  # fresh from disk: permissions/skills may change mid-run
         specs, where = srv.tool_specs(fcfg, plan=self.plan) if self.use_tools else ([], "")
+        if self.parent is None:  # message_parent only reaches a parent whose reply started this one
+            specs = [x for x in specs if x["function"]["name"] != "message_parent"]
         names = {x["function"]["name"] for x in specs}
         system = [srv.instructions_prompt(fcfg), skills.prompt(srv.skills_root(), fcfg.get("skills") or [],
                                                                 "read_skill_file" in names, "run_command" in names)]
@@ -785,6 +836,7 @@ class Run:
                 raise
             with self.lock:
                 self.children.append(child_id)
+            self.pending[child_id] = title
             return idx, child_id
         except Denied as e:
             self.update(idx, content=str(e), isError=True, _running=None)
@@ -792,21 +844,231 @@ class Run:
             self.update(idx, content="Error: %s" % e, isError=True, _running=None)
         return None
 
-    def finish_subtask(self, idx, child_id):
-        """Wait for a child chat's reply and return its final answer as the tool result."""
+    def finish_subtasks(self, started):
+        """After a step that started subtasks: wait for them (or for a question from one), then give each
+        start_subtask call its result."""
+        ids = [cid for _, cid in started if cid in self.pending]
+        reports, extra = self.collect(ids, None) if ids else ({}, "")
+        for n, (idx, cid) in enumerate(started):
+            text, failed = reports.get(cid, ("Started. Its result came back through wait_subtasks.", False))
+            if extra and n == len(started) - 1:
+                text += "\n\n" + extra
+            self.update(idx, content=text, isError=True if failed else None, _running=None)
+
+    def child_run(self, child_id):
+        run = self.engine.runs.get(child_id)
+        return run if run is not None and run.parent is self else None
+
+    def collect(self, ids, timeout):
+        """Wait until every subtask in ids has finished, one of this reply's subtasks asks a question, the
+        timeout passes or Stop is pressed. Returns ({id: (text, failed)}, text of messages from other subtasks)."""
+        end = None if timeout is None else time.time() + timeout
+        with self.news:
+            while not self.cancelled.is_set():
+                running = [c for c in ids if (self.child_run(c) or _DONE).alive]
+                asked = any(u["question"] for u in self.updates) or any((self.child_run(c) or _DONE).question for c in running)
+                if not running or asked or (end is not None and time.time() >= end):
+                    break
+                self.news.wait(0.5)
+            news, self.updates = self.updates, []
+        reports = {}
+        for cid in ids:
+            notes = [self.describe(u) for u in news if u["child"] == cid]
+            run = self.child_run(cid)
+            if run is not None and run.alive and not self.cancelled.is_set():
+                title = self.pending.get(cid) or run.chat.get("title", "Subtask")
+                text = 'Subtask "%s" (id %s) is still running.' % (title, cid)
+                q = run.question
+                if q is not None and not any(u is q for u in news):  # asked earlier and still unanswered
+                    notes.append(self.describe(q))
+                if q is not None or any(u["question"] and u["child"] == cid for u in news):
+                    text += (" It is waiting for your answer: reply with message_subtask (subtask \"%s\"), then call "
+                             "wait_subtasks for its result." % cid)
+                else:
+                    text += " Call wait_subtasks again for its result."
+                reports[cid] = ("\n\n".join(notes + [text]), False)
+            else:
+                text, failed = self.subtask_result(cid, run)
+                self.pending.pop(cid, None)
+                reports[cid] = ("\n\n".join(notes + [text]), failed)
+        extra = "\n\n".join(self.describe(u) for u in news if u["child"] not in ids)
+        for cid in {u["child"] for u in news}:
+            self.absorb_untrusted(cid)
+        return reports, extra
+
+    def describe(self, u):
+        if u["question"]:
+            return 'Question from subtask "%s" (id %s), waiting for your answer:\n%s' % (u["title"], u["child"], u["text"])
+        return 'Message from subtask "%s" (id %s):\n%s' % (u["title"], u["child"], u["text"])
+
+    def absorb_untrusted(self, child_id):
+        """What a subtask read on the web can reach this chat through its messages and results."""
         srv = self.srv
-        child = self.engine.runs.get(child_id)
-        while child and child.alive:
-            child.thread.join(0.5)  # Stop cancels the children too, so this always ends
         try:
             chat = srv.load_chat(child_id)
         except (OSError, ValueError):
-            self.update(idx, content="The subtask chat was deleted.", isError=True, _running=None)
             return
+        if chat.get("untrusted"):
+            flag = srv.mark_untrusted(self.chat_id, "subtask: %s" % chat.get("title", "")[:120], chat.get("webUrls") or [])
+            with self.lock:
+                self.chat["untrusted"] = flag
+                self.publish({"type": "untrusted", "untrusted": flag})
+
+    def remind_subtasks(self):
+        """The model ended its reply with subtasks still running or unread: remind it (a limited number of times)."""
+        if not self.pending or self.reminders >= SUBTASK_REMINDERS or self.cancelled.is_set():
+            return False
+        self.reminders += 1
+        names = ", ".join('"%s" (id %s)' % (t, c) for c, t in self.pending.items())
+        self.add({"role": "user", "auto": True, "content": "[Automatic message] You haven't read the result of these subtasks yet: "
+                  "%s. Call wait_subtasks to get them (answer any question with message_subtask first), then finish your "
+                  "answer. Subtasks still running when your reply ends are stopped." % names})
+        return True
+
+    def stop_own_subtasks(self):
+        for cid in list(self.children):
+            run = self.child_run(cid)
+            if run is not None and run.alive:
+                self.engine.stop(cid)
+
+    def read_inbox(self):
+        """Messages the parent sent while this subtask was working, as automatic messages before its next step."""
+        with self.lock:
+            msgs, self.inbox = self.inbox, []
+        for text in msgs:
+            self.add({"role": "user", "auto": True, "fromParent": True, "content": "[Message from the parent chat]\n" + text})
+
+    def _message_text(self, args):
+        text = str(args.get("message") or "").strip()
+        if not text:
+            raise self.srv.ToolError("The message is empty.")
+        if len(text) > MAX_SUBTASK_MESSAGE:
+            raise self.srv.ToolError("Messages can be at most %d characters." % MAX_SUBTASK_MESSAGE)
+        if self.sent >= MAX_MESSAGES:
+            raise self.srv.ToolError("This reply already sent %d messages, the most allowed." % MAX_MESSAGES)
+        return text
+
+    def message_parent(self, idx, args):
+        """A subtask's note or question to the chat that started it."""
+        parent = self.parent
+        text = self._message_text(args)
+        if parent is None or not parent.alive or parent.finishing:
+            raise self.srv.ToolError("The chat that gave you this task isn't waiting for you any more. Put this in your final answer.")
+        wait = args.get("wait_for_reply") in (True, "true", "True", 1)
+        u = {"child": self.chat_id, "title": self.chat.get("title", "Subtask"), "text": text, "question": wait,
+             "event": threading.Event(), "answer": None}
+        self.sent += 1
+        if wait:
+            self.question = u
+            self.update(idx, display="Asked: " + text[:160], _waitingParent=True)
+        with parent.news:
+            parent.updates.append(u)
+            parent.news.notify_all()
+        if not wait:
+            return "Sent to the parent chat. It sees your message the next time it checks on you."
+        end = time.time() + QUESTION_WAIT
+        try:
+            while not u["event"].is_set() and not self.cancelled.is_set() and time.time() < end:
+                if not parent.alive or parent.finishing:
+                    break
+                u["event"].wait(0.5)
+        finally:
+            self.question = None
+            self.update(idx, _waitingParent=None)
+        if u["answer"] is not None:
+            return "The parent chat answered:\n\n" + u["answer"]
+        if self.cancelled.is_set():
+            raise Denied("Stopped before the parent chat answered.")
+        return ("The parent chat didn't answer (its reply ended or it waited too long). Continue with your best judgement "
+                "and say in your final answer what you assumed.")
+
+    def find_subtask(self, ref):
+        """A subtask chat of this chat, by id or title (this reply's subtasks first)."""
+        ref = str(ref or "").strip()
+        if not ref:
+            raise self.srv.ToolError("Name the subtask by its id or title.")
+        kids = {c["id"]: c.get("title", "") for c in self.srv.list_chats() if c.get("parentId") == self.chat_id}
+        if ref in kids:
+            return ref, kids[ref]
+        matches = [cid for cid, t in kids.items() if t.strip().lower() == ref.lower()]
+        mine = [cid for cid in matches if cid in self.children]
+        if len(mine) == 1 or len(matches) == 1:
+            cid = (mine or matches)[0]
+            return cid, kids[cid]
+        if matches:
+            raise self.srv.ToolError('Several subtasks are called "%s"; use its id: %s.' % (ref, ", ".join(matches)))
+        raise self.srv.ToolError("No subtask of this chat is called %s." % ref)
+
+    def message_subtask(self, idx, args):
+        """The parent's answer or follow-up to one of its subtasks."""
+        srv = self.srv
+        if not capabilities.policy(srv.saved_tool_config(self.chat_id))["subtasks"]:
+            raise srv.ToolError("Subtasks are off for this session.")
+        child_id, title = self.find_subtask(args.get("subtask"))
+        text = self._message_text(args)
+        self.update(idx, display='%s: %s' % (title, text[:160]), subtaskId=child_id)
+        if self.chat.get("untrusted") or capabilities.policy(srv.saved_tool_config(self.chat_id))["untrusted"]:
+            srv.mark_untrusted(child_id, "parent chat", list(self.chat.get("webUrls") or []))
+        run = self.child_run(child_id) or self.engine.active(child_id)
+        self.sent += 1
+        if run is not None and run.alive:
+            if run.parent is not self:
+                raise srv.ToolError("That subtask is busy with another reply. Try again when it has finished.")
+            self.pending[child_id] = title
+            q = run.question
+            if q is not None and not q["event"].is_set():
+                q["answer"] = text
+                q["event"].set()
+                return 'Answered the question from "%s". It continues now; call wait_subtasks for its result.' % title
+            with run.lock:
+                if not run.inbox_closed:
+                    run.inbox.append(text)
+                    return 'Sent to "%s". It reads your message before its next step; call wait_subtasks for its result.' % title
+            end = time.time() + 10  # it is just finishing its answer: continue it with a new reply
+            while run.alive and time.time() < end:
+                run.thread.join(0.2)
+            if run.alive:
+                raise srv.ToolError('"%s" is finishing its answer. Call wait_subtasks, then send this again.' % title)
+        if len(self.children) >= MAX_SUBTASKS_PER_REPLY:
+            raise srv.ToolError("This reply already used %d subtasks, the most allowed." % MAX_SUBTASKS_PER_REPLY)
+        try:
+            self.engine.start(child_id, {"text": "[Message from the parent chat]\n" + text, "think": self.think, "fromParent": True},
+                              parent=self)
+        except RunError as e:
+            raise srv.ToolError(str(e))
+        with self.lock:
+            self.children.append(child_id)
+        self.pending[child_id] = title
+        return ('"%s" had finished, so it continues with your message as a new reply. Call wait_subtasks for its answer.' % title)
+
+    def wait_subtasks(self, args):
+        refs = args.get("subtasks")
+        if isinstance(refs, str):
+            refs = [refs] if refs.strip() else []
+        ids = [self.find_subtask(r)[0] for r in refs or []] or list(self.pending)
+        try:
+            timeout = max(5, min(int(args.get("timeout_seconds") or WAIT_SUBTASKS), MAX_WAIT_SUBTASKS))
+        except (TypeError, ValueError):
+            timeout = WAIT_SUBTASKS
+        if not ids and not self.updates:
+            return "None of your subtasks is running or unread."
+        reports, extra = self.collect(ids, timeout)
+        parts = [reports[c][0] for c in ids] + ([extra] if extra else [])
+        if self.cancelled.is_set():
+            raise Denied("Stopped.")
+        return "\n\n---\n\n".join(p for p in parts if p)
+
+    def subtask_result(self, child_id, child):
+        """The final answer of a finished subtask, as text for the parent (and whether it failed)."""
+        srv = self.srv
+        try:
+            chat = srv.load_chat(child_id)
+        except (OSError, ValueError):
+            return "The subtask chat was deleted.", True
         answer = next((m for m in reversed(chat.get("messages") or [])
                        if m.get("role") == "assistant" and (m.get("content") or m.get("error")) and not m.get("tool_calls")), {})
         title = chat.get("title", "Subtask")
-        if child and child.outcome == "stopped":
+        if child is not None and child.outcome == "stopped":
             text, failed = 'Subtask "%s" was stopped before it finished.' % title, True
         elif answer.get("error") and not answer.get("content"):
             text, failed = 'Subtask "%s" failed: %s' % (title, answer["error"]), True
@@ -814,7 +1076,7 @@ class Run:
             body = answer.get("content") or "(no answer)"
             if len(body) > SUBTASK_RESULT_CHARS:
                 body = body[:SUBTASK_RESULT_CHARS] + "\n[... %d more characters in the subtask chat]" % (len(body) - SUBTASK_RESULT_CHARS)
-            text, failed = 'Subtask "%s" finished. Its answer:\n\n%s' % (title, body), False
+            text, failed = 'Subtask "%s" (id %s) finished. Its answer:\n\n%s' % (title, child_id, body), False
         wt = chat.get("worktree")
         if wt:  # commit what the helper changed on its branch, and tell the parent how to merge it
             try:
@@ -822,11 +1084,8 @@ class Run:
             except gittools.GitError as e:
                 text += "\n\nIts worktree changes couldn't be committed: %s" % e
         if chat.get("untrusted"):  # what it read can carry untrusted content back into this chat
-            flag = srv.mark_untrusted(self.chat_id, "subtask: %s" % title[:120], chat.get("webUrls") or [])
-            with self.lock:
-                self.chat["untrusted"] = flag
-                self.publish({"type": "untrusted", "untrusted": flag})
-        self.update(idx, content=text, isError=True if failed else None, _running=None)
+            self.absorb_untrusted(child_id)
+        return text, failed
 
     def run_tool_call(self, call):
         srv = self.srv
@@ -875,6 +1134,13 @@ class Run:
                     self.set_status(self.status)  # tells windows about the new model
             elif name in ("web_search", "web_fetch"):
                 out = self.run_web_tool(idx, name, args)
+            elif name == "message_parent":
+                out = self.message_parent(idx, args)
+            elif name == "message_subtask":
+                out = self.message_subtask(idx, args)
+            elif name == "wait_subtasks":
+                self.update(idx, display="Waiting for subtasks")
+                out = self.wait_subtasks(args)
             elif name in ("read_memory", "save_memory"):
                 chat = srv.saved_tool_config(self.chat_id)
                 pol = capabilities.policy(chat)

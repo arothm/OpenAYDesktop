@@ -1,3 +1,33 @@
+# Open AY Desktop 1.14.0
+
+Parent chats and their subtasks can now message each other while they work.
+
+## Messages between a chat and its subtasks
+- **A subtask can ask a question** with `message_parent` (wait for a reply) and pause until the parent chat answers. It can also send a short progress note.
+- **The parent answers or follows up** with `message_subtask`:
+  - a running subtask reads the message before its next step;
+  - a finished subtask continues with it as a new reply, so the parent can ask for more without starting over.
+- **`wait_subtasks`** gets results and messages. A parent waiting for its subtasks stops waiting as soon as one asks something, so its model can answer at once.
+- **In the window:**
+  - In the parent, the steps show as "Messaged subtask" and "Waited for subtasks", with an Open button.
+  - In the subtask chat, the parent's messages show as "From the parent chat", and a subtask waiting for an answer shows "waiting for the parent…".
+- **Safety:**
+  - Messages count as coming from the other chat, never from you.
+  - Reading web content on either side marks the other side untrusted, in both directions.
+  - At most 30 messages per reply, 8,000 characters each.
+  - A reply that ends with unread subtasks is reminded twice to read them; any still running when it ends are stopped.
+
+## Also
+- Tool descriptions are shorter, so each request stays under its size budget with the new tools.
+- "Read skill file" steps now have their own name and icon.
+
+## Verification
+- 164 automated tests (7 new). One caught a race, now fixed: a message sent just as a subtask finished could be lost.
+- A real run on gpt-oss:120b: a subtask asked which metal the shop uses, the parent answered, and the answer showed up in the subtask's tagline.
+- A check of both chats in the window, and the packaged-app smoke test.
+
+---
+
 # Open AY Desktop 1.13.1
 
 Stop now always works.

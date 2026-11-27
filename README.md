@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It runs as an **Electron** desktop app, with a local Python 3 server (standard library only) doing the work. It can also still open in an Edge or Chrome app window without Electron. There is no frontend framework or build step for the interface itself.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.13.1
+- **Version:** 1.14.0
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -192,6 +192,13 @@ With **Allow subtasks** on, the model can hand self-contained pieces of work to 
 - **Parallel.** Subtasks requested in the same reply run at the same time. The chat waits for them, then gets each one's final answer and continues.
 - **Visible.** Each subtask is a normal chat, shown under its parent in the sidebar and marked "subtask of …". Its card in the parent chat has an **Open** button, and its approvals appear in its own chat, with an amber dot in the sidebar.
 - **Never more permission than its parent.** A subtask gets the parent's folders and skills and at most its effective permissions. Its model is fixed, and it can't start subtasks of its own. If the parent has read web content, the subtask starts untrusted. If a subtask reads web content, the parent becomes untrusted when the result comes back.
+- **Talking to each other.** A parent and its subtasks can message each other while they work:
+  - `message_parent`: a subtask sends a progress note, or asks a question with `wait_for_reply` and pauses until the parent answers (up to 30 minutes). A parent that is waiting for its subtasks stops waiting as soon as one asks, so its model can answer.
+  - `message_subtask`: the parent answers a question, or sends a follow-up that the subtask reads before its next step. A subtask that has already finished continues with the message as a new reply, so the parent can ask for more without starting over.
+  - `wait_subtasks`: the parent waits for results and messages.
+  - In a subtask chat, messages from the parent show as "From the parent chat"; a subtask waiting for an answer shows "waiting for the parent…".
+  - Messages are treated as findings or instructions from the other chat, never as yours, and they follow the untrusted rule above in both directions. At most 30 messages per reply, 8,000 characters each.
+  - If a reply ends while its subtasks are still running or unread, it's reminded twice to read them; subtasks still running when it ends are stopped.
 - **Bounded.** At most 6 subtasks per reply, and they count toward the limits in Settings.
 - **Stopped and deleted with the parent.** Stopping the parent stops its subtasks, and deleting the parent deletes them.
 
@@ -297,7 +304,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `package.json` — Electron and electron-builder setup (`npm start`, `npm run smoke`, `npm run dist`, `npm run release`).
 - `scripts/fetch-python.js` — downloads and verifies the embeddable Python that the installer bundles.
 - `scripts/release.js` — publishes the built installer as a GitHub Release for the updater (`npm run release`).
-- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`, `test_git.py`, `test_commands.py`, `test_tokens.py`, `test_features.py`, `test_skill_folders.py`, `test_git_processes.py`, `test_stop.py`).
+- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`, `test_git.py`, `test_commands.py`, `test_tokens.py`, `test_features.py`, `test_skill_folders.py`, `test_git_processes.py`, `test_stop.py`, `test_subtask_messages.py`).
 - `verify_static.py` — optional static consistency checks.
 - `backups/pre-approved-changes/` — original source copies from before the first approved change set.
 
