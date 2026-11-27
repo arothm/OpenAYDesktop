@@ -87,12 +87,14 @@ function chatOrder(q) {
   return out;
 }
 function renderChatList() {
+  if (state.renaming) return;  // don't replace the name being edited
   const q = $("#search").value.trim().toLowerCase(); const items = chatOrder(q);
   let group = "";
   $("#chatList").innerHTML = items.map((c) => {
     const run = state.runs[c.id];
     const badge = run === "waiting" ? '<span class="dot wait" title="Waiting for your approval"></span>'
-      : run === "paused" ? '<span class="dot pause" title="Paused: low Ollama balance"></span>' : run ? '<span class="dot run" title="Replying…"></span>' : "";
+      : run === "paused" ? '<span class="dot pause" title="Paused: low Ollama balance"></span>'
+      : run === "wrapping" ? '<span class="dot pause" title="Wrapping up: the Ollama balance is low"></span>' : run ? '<span class="dot run" title="Replying…"></span>' : "";
     let label = "";
     if (!q && !c.parentId) { const g = dayGroup(c.updated); if (g !== group) { group = g; label = `<div class="list-label">${g}</div>`; } }
     const mark = c.scheduled ? ic("clock", "sm") : "";
@@ -127,14 +129,19 @@ function updateSubtitle() {
 }
 function titleFor(chat) { return chat.title; }
 function updateChatMeta(chat) {
-  const i = state.chats.findIndex((x) => x.id === chat.id); const meta = { id: chat.id, title: chat.title, updated: chat.updated || Date.now(), model: chat.model };
+  const i = state.chats.findIndex((x) => x.id === chat.id);
+  const meta = { ...(i >= 0 ? state.chats[i] : {}), id: chat.id, title: chat.title, updated: chat.updated || Date.now(), model: chat.model,
+                 parentId: chat.parentId || null, projectId: chat.projectId || null };  // keep it in its project and under its parent
   if (i >= 0) state.chats.splice(i, 1); state.chats.unshift(meta); state.chats.sort((a, b) => b.updated - a.updated); renderChatList();
 }
-const busy = () => ["running", "waiting", "paused"].includes(state.runStatus);
+const busy = () => ["running", "waiting", "paused", "wrapping"].includes(state.runStatus);
+const RUN_WORDS = { running: "running…", waiting: "waiting for you", paused: "paused: low balance", wrapping: "wrapping up…" };
 async function pollRuns() {
   try {
     const r = await api("/api/runs"); const before = JSON.stringify(state.runs); state.runs = r.runs || {};
-    if (JSON.stringify(state.runs) !== before) { renderChatList(); if (Object.keys(state.runs).length === 0) loadChats(); }
+    const unknown = Object.keys(state.runs).some((id) => !state.chats.some((c) => c.id === id));  // e.g. a subtask just started
+    if (unknown) await loadChats();
+    if (JSON.stringify(state.runs) !== before) { renderChatList(); updateSubtaskRows(); if (Object.keys(state.runs).length === 0) loadChats(); }
   } catch {}
 }
 
@@ -177,6 +184,9 @@ function applyEvent(id, ev) {
     case "approval": showApproval(ev.approval); break;
     case "approval_done": closeApproval(ev.id); break;
     case "untrusted": chat.untrusted = ev.untrusted; updateUntrustedBadge(); break;
+    case "session":  // renamed, or settings changed, while a reply runs
+      for (const [k, v] of Object.entries(ev.chat || {})) { if (v === null) delete chat[k]; else chat[k] = v; }
+      $("#title").textContent = titleFor(chat); updateSubtitle(); updateFolderBtn(); updateUntrustedBadge(); loadChats(); break;
     case "balance_wait": state.pause = ev.balance ? { balance: ev.balance, minimumUsd: ev.minimumUsd } : null; if (ev.balance) state.balance = { balance: ev.balance, minimumUsd: ev.minimumUsd }; renderPause(); renderUsage(); break;
     case "context": state.contextInfo = ev; break;
     case "usage": chat.usage = ev.session; chat.context = ev.context; state.today = ev.today; renderUsage(); break;
@@ -276,9 +286,19 @@ function toolHTML(m, idx) {
     return approvalCard(idx, k.icon, k.tint, esc(t), "Nothing has happened yet. This needs your approval.", `<button class="btn" data-action-approve="no" type="button">Deny</button><button class="btn primary" data-action-review="yes" type="button">Review</button>`); }
   if (m._modelApproval) return approvalCard(idx, "model", "teal", `Switch this session to ${esc(m._modelApproval.model)}?`, "Nothing has changed yet. The model is waiting for your approval.", `<button class="btn" data-model-approve="no" type="button">Keep current</button><button class="btn primary" data-model-review="yes" type="button">Review change</button>`);
   if (m._approval) return approvalCard(idx, "edit", "", `Review change to <span class="mono">${esc(m._approval.path.split(/[\\/]/).pop())}</span>`, `Nothing has been written. <span class="mono">${esc(m._approval.path)}</span>`, `<button class="btn" data-approve="no" type="button">Deny</button><button class="btn primary" data-review="yes" type="button">Review change</button>`);
-  const status = m._waitingParent ? "waiting for the parent…" : m._running ? "running…" : m.isError ? "failed" : "";
+  const sub = m._running && m.subtaskId ? m.subtaskId : "";
+  const status = m._waitingParent ? "waiting for the parent…" : sub ? subtaskWords(sub) : m._running ? "running…" : m.isError ? "failed" : "";
   const open = m.subtaskId ? `<button class="btn sm open-sub" data-open-chat="${esc(m.subtaskId)}" type="button">Open</button>` : "";
-  return `<details class="tool${m.isError ? " err" : ""}${m._running ? " running" : ""}${enterCls(idx)}" data-idx="${idx}"><summary>${ic(toolIcon(m.tool_name))}<b>${esc(TOOL_LABEL[m.tool_name] || m.tool_name || "Tool")}</b><span class="arg">${esc(m.display || "")}</span><span class="st">${status}</span>${open}${ic("chevron", "sm chev")}</summary><div class="out">${esc(m.content || "")}</div></details>`;
+  const body = m.content || (sub ? "This subtask works in its own chat. Open it to follow its progress; its answer appears here when it finishes."
+    : m._running ? "Working on it…" : "");
+  return `<details class="tool${m.isError ? " err" : ""}${m._running ? " running" : ""}${enterCls(idx)}" data-idx="${idx}"${sub ? ` data-sub="${esc(sub)}"` : ""}><summary>${ic(toolIcon(m.tool_name))}<b>${esc(TOOL_LABEL[m.tool_name] || m.tool_name || "Tool")}</b><span class="arg">${esc(m.display || "")}</span><span class="st${sub ? " " + esc(state.runs[sub] || "") : ""}">${status}</span>${open}${ic("chevron", "sm chev")}</summary><div class="out${m.content ? "" : " quiet"}">${esc(body)}</div></details>`;
+}
+function subtaskWords(id) { return RUN_WORDS[state.runs[id]] || "finishing…"; }
+function updateSubtaskRows() {  // the subtasks' live status, without redrawing the chat
+  document.querySelectorAll("#messages details.tool[data-sub]").forEach((d) => {
+    const st = d.querySelector(".st"); if (!st) return; const s = state.runs[d.dataset.sub] || "";
+    st.textContent = subtaskWords(d.dataset.sub); st.className = "st" + (s ? " " + s : "");
+  });
 }
 function msgHTML(m, idx, isLast) {
   if (m.role === "system") return ""; if (m.role === "tool") return toolHTML(m, idx);
@@ -881,6 +901,55 @@ $("#chatList").addEventListener("click", async (e) => {
   const at = item.dataset.index; if (at === "") return;  // a search hit: show the matching message
   const el = $(`#messages [data-idx="${at}"]`); if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("found"); setTimeout(() => el.classList.remove("found"), 1600); }
 });
+// Rename in place: double-click the chat's name in the header, or right-click it in the sidebar
+function renameInPlace(el, id) {
+  const chat = state.chats.find((c) => c.id === id) || (state.chat?.id === id ? state.chat : null); if (!chat || state.renaming) return;
+  const input = document.createElement("input"); input.className = "input rename-input"; input.value = chat.title; input.maxLength = 100;
+  input.setAttribute("aria-label", "Chat name");
+  const before = el.textContent; el.textContent = ""; el.append(input); state.renaming = id; input.focus(); input.select();
+  let done = false;
+  const finish = async (save) => {
+    if (done) return; done = true; const title = input.value.trim(); state.renaming = null;
+    if (save && title && title !== chat.title) {
+      try {
+        const r = await api("/api/session/rename", { method: "POST", body: JSON.stringify({ chatId: id, title }) });
+        chat.title = r.title; if (state.chat?.id === id) { state.chat.title = r.title; $("#title").textContent = r.title; }
+        toast("Renamed");
+      } catch (e) { toast(e.message); }
+    }
+    if (el.id === "title") el.textContent = state.chat?.title || before;
+    await loadChats();
+  };
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); finish(true); } else if (e.key === "Escape") { e.preventDefault(); finish(false); } });
+  input.addEventListener("blur", () => finish(true));
+  input.addEventListener("click", (e) => e.stopPropagation());
+}
+function closeChatMenu() { const m = document.getElementById("chatMenu"); if (m) m.remove(); }
+function showChatMenu(x, y, id) {
+  closeChatMenu();
+  const m = document.createElement("div"); m.id = "chatMenu"; m.className = "menu open ctx-menu"; m.setAttribute("role", "menu");
+  m.innerHTML = `<button type="button" data-act="open" role="menuitem">${ic("sidebar", "sm")}Open</button><button type="button" data-act="rename" role="menuitem">${ic("edit", "sm")}Rename</button><div class="menu-sep"></div><button type="button" data-act="delete" role="menuitem" class="danger">${ic("trash", "sm")}Delete</button>`;
+  document.body.append(m);
+  const r = m.getBoundingClientRect(); m.style.left = Math.min(x, innerWidth - r.width - 8) + "px"; m.style.top = Math.min(y, innerHeight - r.height - 8) + "px";
+  m.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-act]"); if (!b) return; closeChatMenu();
+    const item = document.querySelector(`.chat-item[data-id="${CSS.escape(id)}"]`);
+    if (b.dataset.act === "open") openChat(id);
+    else if (b.dataset.act === "rename" && item) renameInPlace(item.querySelector(".t"), id);
+    else if (b.dataset.act === "delete") deleteChat(id);
+  });
+  m.querySelector("button").focus();
+}
+$("#chatList").addEventListener("contextmenu", (e) => {
+  const item = e.target.closest(".chat-item"); if (!item || e.target.closest(".rename-input")) return;
+  e.preventDefault(); showChatMenu(e.clientX, e.clientY, item.dataset.id);
+});
+$("#chatList").addEventListener("dblclick", (e) => { const item = e.target.closest(".chat-item"); if (item && !e.target.closest(".del")) renameInPlace(item.querySelector(".t"), item.dataset.id); });
+$("#title").addEventListener("dblclick", () => { if (state.chat) renameInPlace($("#title"), state.chat.id); });
+$("#title").title = "Double-click to rename";
+document.addEventListener("pointerdown", (e) => { if (!e.target.closest("#chatMenu")) closeChatMenu(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeChatMenu(); });
+window.addEventListener("blur", closeChatMenu);
 $("#toggleSide").addEventListener("click", () => $("#sidebar").classList.toggle("hidden"));
 $("#modelBtn").addEventListener("click", (e) => { e.stopPropagation(); openModelMenu(!$("#modelMenu").classList.contains("open")); });
 $("#modelFilter").addEventListener("input", () => { state.kbIndex = 0; renderModelOptions(); });

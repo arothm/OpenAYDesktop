@@ -41,7 +41,7 @@ import skills
 import web
 
 APP_NAME = "Open AY Desktop"
-APP_VERSION = "1.14.0"
+APP_VERSION = "1.14.1"
 APP_SLUG = "open-ay-desktop"
 REPOSITORY = "arothm/OpenAYDesktop"
 RELEASES_URL = "https://github.com/%s/releases/latest" % REPOSITORY
@@ -202,6 +202,14 @@ def save_browser_chat(chat_id, incoming):
                 if key in existing: incoming[key] = existing[key]
                 else: incoming.pop(key, None)
         save_chat(chat_id, incoming)
+
+
+def refresh_running(chat_id):
+    """After the user renames a chat or changes its settings, a reply running in it keeps an up-to-date copy."""
+    run = ENGINE.active(chat_id)
+    if run:
+        try: run.refresh_session(load_chat(chat_id))
+        except (OSError, ValueError): pass
 
 
 def update_permissions(chat_id, body):
@@ -1332,6 +1340,7 @@ class Handler(BaseHTTPRequestHandler):
                 chat_id = body.get("chatId", "")
                 with chat_lock(chat_id):
                     chat = load_chat(chat_id); result = session_actions.rename(chat, body.get("title")); save_chat(chat_id, chat)
+                refresh_running(chat_id)
                 self._json({"content": result, "title": chat["title"]})
             except (OSError, ValueError) as e: self._json({"error": str(e)}, 400)
         elif p == "/api/skills/import":  # a skill folder, from a folder path or a .skill/.zip file (base64)
@@ -1356,7 +1365,7 @@ class Handler(BaseHTTPRequestHandler):
             try: clear_untrusted(chat_id); self._json({"ok": True})
             except (OSError, ValueError) as e: self._json({"error": str(e)}, 400)
         elif p == "/api/session/permissions":
-            try: self._json(update_permissions(body.get("chatId", ""), body))
+            try: out = update_permissions(body.get("chatId", ""), body); refresh_running(body.get("chatId", "")); self._json(out)
             except (OSError, ValueError) as e: self._json({"error": str(e) or "bad request"}, 400)
         elif p == "/api/trash/restore":
             try: self._json({"content": capabilities.restore_item(capabilities.trash_root(CHATS_DIR), body.get("id", ""))})

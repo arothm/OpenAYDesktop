@@ -89,6 +89,7 @@ SUBTASK_REMINDERS = 2         # times a reply is reminded of unread subtasks bef
 HISTORY = 30                  # finished replies kept for the Activity view
 BALANCE_RECHECK = 60          # seconds between balance checks while paused
 STOP_GRACE = 3                # seconds after Stop before a reply that is still busy is ended anyway
+SESSION_FIELDS = ("title", "folders", "capabilities", "skills", "projectId", "untrusted", "webUrls")  # changed by the user, not the reply
 STUCK_STEP = "Stopped: this step didn't finish, so the reply was ended when you pressed Stop."
 WRAP_UP_NOTE = ("The user's Ollama balance is nearly used up, so this work must pause now. Do not call any tools. "
                 "Write a short summary: what you have done so far, what is left to do, and anything the user should know. "
@@ -111,6 +112,7 @@ PLAN_NOTE = (
 class _Done:
     alive = False
     question = None
+    status = "idle"
 
 
 _DONE = _Done()  # stands in for a subtask that has no running reply
@@ -178,7 +180,10 @@ class Engine:
         return any(r.alive for r in list(self.runs.values()))
 
     def statuses(self):
-        return {cid: r.status for cid, r in list(self.runs.items()) if r.alive}
+        """Every running reply's status: running, waiting (for you), paused (low balance) or wrapping (its last
+        request before pausing)."""
+        return {cid: ("wrapping" if r.wrapping_up and r.status == "running" else r.status)
+                for cid, r in list(self.runs.items()) if r.alive}
 
     def snapshot(self, chat_id):
         """(snapshot event, channel seq it is current as of)."""
@@ -267,6 +272,7 @@ class Run:
         self.question = None       # this subtask's question while it waits for the parent's answer
         self.sent = 0              # messages this reply sent to its parent or subtasks
         self.reminders = 0
+        self.paused_seen = set()   # subtasks whose low-balance pause the model has been told about
         self.approval = None
         self.response = None
         self.use_tools = True
@@ -337,8 +343,31 @@ class Run:
         return {"id": a["id"], "kind": a["kind"], "data": a["data"]} if a else None
 
     def snapshot_event(self):
-        return {"type": "snapshot", "chat": copy.deepcopy(self.chat), "status": self.status, "approval": self.public_approval(),
+        chat = copy.deepcopy(self.chat)
+        try:  # the name, folders and permissions the user changed while this reply runs live on disk
+            disk = self.srv.load_chat(self.chat_id)
+            for key in SESSION_FIELDS:
+                if key in disk:
+                    chat[key] = disk[key]
+                else:
+                    chat.pop(key, None)
+        except (OSError, ValueError):
+            pass
+        return {"type": "snapshot", "chat": chat, "status": self.status, "approval": self.public_approval(),
                 "pause": copy.deepcopy(self.pause)}
+
+    def refresh_session(self, disk):
+        """The user renamed the chat or changed its settings while this reply runs: keep this copy current and
+        tell open windows."""
+        with self.lock:
+            changed = {}
+            for key in SESSION_FIELDS:
+                if key in disk:
+                    self.chat[key] = changed[key] = copy.deepcopy(disk[key])
+                elif key in self.chat:
+                    self.chat.pop(key, None)
+                    changed[key] = None
+            self.publish({"type": "session", "chat": changed})
 
     def publish(self, event):
         if not self.detached:
@@ -560,6 +589,8 @@ class Run:
                                                                 "read_skill_file" in names, "run_command" in names)]
         if specs:
             system.append(srv.tool_system_note(fcfg, specs, where))
+        elif fcfg.get("parentId"):  # no tools (a wrap-up, or a model without tools): it's still a helper
+            system.append("You are a subtask helper: do the task you were given and finish with a complete, self-contained answer.")
         if self.plan:
             system.append(PLAN_NOTE)
         note = "\n\n".join(x for x in system if x)
@@ -867,7 +898,13 @@ class Run:
             while not self.cancelled.is_set():
                 running = [c for c in ids if (self.child_run(c) or _DONE).alive]
                 asked = any(u["question"] for u in self.updates) or any((self.child_run(c) or _DONE).question for c in running)
-                if not running or asked or (end is not None and time.time() >= end):
+                for c in running:
+                    if (self.child_run(c) or _DONE).status != "paused":
+                        self.paused_seen.discard(c)  # it continued: a later pause is news again
+                paused = [c for c in running if (self.child_run(c) or _DONE).status == "paused" and c not in self.paused_seen]
+                # every one still running is paused for the balance: waiting changes nothing, so this reply can pause too
+                all_paused = running and all((self.child_run(c) or _DONE).status == "paused" for c in running)
+                if not running or asked or paused or all_paused or (end is not None and time.time() >= end):
                     break
                 self.news.wait(0.5)
             news, self.updates = self.updates, []
@@ -881,7 +918,14 @@ class Run:
                 q = run.question
                 if q is not None and not any(u is q for u in news):  # asked earlier and still unanswered
                     notes.append(self.describe(q))
-                if q is not None or any(u["question"] and u["child"] == cid for u in news):
+                if run.status == "paused":
+                    self.paused_seen.add(cid)
+                    text = ('Subtask "%s" (id %s) is paused: the Ollama balance is at or below the minimum in Settings. It '
+                            "continues by itself when the balance is topped up; call wait_subtasks then for its result." % (title, cid))
+                    summary = next((m.get("content") for m in reversed(run.chat["messages"]) if m.get("wrapUp") and m.get("content")), "")
+                    if summary:
+                        text += " Its progress so far:\n\n" + summary[:SUBTASK_RESULT_CHARS]
+                elif q is not None or any(u["question"] and u["child"] == cid for u in news):
                     text += (" It is waiting for your answer: reply with message_subtask (subtask \"%s\"), then call "
                              "wait_subtasks for its result." % cid)
                 else:

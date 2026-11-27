@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It runs as an **Electron** desktop app, with a local Python 3 server (standard library only) doing the work. It can also still open in an Edge or Chrome app window without Electron. There is no frontend framework or build step for the interface itself.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.14.0
+- **Version:** 1.14.1
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -199,6 +199,7 @@ With **Allow subtasks** on, the model can hand self-contained pieces of work to 
   - In a subtask chat, messages from the parent show as "From the parent chat"; a subtask waiting for an answer shows "waiting for the parent…".
   - Messages are treated as findings or instructions from the other chat, never as yours, and they follow the untrusted rule above in both directions. At most 30 messages per reply, 8,000 characters each.
   - If a reply ends while its subtasks are still running or unread, it's reminded twice to read them; subtasks still running when it ends are stopped.
+- **Low balance.** A subtask wraps up and pauses like any reply. Its step in the parent shows "wrapping up…" or "paused: low balance", and the parent stops waiting, reads its progress summary, and pauses too. Both continue when the balance is topped up.
 - **Bounded.** At most 6 subtasks per reply, and they count toward the limits in Settings.
 - **Stopped and deleted with the parent.** Stopping the parent stops its subtasks, and deleting the parent deletes them.
 
@@ -260,6 +261,8 @@ The installed app checks GitHub Releases at start and every 6 hours (Settings > 
 ## Features
 Streaming replies, Markdown and code highlighting, collapsible thinking/reasoning panels, image and document attachments, stop, regenerate, edit-and-resend, full-text search, projects, memory, plan mode, undo, scheduled tasks, a terminal and preview panel, export, and server-approved folder tools.
 
+Rename a chat by double-clicking its name in the header or sidebar, or right-click it in the sidebar for Open, Rename and Delete. Right-clicking text or a text box gives Cut, Copy, Paste and Select all, with spelling suggestions.
+
 **Isolated subtasks**: with Git set to commit or more and subtasks on, the model can start a helper with `isolated: true`. The helper works in its own Git worktree and branch (`openay/<chat id>`), so several helpers can change code at once without touching your working tree. Its work is committed on that branch when it finishes, and `git_merge` brings it in after you approve. Deleting the helper chat removes the worktree; the branch stays.
 
 ## Persistence and reliability
@@ -304,7 +307,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `package.json` — Electron and electron-builder setup (`npm start`, `npm run smoke`, `npm run dist`, `npm run release`).
 - `scripts/fetch-python.js` — downloads and verifies the embeddable Python that the installer bundles.
 - `scripts/release.js` — publishes the built installer as a GitHub Release for the updater (`npm run release`).
-- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`, `test_git.py`, `test_commands.py`, `test_tokens.py`, `test_features.py`, `test_skill_folders.py`, `test_git_processes.py`, `test_stop.py`, `test_subtask_messages.py`).
+- `tests/` — isolated standard-library tests (`test_server.py`, `test_capabilities.py`, `test_runs.py`, `test_phase3.py`, `test_phase4.py`, `test_balance.py`, `test_git.py`, `test_commands.py`, `test_tokens.py`, `test_features.py`, `test_skill_folders.py`, `test_git_processes.py`, `test_stop.py`, `test_subtask_messages.py`, `test_session_refresh.py`).
 - `verify_static.py` — optional static consistency checks.
 - `backups/pre-approved-changes/` — original source copies from before the first approved change set.
 

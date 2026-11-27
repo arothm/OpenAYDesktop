@@ -135,10 +135,30 @@ function createWindow() {
   const external = (url) => { if (/^https:\/\//i.test(url)) shell.openExternal(url); };
   win.webContents.setWindowOpenHandler(({ url }) => { external(url); return { action: "deny" }; });
   win.webContents.on("will-navigate", (e, url) => { if (!url.startsWith(origin + "/")) { e.preventDefault(); external(url); } });
+  win.webContents.on("context-menu", (_e, p) => textMenu(p));  // pages that show their own menu (the sidebar) prevent this
   win.on("close", onClose);
   if (SMOKE) win.webContents.once("did-finish-load", smokeReport);
   else win.once("ready-to-show", () => win.show());
   win.loadURL(origin + "/");
+}
+
+// Right-click on text, a text box or a link: the usual Cut / Copy / Paste menu, with spelling fixes
+function textMenu(p) {
+  const items = [];
+  for (const word of (p.dictionarySuggestions || []).slice(0, 5)) items.push({ label: word, click: () => win.webContents.replaceMisspelling(word) });
+  if (items.length) items.push({ type: "separator" });
+  if (p.isEditable) {
+    items.push({ role: "undo", enabled: p.editFlags.canUndo }, { role: "redo", enabled: p.editFlags.canRedo }, { type: "separator" },
+               { role: "cut", enabled: p.editFlags.canCut }, { role: "copy", enabled: p.editFlags.canCopy },
+               { role: "paste", enabled: p.editFlags.canPaste }, { type: "separator" }, { role: "selectAll" });
+  } else if (p.selectionText && p.selectionText.trim()) {
+    items.push({ role: "copy" }, { role: "selectAll" });
+  }
+  if (p.linkURL && /^https?:\/\//i.test(p.linkURL)) {
+    if (items.length) items.push({ type: "separator" });
+    items.push({ label: "Copy link", click: () => require("electron").clipboard.writeText(p.linkURL) });
+  }
+  if (items.length) Menu.buildFromTemplate(items).popup({ window: win });
 }
 
 function showWindow() {

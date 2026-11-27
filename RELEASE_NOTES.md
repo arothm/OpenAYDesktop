@@ -1,3 +1,28 @@
+# Open AY Desktop 1.14.1
+
+Fixes for subtasks, renaming and right-click.
+
+## Fixed
+- **Subtasks didn't show in the sidebar while running.** The list now updates as soon as a subtask starts, under its parent and in its project.
+- **Renaming a chat while it was replying didn't stick.** The running reply kept the old name and showed it again when you came back. Renames and settings changes now reach a running reply at once.
+- **No right-click menu.** Right-clicking text or a text box now offers Cut, Copy, Paste and Select all, with spelling suggestions and Copy link.
+- **You couldn't tell whether subtasks were wrapping up.**
+  - A subtask's step now shows "wrapping up…" or "paused: low balance", and the sidebar dot changes to match.
+  - When a subtask pauses for the balance, the parent stops waiting, reads its progress summary, and pauses too. Both continue when you top up.
+- **Expanding a running subtask showed an empty box.** It now says the subtask works in its own chat and that its answer appears when it finishes.
+
+## New
+- **Rename in place:**
+  - double-click a chat's name in the header or the sidebar;
+  - or right-click it in the sidebar for Open, Rename and Delete.
+
+## Verification
+- 167 automated tests (3 new).
+- A live check in the window: two subtasks under a parent in a project, one pausing for low balance, renames while running.
+- The packaged-app smoke test.
+
+---
+
 # Open AY Desktop 1.14.0
 
 Parent chats and their subtasks can now message each other while they work.
