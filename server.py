@@ -41,7 +41,7 @@ import skills
 import web
 
 APP_NAME = "Open AY Desktop"
-APP_VERSION = "1.16.0"
+APP_VERSION = "1.16.1"
 APP_SLUG = "open-ay-desktop"
 REPOSITORY = "arothm/OpenAYDesktop"
 RELEASES_URL = "https://github.com/%s/releases/latest" % REPOSITORY
@@ -709,6 +709,9 @@ def tool_specs(cfg, plan=False):
         specs.append(fn("set_subtask_mode", "Change a subtask's permission mode: manual (asks the user before every change), auto (edits files "
                         "without asking) or bypass (asks nothing). At most this chat's own mode (%s)." % pol["mode"],
                         {"subtask": s, "mode": {"type": "string", "enum": list(capabilities.MODES)}}, ["subtask", "mode"]))
+        specs.append(fn("rename_subtask", "Rename one of this chat's subtasks (id or title).", {"subtask": s, "title": s}, ["subtask", "title"]))
+        specs.append(fn("delete_subtask", "Delete one of this chat's subtasks and its messages, stopping it if it runs. Only when the user asks."
+                        + ("" if pol["mode"] == "bypass" else " The user approves it first."), {"subtask": s}, ["subtask"]))
         specs.append(fn("message_subtask", "Answer a subtask's question or send it a follow-up (subtask: id or title).",
                         {"subtask": s, "message": s}, ["subtask", "message"]))
         specs.append(fn("wait_subtasks", "Wait for subtasks' results and messages (default: all unread).",

@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It runs as an **Electron** desktop app, with a local Python 3 server (standard library only) doing the work. It can also still open in an Edge or Chrome app window without Electron. There is no frontend framework or build step for the interface itself.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.16.0
+- **Version:** 1.16.1
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -194,6 +194,10 @@ The model can hand self-contained pieces of work to helper chats with `start_sub
   - `message_parent`: a subtask sends a progress note, or asks a question with `wait_for_reply` and pauses until the parent answers (up to 30 minutes). A parent that is waiting for its subtasks stops waiting as soon as one asks, so its model can answer.
   - `message_subtask`: the parent answers a question, or sends a follow-up that the subtask reads before its next step. A subtask that has already finished continues with the message as a new reply, so the parent can ask for more without starting over.
   - `wait_subtasks`: the parent waits for results and messages.
+- **Managing them.** The parent's model can also:
+  - `rename_subtask`: rename a subtask, without asking;
+  - `set_subtask_mode`: change its permission mode, never above the parent's own;
+  - `delete_subtask`: delete a subtask and its messages, stopping it first if it's running. Outside **Bypass permissions** you approve each deletion; the files it changed stay as they are.
   - In a subtask chat, messages from the parent show as "From the parent chat"; a subtask waiting for an answer shows "waiting for the parent…".
   - Messages are treated as findings or instructions from the other chat, never as yours, and they follow the untrusted rule above in both directions. At most 30 messages per reply, 8,000 characters each.
   - If a reply ends while its subtasks are still running or unread, it's reminded twice to read them; subtasks still running when it ends are stopped.

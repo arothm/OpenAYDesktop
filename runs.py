@@ -1179,6 +1179,44 @@ class Run:
         srv.refresh_running(child_id)  # its next tool call follows the new mode
         return '"%s" is now in %s mode.' % (title, {"manual": "Manual approve", "auto": "Auto edits", "bypass": "Bypass permissions"}[mode])
 
+    def rename_subtask(self, idx, args):
+        """The parent renames one of its subtasks (no approval: it changes only the chat's name)."""
+        srv = self.srv
+        if not capabilities.policy(srv.saved_tool_config(self.chat_id))["subtasks"]:
+            raise srv.ToolError("Subtasks are off for this session.")
+        child_id, title = self.find_subtask(args.get("subtask"))
+        try:
+            new = srv.session_actions.clean_title(args.get("title"))
+        except ValueError as e:
+            raise srv.ToolError(str(e))
+        self.update(idx, display="%s → %s" % (title, new), subtaskId=child_id)
+        with srv.chat_lock(child_id):
+            chat = srv.load_chat(child_id)
+            srv.session_actions.rename(chat, new)
+            srv.save_chat(child_id, chat)
+        srv.refresh_running(child_id)
+        if child_id in self.pending:
+            self.pending[child_id] = new
+        return 'Renamed "%s" to "%s".' % (title, new)
+
+    def delete_subtask(self, idx, args):
+        """The parent deletes one of its subtasks, stopping it first if it runs. Outside Bypass the user approves it."""
+        srv = self.srv
+        pol = capabilities.policy(srv.saved_tool_config(self.chat_id))
+        if not pol["subtasks"]:
+            raise srv.ToolError("Subtasks are off for this session.")
+        child_id, title = self.find_subtask(args.get("subtask"))
+        running = self.engine.active(child_id) is not None
+        self.update(idx, display=title, subtaskId=child_id)
+        if pol["mode"] != "bypass":
+            self.ask(idx, {"title": "Delete this subtask?",
+                           "detail": "Subtask: %s%s" % (title, "\nIt is still running and will be stopped." if running else ""),
+                           "why": "The subtask chat and its messages are deleted, which can't be undone. Files it changed stay as they are."},
+                     "The user didn't allow deleting this subtask.")
+        srv.delete_chat(child_id)
+        self.pending.pop(child_id, None)
+        return 'Deleted the subtask "%s"%s.' % (title, " (it was stopped first)" if running else "")
+
     def find_subtask(self, ref):
         """A subtask chat of this chat, by id or title (this reply's subtasks first)."""
         ref = str(ref or "").strip()
@@ -1342,6 +1380,10 @@ class Run:
                 out = self.message_subtask(idx, args)
             elif name == "set_subtask_mode":
                 out = self.set_subtask_mode(idx, args)
+            elif name == "rename_subtask":
+                out = self.rename_subtask(idx, args)
+            elif name == "delete_subtask":
+                out = self.delete_subtask(idx, args)
             elif name == "wait_subtasks":
                 self.update(idx, display="Waiting for subtasks")
                 out = self.wait_subtasks(args)

@@ -100,7 +100,35 @@ class SubtaskModeTests(test_phase4.SubtaskTestCase):
         child = next(c for c in server.list_chats() if c.get("parentId") == cid)
         self.assertEqual("manual", server.load_chat(child["id"])["capabilities"]["mode"])
         names = {s["function"]["name"] for s in server.tool_specs(server.saved_tool_config(child["id"]))[0]}
-        self.assertNotIn("set_subtask_mode", names)  # subtasks have no subtasks
+        self.assertFalse({"set_subtask_mode", "rename_subtask", "delete_subtask"} & names)  # subtasks have no subtasks
+
+    def kids(self, cid):
+        return [c for c in server.list_chats() if c.get("parentId") == cid]
+
+    def test_the_main_chat_renames_a_subtask(self):
+        cid = self.parent(mode="manual")
+        self.script = [call("start_subtask", task="look up prices", title="Helper"),
+                       call("rename_subtask", subtask="Helper", title="Price research"), say("done")]
+        chat = self.run_to_end(cid)  # renaming never asks
+        self.assertEqual(["Price research"], [c["title"] for c in self.kids(cid)])
+        self.assertIn('Renamed "Helper" to "Price research"', next(m for m in chat["messages"] if m.get("tool_name") == "rename_subtask")["content"])
+
+    def test_deleting_a_subtask_asks_outside_bypass(self):
+        cid = self.parent(mode="auto")
+        self.script = [call("start_subtask", task="draft", title="Draft"), call("delete_subtask", subtask="Draft"), say("kept")]
+        self.run_to_end(cid, approve=False)
+        self.assertEqual(1, len(self.kids(cid)))  # denied: still there
+        self.script = [call("delete_subtask", subtask="Draft"), say("gone")]
+        server.ENGINE.start(cid, {"text": "delete it"}); run = self.wait(cid, lambda r: r.approval)
+        self.assertIn("can't be undone", run.approval["data"]["why"]); self.assertIn("Draft", run.approval["data"]["detail"])
+        server.ENGINE.decide(cid, run.approval["id"], True); self.wait(cid)
+        self.assertEqual([], self.kids(cid))
+
+    def test_bypass_deletes_without_asking(self):
+        cid = self.parent(mode="bypass")
+        self.script = [call("start_subtask", task="scratch", title="Scratch"), call("delete_subtask", subtask="Scratch"), say("cleaned up")]
+        chat = self.run_to_end(cid)
+        self.assertEqual([], self.kids(cid)); self.assertEqual("cleaned up", chat["messages"][-1]["content"])
 
 
 class SteerTests(RunTestCase):

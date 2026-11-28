@@ -1,3 +1,16 @@
+# Open AY Desktop 1.16.1
+
+## New
+- **The main chat can rename and delete its subtasks.** Ask it to, for example "rename the helper to Price research" or "delete the scratch subtasks":
+  - **Rename** happens without asking.
+  - **Delete** removes the subtask chat and its messages, stopping it first if it's still running. Outside **Bypass permissions** you approve each deletion; files the subtask changed stay as they are.
+
+## Verification
+- 210 automated tests (3 new).
+- The packaged-app smoke test.
+
+---
+
 # Open AY Desktop 1.16.0
 
 Simpler permissions, writing to a reply while it works, session defaults, and no more stop at 25 steps.
