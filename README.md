@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It runs as an **Electron** desktop app, with a local Python 3 server (standard library only) doing the work. It can also still open in an Edge or Chrome app window without Electron. There is no frontend framework or build step for the interface itself.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.15.0
+- **Version:** 1.16.0
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -54,6 +54,7 @@ The Settings dialog contains only:
 3. **Limits**:
    - **Tokens per day** and **Tokens per chat** count tokens sent and generated, as Ollama reports them; 0 turns a limit off. When a limit is reached, replies stop with a message until you raise the limit.
    - **Replies at the same time** (default 4) caps how many replies, subtasks included, can run at once.
+   - **Steps per reply** (default 100; 0 = no limit) is how many requests to the model one reply can make. A reply that reaches it pauses with a **Continue** button.
 
    - **Allowed commands**: see *Running commands* below.
    - **Pause at balance ($)** (default 1, 0 = off): see *Balance guard* below.
@@ -93,31 +94,28 @@ Settings > Trash lists it. It holds two kinds of items:
 The number on the folder icon shows how many folders the current chat can access. Tool calling needs a compatible model; small models sometimes say they did something without actually calling the tool.
 
 ## Session settings
-**Session settings**, in the menu on the chat's name (top left), are for the current chat only. The server stores them with the chat and checks them on every tool call.
+Every chat has two settings, in **Session settings** (the menu on the chat's name, top left) or the mode chip under the message box:
 
-A chat's folders, permissions and name are **server-owned**. Normal chat saves from the window can't change them, even from an outdated copy. They change only through the validated `/api/session/permissions` and `/api/session/rename` endpoints. A new chat keeps the folders you picked before its first message, but always starts with the default permissions below.
+- **Permission mode**, what asks you first:
 
-- **Session name:** rename the chat. Its ID and history are kept.
-- **File editing:** *Review every file write* (default) or *Auto-edit*. Auto-edit writes without a review dialog, and only inside folders with **Allow edits**.
-- **File/folder creation, copy, move and rename:** off by default. Copy and move never overwrite an existing item.
-- **Recoverable deletion:** off by default. Deleted items go to the app's private trash in `data/trash/` and can be restored by ID. Nothing is permanently deleted.
-- **Session model control:**
-  - *Ask me before each change* (default): when you ask in chat, for example "switch to gpt-oss:120b", an approval dialog shows the current model, the new model and the reason the model gave.
-  - *Change when I ask in chat, without confirming*: switches without the dialog.
-  - *Fixed*: the session can't change its model.
+  | Mode | Without asking | Asks first |
+  |---|---|---|
+  | **Manual approve** (default) | reading files, searching, Git status and history | every file write or edit (review dialog), every create, copy, move, delete or restore, every command, commit, merge, push and pull request, and model changes |
+  | **Auto edits** | also file writes, edits, create, copy, move, delete (to Trash) and restore, and commands on your allowed list | other commands, commits, merges, pushes, pull requests, model changes; after the chat reads web content, every command and memory note |
+  | **Bypass permissions** | everything | nothing, web content or not |
 
-- **Web search and reading web pages:** off by default. See *Web search* below.
-- **Skills for this chat:** tick the skills this chat should follow. See *Skills* below.
-- **Git and GitHub:** off by default. See *Git and GitHub* below.
-- **Allow running commands:** off by default. See *Running commands* below.
-- **Allow subtasks:** off by default. See *Subtasks* below.
+- **Web search:** the chat can search the web and open any page without asking. See *Web search* below.
 
-  The model is told to switch only when you explicitly ask. Before switching, the server checks that the model exists in Ollama Cloud. It refuses a model without image support if the chat contains images, and warns when the new model doesn't support tools. The new model answers from the next step of the same reply. Your default model in Settings is not changed.
+Every chat can use files (in folders with **Allow edits**), Git up to push, commands (in folders with **Allow edits**), subtasks, instruction files and memory; the mode decides what asks first. Deleted items always go to the app's trash in `data/trash/`, and edited files keep their earlier version there, so changes can be undone in every mode. A subtask always has read-only Git, no commands, no subtasks of its own and a fixed model.
 
-Chats saved before these settings existed get the defaults above. A folder with **Allow edits** still allows reviewed writes, but file management and deletion stay off until you enable them.
+**Settings > Session defaults** sets the mode, web search and skills every new chat starts with. Existing chats keep theirs. A project's mode and web search take precedence for chats in that project; a subtask starts with its parent chat's mode, and the parent's model can change it with `set_subtask_mode`, never above its own mode. **Use defaults** in Session settings fills in the defaults for one chat.
+
+A chat's folders, permissions and name are **server-owned**. Normal chat saves from the window can't change them, even from an outdated copy. They change only through the validated `/api/session/permissions` and `/api/session/rename` endpoints. Chats saved before modes existed get **Auto edits** if they had auto-edit on, and **Manual approve** otherwise.
+
+**Model changes.** The model is told to switch only when you explicitly ask, for example "switch to gpt-oss:120b". Outside Bypass, a dialog shows the current model, the new model and the reason the model gave. Before switching, the server checks that the model exists in Ollama Cloud. It refuses a model without image support if the chat contains images, and warns when the new model doesn't support tools. The new model answers from the next step of the same reply. Your default model in Settings is not changed.
 
 ## Web search
-Turn on **Allow web search and reading web pages** in a chat's Session settings. The model gets two tools, which use Ollama's web API with your API key:
+Turn on **Web search** in a chat's Session settings (or in Settings > Session defaults). The model gets two tools, which use Ollama's web API with your API key:
 - **`web_search`** returns titles, addresses and snippets.
 - **`web_fetch`** reads a page.
 
@@ -125,14 +123,10 @@ The model is told to cite the sources it uses as clickable Markdown links.
 
 Web pages are written by strangers and can contain text aimed at steering the model. The app protects against that in four ways:
 - **Results are marked as data.** Everything from the web is wrapped in clear "untrusted content" markers, which a page can't fake, and the model is told never to follow instructions inside them.
-- **The chat becomes untrusted.** The first time a chat reads web content, a **⚠ Web content** badge appears in the header. From then on in that chat, no matter what its settings say:
-  - every file write or edit needs your review, even with auto-edit;
-  - model switching set to "allowed" asks you first;
-  - every create, copy, move, delete or restore needs your approval.
-- **Opening a page can need approval.** A page address can carry information out of the chat, for example file contents written into a link. So `web_fetch` opens a page without asking only if its address came from a web search in this chat or from your own messages. Links found on a page always need approval.
-- **You decide when to trust it again.** In Session settings, the notice lists what the chat read, and **Trust this chat again** clears the flag. The web content stays in the conversation.
+- **The chat is marked.** The first time a chat reads web content, a **⚠ Web content** badge appears in the header. From then on, in **Auto edits**, every command (even one on your allowed list) and every memory note asks first. **Manual approve** already asks for those, and **Bypass permissions** never asks.
+- **You decide when to trust it again.** In Session settings, the notice lists what the chat read, and **Trust this chat again** clears the mark. The web content stays in the conversation.
 
-One gap remains: the model could still put private information into a search query. The model is told not to, but the app can't check it, so turn on web search only for chats where that risk is acceptable.
+With web search on, the chat opens any page without asking. A page address can carry information out of the chat (file contents written into a link, say), and the model could put private information into a search query; it's told not to, but the app can't check it. Turn on web search only for chats where that's acceptable.
 
 ## Skills
 A skill is a set of instructions you write once and turn on per chat, for example how to review code or the style to write in. Open **Settings > Skills** to:
@@ -150,14 +144,15 @@ Turn skills on for a chat in its Session settings. Enabled skills are added to t
 - **Scripts:** these run only through **Run commands**, under the usual rules. The model runs the script by its full path from a shared folder, and anything not on your allowed list needs your approval.
 
 ## Git and GitHub
-The **Git and GitHub** session setting gives the model Git tools for repositories in the chat's shared folders. It has four levels:
+Every chat gets Git tools for repositories in its shared folders:
 
-| Level | Tools | Your involvement |
+| Tools | Manual approve and Auto edits | Bypass permissions |
 |---|---|---|
-| Off (default) | none | |
-| Read only | `git_status`, `git_diff`, `git_log`, `git_show`, `git_branches`, `gh_pr_list` | none |
-| Read and commit | adds `git_commit` | You review every commit: message, files and full diff. |
-| Read, commit, push and pull requests | adds `git_push` and `gh_pr_create` | You approve every push (remote, branch and commits) and every pull request (title, branches and description). |
+| `git_status`, `git_diff`, `git_log`, `git_show`, `git_branches`, `gh_pr_list` | no approval | no approval |
+| `git_commit`, `git_merge` | you review every commit (message, files and full diff) and merge | no approval |
+| `git_push`, `gh_pr_create` | you approve every push (remote, branch and commits) and pull request (title, branches and description) | no approval |
+
+Subtasks get only the first row.
 
 Safety rules, enforced by the server (`gittools.py`):
 - **Whole repositories only.** A repository is usable only if its **top folder** is inside a shared folder, so sharing a subfolder doesn't open up the whole repository. Committing needs **Allow edits** on that folder.
@@ -172,13 +167,13 @@ Safety rules, enforced by the server (`gittools.py`):
 Pull requests need the [GitHub CLI](https://cli.github.com) installed and signed in (`gh auth login`), and the branch pushed first.
 
 ## Running commands
-With **Allow running commands** on, the model gets `run_command`: one command at a time, run in a shared folder with **Allow edits**, with its output returned.
+A chat with a shared folder with **Allow edits** gets `run_command`: one command at a time, run in such a folder, with its output returned.
 
 **Allowed commands** (Settings) are one per line:
 - `npm test` matches exactly `npm test`. The program name is compared without path or extension, so `npm.cmd test` also matches.
 - `python -m pytest *` matches `python -m pytest` followed by any extra arguments.
 
-A command on the list runs without asking. **Anything else needs your approval**, in a dialog showing the folder, the exact command and the time limit. **In a chat that has read web content, every command needs approval**, even ones on the list.
+In **Auto edits**, a command on the list runs without asking and **anything else needs your approval**, in a dialog showing the folder, the exact command and the time limit; once the chat has read web content, every command needs approval. In **Manual approve** every command asks; in **Bypass permissions** none does.
 
 How commands run (`commands.py`):
 - **No shell.** The line is split the way Windows splits it. Arguments that are shell operators (`&&`, `|`, `;`, `>`, `<`, …) are refused with a clear message, so the model can't expect pipes or chaining to work.
@@ -191,10 +186,10 @@ How commands run (`commands.py`):
 **Important:** a command runs with your Windows account, so it can read or change anything you can, not just the shared folders. Keep the allowed list to commands you'd be happy to run without looking, such as tests, builds and linters.
 
 ## Subtasks
-With **Allow subtasks** on, the model can hand self-contained pieces of work to helper chats with `start_subtask`:
+The model can hand self-contained pieces of work to helper chats with `start_subtask`:
 - **Parallel.** Subtasks requested in the same reply run at the same time. The chat waits for them, then gets each one's final answer and continues.
 - **Visible.** Each subtask is a normal chat, shown under its parent in the sidebar and marked "subtask of …". Its card in the parent chat has an **Open** button, and its approvals appear in its own chat, with an amber dot in the sidebar.
-- **Never more permission than its parent.** A subtask gets the parent's folders and skills and at most its effective permissions. Its model is fixed, and it can't start subtasks of its own. If the parent has read web content, the subtask starts untrusted. If a subtask reads web content, the parent becomes untrusted when the result comes back.
+- **Never more permission than its parent.** A subtask gets the parent's folders, skills, mode and web search, and always has read-only Git, no commands and a fixed model; it can't start subtasks of its own. The parent's model can change a subtask's mode with `set_subtask_mode` (for example to Manual approve), never above its own. If the parent has read web content, the subtask starts untrusted. If a subtask reads web content, the parent becomes untrusted when the result comes back.
 - **Talking to each other.** A parent and its subtasks can message each other while they work:
   - `message_parent`: a subtask sends a progress note, or asks a question with `wait_for_reply` and pauses until the parent answers (up to 30 minutes). A parent that is waiting for its subtasks stops waiting as soon as one asks, so its model can answer.
   - `message_subtask`: the parent answers a question, or sends a follow-up that the subtask reads before its next step. A subtask that has already finished continues with the message as a new reply, so the parent can ask for more without starting over.
@@ -220,11 +215,12 @@ If the balance can't be read, for example because Ollama changes its API, replie
 **Settings > Activity** lists every running reply across all chats, subtasks included. For each one it shows the status (running, waiting for you, wrapping up, paused, or a subtask asking its parent), model, time, steps and tokens, with **Open** and **Stop** buttons. Below that are the most recently finished replies and how they ended (done, stopped, or error).
 
 ## Replies run on the server
-Each reply runs on the app's local server (`runs.py`): the model answers, calls tools, gets their results, and continues, up to 25 steps. The window shows it live through an event stream. As a result:
+Each reply runs on the app's local server (`runs.py`): the model answers, calls tools, gets their results, and continues, up to the step limit (Settings > Usage & limits, 100 by default). The window shows it live through an event stream. As a result:
 - **Switching chats or closing the window doesn't stop a reply.** Reopen the chat to see where it got to. The background server keeps running while any reply is in progress.
 - **Several chats can reply at the same time.** A pulsing dot in the sidebar marks chats that are replying, and an amber dot marks chats waiting for your approval.
 - **Above the message box**, a working line shows what the reply is doing (thinking, writing, reading a file, running a command, waiting for you) and for how long.
-- **Stop** (the ■ button, or Escape in the message box) ends the current chat's reply, including one that's waiting for approval. Escape in a menu, a dialog or a rename only closes that.
+- **You can write while it works.** Type and press Enter (the ■ button becomes send while there's text): the reply reads your message before its next step, and the working line shows it as waiting until then. A reply waiting for its subtasks reads it straight away. A reply that pauses at the step limit shows **Continue**.
+- **Stop** (the ■ button with an empty message box, or Escape in the message box) ends the current chat's reply, including one that's waiting for approval. Escape in a menu, a dialog or a rename only closes that.
 - **Temporary Ollama errors are retried.** When Ollama answers "busy" or a server error, or the connection drops before a reply finishes, the step is tried again after 3, 10 and 30 seconds, with a note in the reply. Only then does the reply stop with the error.
 - **Edit and resend** shows a banner. The earlier message and everything after it are replaced only when you send.
 - While a reply runs, its chat's messages and model can't be changed from elsewhere. Folders and permissions can still change, and they take effect at the next tool call.
@@ -244,9 +240,9 @@ Before each request the server fits the conversation into the **context budget**
 The row under the message box shows the chat's folders, Git level, a context gauge (tokens in the last request out of the model's window), **Compact**, the tokens this chat sent and received, and the model. Today's totals are in Settings > Usage & limits (kept in `data/usage.json` for 90 days).
 
 ## Projects and memory
-- **Projects** (the switcher under the search box, or Manage projects) group chats. A project has folders, starting permissions, skills, written instructions and its own memory. New chats in the project start with all of them.
-- **Memory**: notes chats can use later. Global memory (Settings > Memory) applies everywhere; project memory only in that project. Ask the model to remember something and it saves a note; you can edit or delete notes at any time. A chat that has read web content asks you before saving, so a web page can't plant lasting instructions.
-- **Instruction files**: `AGENTS.md`, `CLAUDE.md` or `.openay/instructions.md` at the top of a shared folder are followed by the chat (Session settings can turn this off). They can't change permissions.
+- **Projects** (the switcher under the search box, or Manage projects) group chats. A project has folders, a starting mode and web search setting, skills, written instructions and its own memory. New chats in the project start with all of them.
+- **Memory**: notes chats can use later. Global memory (Settings > Memory) applies everywhere; project memory only in that project. Ask the model to remember something and it saves a note; you can edit or delete notes at any time. In Manual approve and Auto edits, a chat that has read web content asks you before saving, so a web page can't plant lasting instructions.
+- **Instruction files**: `AGENTS.md`, `CLAUDE.md` or `.openay/instructions.md` at the top of a shared folder are followed by the chat. They can't change permissions.
 
 ## Plan mode, undo and documents
 - **Mode** (next to the paperclip) switches between **Act** and **Plan**. Plan asks for a plan first: the model only gets tools that read, and the server refuses anything else. Then **Carry out this plan**, or reply with changes.
@@ -267,8 +263,8 @@ The installed app checks GitHub Releases at start and every 6 hours (Settings > 
 ## The window
 - **Sidebar:** New chat, search, the project switcher, your sessions (subtasks under their parent), and at the bottom the Ollama balance and Settings.
 - **Top:** the chat's name, with a menu (rename, session settings, terminal and preview, delete), and **Export** on the right.
-- **Message box:** attach (paperclip), mode (**Act** or **Plan**), dictation (microphone) and send. Above it, the working line while a reply runs; under it, folders, Git, the context gauge, **Compact**, tokens and the model.
-- **Settings** has one page per tab: Connection, Usage & limits, Memory, Commands, Skills, Projects, Scheduled tasks, Activity, Trash, and App & updates.
+- **Message box:** attach (paperclip), mode (**Act** or **Plan**), dictation (microphone) and send. Above it, the working line while a reply runs; under it, folders, the permission mode, the context gauge, **Compact**, tokens and the model.
+- **Settings** has one page per tab: Connection, Session defaults, Usage & limits, Memory, Commands, Skills, Projects, Scheduled tasks, Activity, Trash, and App & updates.
 
 ## Features
 Streaming replies, Markdown and code highlighting, collapsible thinking/reasoning panels, image and document attachments, stop, regenerate, edit-and-resend, full-text search, projects, memory, plan mode, undo, scheduled tasks, a terminal and preview panel, export, and server-approved folder tools.

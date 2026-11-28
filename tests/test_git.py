@@ -38,9 +38,12 @@ class GitTestCase(RunTestCase):
         subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(self.remote)], check=True, capture_output=True)
         git(self.repo, "remote", "add", "origin", str(self.remote))
 
-    def git_chat(self, mode, write=True):
+    def git_chat(self, mode="push", write=True):
+        """mode "push": a chat (every chat can use Git up to push). "read": a subtask, which gets read-only Git."""
         c = server.create_chat({"model": "m1", "folders": [{"path": str(self.repo), "write": write}]})
-        server.update_permissions(c["id"], {"capabilities": {"git": mode}})
+        if mode == "read":
+            with server.chat_lock(c["id"]):
+                chat = server.load_chat(c["id"]); chat["parentId"] = "p"; server.save_chat(c["id"], chat)
         return c["id"]
 
     def tool(self, cid, name, **args):
@@ -58,14 +61,10 @@ class ReadToolTests(GitTestCase):
         for bad in ("--output=x.txt", "-p", "a b", "HEAD;rm"):
             with self.assertRaises(server.ToolError): self.tool(cid, "git_show", repo=str(self.repo), rev=bad)
 
-    def test_off_and_levels(self):
-        cid = self.git_chat("off")
-        with self.assertRaises(server.ToolError): self.tool(cid, "git_status", repo=str(self.repo))
+    def test_levels(self):
         names = lambda c: {s["function"]["name"] for s in server.tool_specs(server.saved_tool_config(c))[0]}  # noqa: E731
-        self.assertFalse({n for n in names(cid) if n.startswith(("git_", "gh_"))})
         read = names(self.git_chat("read")); self.assertIn("git_status", read); self.assertNotIn("git_commit", read)
-        commit = names(self.git_chat("commit")); self.assertIn("git_commit", commit); self.assertNotIn("git_push", commit)
-        self.assertTrue({"git_push", "gh_pr_create"} <= names(self.git_chat("push")))
+        self.assertTrue({"git_commit", "git_push", "gh_pr_create"} <= names(self.git_chat("push")))
         with self.assertRaises(gittools.GitError): gittools.prepare(server.saved_tool_config(self.git_chat("read")), "git_commit", {"repo": str(self.repo), "message": "x"})
 
     def test_repository_top_must_be_shared(self):
@@ -77,8 +76,7 @@ class ReadToolTests(GitTestCase):
         with self.assertRaises(server.ToolError): self.tool(c["id"], "git_status", repo=str(self.outside))
 
     def test_subtasks_get_read_only_git(self):
-        parent = server.load_chat(self.git_chat("push"))
-        self.assertEqual("read", capabilities.child_capabilities(parent)["git"])
+        self.assertEqual("read", capabilities.policy(server.load_chat(self.git_chat("read")))["git"])
 
 
 class CommitTests(GitTestCase):
@@ -145,7 +143,7 @@ class PushTests(GitTestCase):
         for bad in ({"remote": "--receive-pack=evil"}, {"branch": "-D"}, {"remote": "../x"}, {"branch": "a b"}):
             with self.assertRaises(gittools.GitError): gittools.prepare(chat, "git_push", dict(repo=str(self.repo), **bad))
         with self.assertRaises(gittools.GitError):  # pushing needs the push level
-            gittools.prepare(server.saved_tool_config(self.git_chat("commit")), "git_push", {"repo": str(self.repo)})
+            gittools.prepare(server.saved_tool_config(self.git_chat("read")), "git_push", {"repo": str(self.repo)})
 
     def test_pull_request_needs_github_cli(self):
         cid = self.git_chat("push"); real_which = shutil.which

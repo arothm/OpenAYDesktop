@@ -726,3 +726,25 @@ header#chatHead { height: 54px; gap: 6px; padding: 0 14px 0 10px; }
   .title-btn { max-width: 60vw; }
   #exportBtn { padding: 0 8px; }
 }
+
+/* 1.16 permission modes */
+.mode-cards { display: grid; gap: 8px; margin: 4px 0 6px; }
+.mode-card { display: flex; gap: 12px; align-items: flex-start; padding: 12px; border-radius: 12px; box-shadow: inset 0 0 0 1px var(--line2); cursor: pointer; transition: background .15s ease, box-shadow .15s ease; }
+.mode-card:hover { background: var(--hover); }
+.mode-card input { position: absolute; opacity: 0; pointer-events: none; }
+.mode-card:has(input:checked) { box-shadow: inset 0 0 0 1.5px var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.mode-card:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mode-card.m-bypass:has(input:checked) { box-shadow: inset 0 0 0 1.5px var(--amber, #d29922); background: color-mix(in srgb, var(--amber, #d29922) 9%, transparent); }
+.mode-card .ptext { display: flex; flex-direction: column; gap: 2px; }
+.mode-wrap { position: relative; display: inline-flex; }
+.mode-menu { left: 0; right: auto; top: auto; bottom: calc(100% + 8px); width: 320px; transform-origin: bottom left; }
+.mode-menu button { height: auto; align-items: flex-start; padding: 8px 10px; }
+.mode-menu button .ico { margin-top: 2px; flex: none; }
+.mode-menu button > span { display: flex; flex-direction: column; gap: 2px; }
+.mode-menu button .d { color: var(--muted); font-size: 12px; line-height: 1.35; white-space: normal; }
+.mode-menu button.sel b { color: var(--accent); }
+#modeBtn.bypass { color: var(--amber, #d29922); }
+#modeBtn.auto { color: var(--text); }
+details.help summary { cursor: pointer; margin: 4px 0; }
+
+.msg.assistant.pending { display: none; }

@@ -120,7 +120,7 @@ class RetryAndCompactTests(RunTestCase):
             server.ENGINE.start(cid, {"compact": True})
 
     def test_copy_and_move_steps_name_where_the_file_is_now(self):
-        cid = self.chat(fileManage=True)
+        cid = self.chat(mode="auto")
         (self.shared / "a.txt").write_text("a", encoding="utf-8")
         self.script = [call("copy_path", source=str(self.shared / "a.txt"), destination=str(self.shared / "b.txt")), say("done")]
         chat = self.run_to_end(cid)
@@ -163,11 +163,12 @@ class EngineMemoryTests(RunTestCase):
 
 class ChatListCacheTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(); self._old = server.CHATS_DIR
+        self.temp = tempfile.TemporaryDirectory(); self._old = server.CHATS_DIR, server.CONFIG_PATH
         server.CHATS_DIR = os.path.join(self.temp.name, "chats"); os.makedirs(server.CHATS_DIR)
+        server.CONFIG_PATH = os.path.join(self.temp.name, "config.json")
 
     def tearDown(self):
-        server.CHATS_DIR = self._old; self.temp.cleanup()
+        server.CHATS_DIR, server.CONFIG_PATH = self._old; self.temp.cleanup()
 
     def test_the_list_follows_changes_and_reads_only_changed_files(self):
         a = server.create_chat({"model": "m", "title": "First"}); server.create_chat({"model": "m", "title": "Second"})

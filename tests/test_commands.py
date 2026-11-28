@@ -77,8 +77,8 @@ class ExecuteTests(RunTestCase):
         ro_dir = self.shared.parent / "ro"; ro_dir.mkdir()
         server.update_permissions(cid, {"folders": [{"path": str(self.shared), "write": True}, {"path": str(ro_dir), "write": False}]})
         with self.assertRaises(commands.CommandError): self.plan(cid, line("-V"), cwd=str(ro_dir))
-        with self.assertRaises(commands.CommandError): self.plan(self.chat(), line("-V"))  # commands off
-        ro = self.chat(write=False, commands=True)  # no writable folder: the permission can't be on
+        ro = self.chat(write=False)  # no writable folder: no commands
+        with self.assertRaises(commands.CommandError): self.plan(ro, line("-V"))
         self.assertFalse(capabilities.policy(server.saved_tool_config(ro))["commands"])
 
     def test_time_limit_and_stop_end_the_process(self):
@@ -107,7 +107,7 @@ class RunCommandToolTests(RunTestCase):
         self.cfg_patch.stop(); super().tearDown()
 
     def test_allowed_command_runs_without_asking(self):
-        cid = self.chat(commands=True); self.script = [call("run_command", command=self.allowed[0]), say("it printed 42")]
+        cid = self.chat(mode="auto"); self.script = [call("run_command", command=self.allowed[0]), say("it printed 42")]
         chat = self.run_to_end(cid)  # fails if an approval is requested
         self.assertIn("42", chat["messages"][2]["content"])
         spec = next(s for s in server.tool_specs(server.saved_tool_config(cid))[0] if s["function"]["name"] == "run_command")
@@ -123,17 +123,17 @@ class RunCommandToolTests(RunTestCase):
         self.run_to_end(cid, approve=True); self.assertTrue(marker.exists())
 
     def test_untrusted_chat_asks_even_for_allowed_commands(self):
-        cid = self.chat(commands=True); server.mark_untrusted(cid, "page: x", [])
+        cid = self.chat(mode="auto"); server.mark_untrusted(cid, "page: x", [])
         self.script = [call("run_command", command=self.allowed[0]), say("ok")]
         server.ENGINE.start(cid, {"text": "go"}); run = self.wait(cid, lambda r: r.approval)
         self.assertIn("web content", run.approval["data"]["why"]); server.ENGINE.decide(cid, run.approval["id"], False); self.wait(cid)
 
     def test_not_offered_when_off_or_in_subtasks(self):
         names = lambda c: {s["function"]["name"] for s in server.tool_specs(c)[0]}  # noqa: E731
-        self.assertNotIn("run_command", names(server.saved_tool_config(self.chat())))
-        parent = server.saved_tool_config(self.chat(commands=True, subtasks=True))
+        self.assertNotIn("run_command", names(server.saved_tool_config(self.chat(write=False))))
+        parent = server.saved_tool_config(self.chat())
         self.assertIn("run_command", names(parent))
-        self.assertFalse(capabilities.child_capabilities(parent)["commands"])
+        self.assertFalse(capabilities.policy(dict(parent, parentId="p"))["commands"])
 
 
 if __name__ == "__main__":

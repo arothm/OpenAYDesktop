@@ -41,7 +41,7 @@ import skills
 import web
 
 APP_NAME = "Open AY Desktop"
-APP_VERSION = "1.15.0"
+APP_VERSION = "1.16.0"
 APP_SLUG = "open-ay-desktop"
 REPOSITORY = "arothm/OpenAYDesktop"
 RELEASES_URL = "https://github.com/%s/releases/latest" % REPOSITORY
@@ -57,11 +57,13 @@ CLOUD_URL = "https://ollama.com"
 # minBalanceUsd: replies wrap up and pause when the Ollama balance is at or below this (0 = off).
 DEFAULT_CONFIG = {"apiKey": "", "defaultModel": "", "think": "default",
                   "dailyTokenLimit": 0, "chatTokenLimit": 0, "maxConcurrentRuns": 4, "minBalanceUsd": 1.0,
+                  "maxSteps": 100,  # model requests in one reply before it pauses for "Continue" (0 = no limit)
                   "allowedCommands": [],  # see commands.py
                   "contextBudget": "full",  # see context_budget.BUDGETS
                   "autoUpdate": True, "quickEntry": True,
-                  "keepInTray": False, "startAtLogin": False}  # Electron: keep running in the tray / start with Windows
-LIMIT_RANGES = {"dailyTokenLimit": (0, 10_000_000_000), "chatTokenLimit": (0, 10_000_000_000), "maxConcurrentRuns": (1, 20)}
+                  "keepInTray": False, "startAtLogin": False,  # Electron: keep running in the tray / start with Windows
+                  "sessionDefaults": {}}  # what new chats start with: {"capabilities": {...}, "skills": [...]}; see session_defaults
+LIMIT_RANGES = {"dailyTokenLimit": (0, 10_000_000_000), "chatTokenLimit": (0, 10_000_000_000), "maxConcurrentRuns": (1, 20), "maxSteps": (0, 10_000)}
 VENDOR_FILES = {
     "marked.min.js": {"url": "https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js", "type": "application/javascript; charset=utf-8"},
     "purify.min.js": {"url": "https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js", "type": "application/javascript; charset=utf-8"},
@@ -195,7 +197,7 @@ def save_browser_chat(chat_id, incoming):
         if existing is None:  # new chat: folders picked before the first message are accepted, permissions start at defaults
             try: incoming["folders"] = capabilities.clean_folders(incoming.get("folders") or [])
             except capabilities.CapabilityError as e: raise ValueError(str(e))
-            incoming["capabilities"] = dict(capabilities.DEFAULT_POLICY)
+            defaults = session_defaults(); incoming["capabilities"] = defaults["capabilities"]; incoming["skills"] = defaults["skills"]
             try: incoming["title"] = session_actions.clean_title(incoming.get("title") or "Untitled")
             except ValueError: incoming["title"] = "Untitled"
         else:
@@ -220,10 +222,7 @@ def update_permissions(chat_id, body):
         try:
             if "folders" in body: chat["folders"] = capabilities.clean_folders(body["folders"])
             if "capabilities" in body:
-                merged = dict(capabilities.DEFAULT_POLICY)
-                merged.update(capabilities.clean_capabilities(chat.get("capabilities") or {}))  # keep valid saved values
-                merged.update(capabilities.clean_capabilities(body["capabilities"]))
-                chat["capabilities"] = merged
+                chat["capabilities"] = capabilities.stored(chat.get("capabilities"), capabilities.clean_capabilities(body["capabilities"]))
             if "skills" in body: chat["skills"] = skills.valid_ids(skills_root(), body["skills"])
             if "projectId" in body:
                 if body["projectId"]: chat["projectId"] = projects.get_project(data_root(), body["projectId"])["id"]
@@ -279,8 +278,35 @@ def cloud_post(path, body):
     except (OSError, ValueError) as e: raise web.WebError("Could not reach Ollama's web service: %s" % e)
 
 
+def session_defaults(cfg=None):
+    """What a new chat starts with (Settings > Session defaults): the built-in policy with the user's
+    saved choices on top, and default skills that still exist. Saved values that no longer validate are ignored."""
+    saved = (cfg or load_config()).get("sessionDefaults")
+    saved = saved if isinstance(saved, dict) else {}
+    raw = saved.get("capabilities") if isinstance(saved.get("capabilities"), dict) else {}
+    valid = {}
+    for k, v in raw.items():  # one bad value doesn't discard the others
+        try: valid.update(capabilities.clean_capabilities({k: v}))
+        except capabilities.CapabilityError: pass
+    caps = capabilities.stored(capabilities.DEFAULT_POLICY, valid)
+    ids = saved.get("skills") if isinstance(saved.get("skills"), list) else []
+    root = skills_root()
+    return {"capabilities": caps, "skills": [i for i in dict.fromkeys(ids) if isinstance(i, str) and skills.exists(root, i)]}
+
+
+def clean_session_defaults(value):
+    """Validate Settings > Session defaults from the window (raises ValueError)."""
+    if not isinstance(value, dict): raise ValueError("sessionDefaults must be an object.")
+    try:
+        caps = capabilities.stored(capabilities.DEFAULT_POLICY, capabilities.clean_capabilities(value.get("capabilities") or {}))
+        ids = skills.valid_ids(skills_root(), value.get("skills") or [])
+    except (capabilities.CapabilityError, skills.SkillError) as e: raise ValueError(str(e))
+    return {"capabilities": caps, "skills": ids}
+
+
 def create_chat(body):
-    """New chat from the window: model, folders picked before the first message, default permissions."""
+    """New chat from the window: model, folders picked before the first message, and the permissions and
+    skills from Settings > Session defaults (a project's starting permissions win over those)."""
     model = str(body.get("model") or "").strip()
     if not model or len(model) > 200: raise ValueError("Pick a cloud model first.")
     try: folders = capabilities.clean_folders(body.get("folders") or [])
@@ -288,16 +314,24 @@ def create_chat(body):
     try: title = session_actions.clean_title(body.get("title") or "New chat")
     except ValueError: title = "New chat"
     chat_id = "c" + secrets.token_hex(7); now = int(time.time() * 1000)
+    defaults = session_defaults()
     chat = {"title": title, "model": model, "created": now, "updated": now, "messages": [],
-            "folders": folders, "capabilities": dict(capabilities.DEFAULT_POLICY)}
+            "folders": folders, "capabilities": defaults["capabilities"]}
+    if defaults["skills"]: chat["skills"] = defaults["skills"]
     if body.get("projectId"):  # a chat in a project starts with the project's folders, permissions and skills
         try: project = projects.get_project(data_root(), body["projectId"])
         except projects.ProjectError as e: raise ValueError(str(e))
         chat["projectId"] = project["id"]
         known = {os.path.normcase(f["path"]) for f in project.get("folders") or []}
         chat["folders"] = [dict(f) for f in project.get("folders") or []] + [f for f in folders if os.path.normcase(f["path"]) not in known]
-        chat["capabilities"].update(capabilities.clean_capabilities(project.get("capabilities") or {}))
-        chat["skills"] = skills.valid_ids(skills_root(), project.get("skills") or [])
+        try: pc = capabilities.clean_capabilities(project.get("capabilities") or {})
+        except capabilities.CapabilityError: pc = {}
+        chat["capabilities"] = capabilities.stored(chat["capabilities"], pc)  # a project without a mode keeps the default one
+        project_skills = skills.valid_ids(skills_root(), project.get("skills") or [])
+        chat["skills"] = list(dict.fromkeys(defaults["skills"] + project_skills))  # default skills plus the project's
+    if isinstance(body.get("capabilities"), dict):  # a mode picked in the window before the first message
+        try: chat["capabilities"] = capabilities.stored(chat["capabilities"], capabilities.clean_capabilities(body["capabilities"]))
+        except capabilities.CapabilityError as e: raise ValueError(str(e))
     save_chat(chat_id, chat)
     chat = load_chat(chat_id); chat.pop("_path", None); return chat
 
@@ -633,9 +667,10 @@ def tool_specs(cfg, plan=False):
     if pol["webSearch"]:
         specs.extend([
             fn("web_search", "Search the web. Returns titles, URLs and snippets.", {"query": s, "max_results": {"type": "integer", "description": "1-10, default 5"}}, ["query"]),
-            fn("web_fetch", "Read a web page. Pages not from a search or the user's messages need the user's approval.", {"url": s}, ["url"]),
+            fn("web_fetch", "Read a web page.", {"url": s}, ["url"]),
         ])
     git_level = gittools.level(pol)
+    approves = " The user approves it first." if pol.get("askGit", True) else ""
     if roots and git_level:
         repo = {"type": "string", "description": "Repository path (or a folder in it)"}
         specs.extend([
@@ -647,21 +682,22 @@ def tool_specs(cfg, plan=False):
             fn("gh_pr_list", "Open GitHub pull requests.", {"repo": repo}, ["repo"]),
         ])
         if git_level >= 2:
-            specs.append(fn("git_commit", "Commit changes (paths, or all=true). The user reviews it first.",
+            specs.append(fn("git_commit", "Commit changes (paths, or all=true)." + approves,
                             {"repo": repo, "message": s, "paths": {"type": "array", "items": s}, "all": b}, ["repo", "message"]))
-            specs.append(fn("git_merge", "Merge a branch into the current branch. The user approves it first.",
+            specs.append(fn("git_merge", "Merge a branch into the current branch." + approves,
                             {"repo": repo, "branch": s}, ["repo", "branch"]))
         if git_level >= 3:
             specs.extend([
-                fn("git_push", "Push a branch (never forced). The user approves it first.", {"repo": repo, "remote": s, "branch": s}, ["repo"]),
-                fn("gh_pr_create", "Open a GitHub pull request from the current branch (push first). The user approves it first.",
+                fn("git_push", "Push a branch (never forced)." + approves, {"repo": repo, "remote": s, "branch": s}, ["repo"]),
+                fn("gh_pr_create", "Open a GitHub pull request from the current branch (push first)." + approves,
                    {"repo": repo, "title": s, "body": s, "base": s}, ["repo", "title", "body"]),
             ])
     if roots and pol["commands"]:
         allowed = load_config().get("allowedCommands") or []
         specs.append(fn("run_command", "Run one command (no shell: no &&, pipes or redirects) in a writable shared folder. "
-                        + ("Allowed without asking: %s. Anything else needs the user's approval." % "; ".join(allowed)
-                           if allowed else "Every command needs the user's approval."),
+                        + ("Commands run without asking." if pol["mode"] == "bypass" else "Every command needs the user's approval."
+                           if pol["askEveryCommand"] or not allowed else
+                           "Allowed without asking: %s. Anything else needs the user's approval." % "; ".join(allowed)),
                         {"command": s, "cwd": s, "timeout_seconds": {"type": "integer", "description": "Default 120, at most 600"}}, ["command"]))
     if pol["subtasks"]:
         sub = {"task": {"type": "string", "description": "Everything it needs: it can't see this chat"},
@@ -670,6 +706,9 @@ def tool_specs(cfg, plan=False):
             sub["isolated"] = {"type": "boolean", "description": "Use its own Git worktree and branch"}
         specs.append(fn("start_subtask", "Give a self-contained task to a helper chat; it returns its final answer. Several calls in one reply run in parallel.",
                         sub, ["task", "title"]))
+        specs.append(fn("set_subtask_mode", "Change a subtask's permission mode: manual (asks the user before every change), auto (edits files "
+                        "without asking) or bypass (asks nothing). At most this chat's own mode (%s)." % pol["mode"],
+                        {"subtask": s, "mode": {"type": "string", "enum": list(capabilities.MODES)}}, ["subtask", "mode"]))
         specs.append(fn("message_subtask", "Answer a subtask's question or send it a follow-up (subtask: id or title).",
                         {"subtask": s, "message": s}, ["subtask", "message"]))
         specs.append(fn("wait_subtasks", "Wait for subtasks' results and messages (default: all unread).",
@@ -999,9 +1038,8 @@ def tool_system_note(fcfg, specs, where):
         if "message_parent" in names:
             note += (" Use message_parent for a short progress note, or with wait_for_reply for a question you can't settle"
                      " yourself; don't ask about things you can decide.")
-    if capabilities.policy(fcfg)["untrusted"]:
-        note += (" This session has read untrusted web content, so file changes, file management and model changes"
-                 " each need the user's approval.")
+    if capabilities.policy(fcfg)["askMemory"]:
+        note += (" This session has read untrusted web content, so every command and memory note needs the user's approval.")
     return note
 
 
@@ -1371,12 +1409,24 @@ class Handler(BaseHTTPRequestHandler):
                     if k in body:
                         if not isinstance(body[k], bool): return self._json({"error": "%s must be true or false." % k}, 400)
                         cfg[k] = body[k]
+                if "sessionDefaults" in body:
+                    try: cfg["sessionDefaults"] = clean_session_defaults(body["sessionDefaults"])
+                    except ValueError as e: return self._json({"error": str(e)}, 400)
                 if body.get("clearApiKey"): cfg["apiKey"] = ""
                 save_config(cfg)
             self._json(public_config(load_config()))
         elif p == "/api/chats":
             try: self._json(create_chat(body))
             except (OSError, ValueError) as e: self._json({"error": str(e)}, 400)
+        elif p == "/api/runs" and body.get("steer"):  # typed while a reply runs: it reads it before its next step
+            chat_id = body.get("chatId", "")
+            try:
+                if ENGINE.steer(chat_id, body.get("text")): return self._json({"ok": True, "queued": True})
+                end = time.time() + 15  # the reply is just finishing: send it as a new message when it has
+                while ENGINE.active(chat_id) and time.time() < end: time.sleep(0.2)
+                ENGINE.start(chat_id, {"text": body.get("text"), "think": body.get("think")}); self._json({"ok": True, "queued": False})
+            except runs.RunError as e: self._json({"error": str(e)}, 409 if "already running" in str(e) else 400)
+            except (OSError, ValueError) as e: self._json({"error": str(e) or "bad request"}, 400)
         elif p == "/api/runs":
             try: ENGINE.start(body.get("chatId", ""), body); self._json({"ok": True})
             except runs.RunError as e: self._json({"error": str(e)}, 409 if "already running" in str(e) else 400)

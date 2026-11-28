@@ -1,3 +1,37 @@
+# Open AY Desktop 1.16.0
+
+Simpler permissions, writing to a reply while it works, session defaults, and no more stop at 25 steps.
+
+## Permission modes
+Session settings now has two options instead of ten:
+- **Permission mode:**
+  - **Manual approve** (default) asks before every file change, command, commit, push and model change.
+  - **Auto edits** writes, edits, creates, moves and deletes files without asking (deleted files go to Trash). Commands not on your allowed list, commits, pushes and model changes still ask.
+  - **Bypass permissions** asks for nothing.
+- **Web search:** the chat searches and opens any page without asking.
+
+Every chat can now use Git, commands, subtasks, memory and instruction files; the mode decides what asks first. A chip under the message box shows the mode and switches it, also before a new chat's first message. After a chat reads web content, Auto edits asks before every command and memory note; Bypass never asks. Chats from earlier versions get Auto edits if they had auto-edit on, Manual approve otherwise.
+
+## New
+- **Write while a reply works.** Type and press Enter (the stop button becomes send while there's text). The reply reads your message before its next step; a reply waiting for its subtasks reads it straight away.
+- **Settings > Session defaults:** the mode, web search and skills every new chat starts with. **Use defaults** in Session settings applies them to one chat. Projects can set their own mode.
+- **The main chat can change a subtask's mode** (`set_subtask_mode`), never above its own.
+- **Steps per reply** (Settings > Usage & limits, default 100, 0 = no limit). A reply that reaches it pauses with a **Continue** button.
+
+## Changed
+- A reply no longer shows a blinking cursor and model name before it has written anything; the working line above the message box covers that. Replies name their model only when it differs from the chat's current one.
+
+## Fixed
+- A reply stopped after 25 tool steps and needed you to type "continue".
+- You couldn't send a message to a chat while its reply was running.
+
+## Verification
+- 207 automated tests (24 new).
+- A live check in the window with a fake model: the mode chip and menu, Session settings, Session defaults, projects, a message sent during a reply, and the hidden placeholder.
+- The packaged-app smoke test.
+
+---
+
 # Open AY Desktop 1.15.0
 
 A new layout, a working indicator, Compact, background mode, and fixes from a full review.

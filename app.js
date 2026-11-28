@@ -10,7 +10,7 @@ const state = {
   es: null, runStatus: "idle", runs: {}, editIndex: null, usage: null, today: null,
   documents: [], plan: false, projects: [], projectFilter: "", undoRuns: [], searchHits: null,
 };
-const DEFAULT_CAPABILITIES = { editMode: "review", fileManage: false, deleteFiles: false, modelControl: "ask", webSearch: false, subtasks: false, git: "off", commands: false, instructions: true, memory: true };
+const DEFAULT_CAPABILITIES = { mode: "manual", webSearch: false };
 const api = async (path, opts = {}) => {
   const r = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
   const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.statusText); return j;
@@ -126,12 +126,11 @@ function dayGroup(ms) {
   return diff <= 0 ? "Today" : diff === 1 ? "Yesterday" : diff < 7 ? "This week" : "Earlier";
 }
 // The header shows the chat's name (and, for a subtask, its parent); the row under the message box shows
-// what the chat can reach: folders and Git
+// the chat's folders and permission mode
 function updateSubtitle() {
   const parent = state.chat?.parentId ? state.chats.find((c) => c.id === state.chat.parentId) : null;
   $("#subtitle").textContent = parent ? "subtask of " + parent.title : "";
-  const git = state.chat?.capabilities?.git; const gitText = { read: "Git: read", commit: "Git: commit", push: "Git: push" }[git] || "";
-  $("#gitLabel").innerHTML = gitText ? `<span class="meta-btn static">${ic("git", "sm")}${esc(gitText)}</span>` : "";
+  updateModeBtn();
   $("#titleBtn").classList.toggle("empty", !state.chat);
 }
 function setTitle(text) { $("#title").textContent = text || "New chat"; $("#titleBtn").classList.toggle("empty", !state.chat); $("#exportBtn").hidden = !state.chat; }
@@ -155,6 +154,7 @@ async function pollRuns() {
 
 // Live events for the open chat (see runs.py for the event types)
 function subscribe(id) {
+  state.queued = 0;
   if (state.es) { state.es.close(); state.es = null; }
   if (!id) return;
   const es = new EventSource(`/api/chats/${encodeURIComponent(id)}/events`); state.es = es;
@@ -176,6 +176,7 @@ function applyEvent(id, ev) {
     case "message": {
       if (ev.index > chat.messages.length) { renderMessages(); return; }  // a gap: the next snapshot fills it
       const isNew = ev.index >= chat.messages.length; chat.messages[ev.index] = ev.message;
+      if (ev.message?.sentWhileRunning) state.queued = Math.max(0, (state.queued || 0) - 1);  // the reply read it
       if (isNew || ev.index !== chat.messages.length - 1) { const nb = nearBottom(); updateMessage(ev.index, isNew); if (nb) scrollBottom(true); } else scheduleLive();
       updateWorking(); break;
     }
@@ -195,6 +196,7 @@ function applyEvent(id, ev) {
     case "approval": showApproval(ev.approval); break;
     case "approval_done": closeApproval(ev.id); break;
     case "untrusted": chat.untrusted = ev.untrusted; updateUntrustedBadge(); break;
+    case "queued": state.queued = ev.count || 0; updateWorking(); break;
     case "session":  // renamed, or settings changed, while a reply runs
       for (const [k, v] of Object.entries(ev.chat || {})) { if (v === null) delete chat[k]; else chat[k] = v; }
       setTitle(titleFor(chat)); updateSubtitle(); updateFolderBtn(); updateUntrustedBadge(); loadChats(); break;
@@ -215,7 +217,7 @@ function setRunStatus(status) {
 // The working line above the message box: what the reply is doing now, and for how long
 const TOOL_DOING = { read_file: "Reading", list_directory: "Looking in", search_files: "Searching files", write_file: "Writing", edit_file: "Editing",
   create_folder: "Creating a folder", copy_path: "Copying", move_path: "Moving", delete_path: "Moving to the trash", restore_path: "Restoring",
-  web_search: "Searching the web", web_fetch: "Reading", run_command: "Running", start_subtask: "Running subtask", message_subtask: "Messaging a subtask",
+  web_search: "Searching the web", web_fetch: "Reading", run_command: "Running", start_subtask: "Running subtask", message_subtask: "Messaging a subtask", set_subtask_mode: "Changing a subtask's mode",
   wait_subtasks: "Waiting for subtasks", message_parent: "Messaging the parent chat", read_skill_file: "Reading skill file", read_memory: "Reading memory",
   save_memory: "Saving to memory", set_session_model: "Switching model", git_commit: "Committing", git_push: "Pushing", git_merge: "Merging", gh_pr_create: "Opening a pull request" };
 const baseName = (p) => String(p || "").split(/[\\/]/).filter(Boolean).pop() || String(p || "");
@@ -248,8 +250,9 @@ let workingTimer = 0;
 function updateWorking() {
   const show = busy() && state.runStatus !== "paused" && Boolean(state.chat || state.runStarted);
   const w = $("#working"); w.hidden = !show;
-  if (!show) { clearInterval(workingTimer); workingTimer = 0; return; }
-  const text = workingText(); if ($("#workingText").textContent !== text) $("#workingText").textContent = text;
+  if (!show) { clearInterval(workingTimer); workingTimer = 0; if (!busy()) state.queued = 0; return; }
+  const q = state.queued || 0;
+  const text = workingText() + (q ? ` · ${q} message${q === 1 ? "" : "s"} waiting` : ""); if ($("#workingText").textContent !== text) $("#workingText").textContent = text;
   w.classList.toggle("waiting", /^Waiting for (your|you)/.test(text));
   $("#workingTime").textContent = fmtElapsed(Date.now() - (state.runStarted || Date.now()));
   if (!workingTimer) workingTimer = setInterval(updateWorking, 1000);
@@ -308,7 +311,7 @@ async function loadUndoRuns() {
 }
 
 function newChat() {
-  state.navSeq++; subscribe(null); state.chat = null; state.pause = null; renderPause(); state.draftFolders = []; state.editIndex = null; closeApproval(); setRunStatus("idle");
+  state.navSeq++; subscribe(null); state.chat = null; state.pause = null; renderPause(); state.draftFolders = []; state.draftMode = null; state.editIndex = null; closeApproval(); setRunStatus("idle");
   state.selectedModel = state.config.defaultModel || state.models[0]?.name || "";
   state.undoRuns = []; setStatusBar("");
   renderMessages(); renderChatList(); updateModelBtn(); updateFolderBtn(); updateUntrustedBadge(); toggleFolderPop(false); renderUsage(); setTitle(""); $("#input").focus();
@@ -335,8 +338,8 @@ async function deleteChat(id) {
 }
 
 // Rendering
-const TOOL_LABEL = { list_directory: "Listed folder", read_file: "Read file", search_files: "Searched files", write_file: "Wrote file", edit_file: "Edited file", create_folder: "Created folder", copy_path: "Copied item", move_path: "Moved/renamed item", delete_path: "Moved to trash", restore_path: "Restored item", set_session_model: "Changed model", web_search: "Searched the web", web_fetch: "Read web page", start_subtask: "Subtask", message_subtask: "Messaged subtask", wait_subtasks: "Waited for subtasks", message_parent: "Messaged parent chat", read_skill_file: "Read skill file", git_status: "Git status", git_diff: "Git diff", git_log: "Git log", git_show: "Git show", git_branches: "Git branches", git_commit: "Git commit", git_push: "Git push", gh_pr_list: "Pull requests", gh_pr_create: "Opened pull request", run_command: "Ran command" };
-const TOOL_ICON = { list_directory: "folder", read_file: "file", search_files: "search", write_file: "edit", edit_file: "edit", create_folder: "folder", copy_path: "copy", move_path: "file", delete_path: "trash", restore_path: "restore", set_session_model: "model", web_search: "globe", web_fetch: "globe", start_subtask: "subtask", message_subtask: "subtask", wait_subtasks: "subtask", message_parent: "subtask", read_skill_file: "skills", run_command: "terminal" };
+const TOOL_LABEL = { list_directory: "Listed folder", read_file: "Read file", search_files: "Searched files", write_file: "Wrote file", edit_file: "Edited file", create_folder: "Created folder", copy_path: "Copied item", move_path: "Moved/renamed item", delete_path: "Moved to trash", restore_path: "Restored item", set_session_model: "Changed model", web_search: "Searched the web", web_fetch: "Read web page", start_subtask: "Subtask", message_subtask: "Messaged subtask", set_subtask_mode: "Changed subtask mode", wait_subtasks: "Waited for subtasks", message_parent: "Messaged parent chat", read_skill_file: "Read skill file", git_status: "Git status", git_diff: "Git diff", git_log: "Git log", git_show: "Git show", git_branches: "Git branches", git_commit: "Git commit", git_push: "Git push", gh_pr_list: "Pull requests", gh_pr_create: "Opened pull request", run_command: "Ran command" };
+const TOOL_ICON = { list_directory: "folder", read_file: "file", search_files: "search", write_file: "edit", edit_file: "edit", create_folder: "folder", copy_path: "copy", move_path: "file", delete_path: "trash", restore_path: "restore", set_session_model: "model", web_search: "globe", web_fetch: "globe", start_subtask: "subtask", message_subtask: "subtask", set_subtask_mode: "shield", wait_subtasks: "subtask", message_parent: "subtask", read_skill_file: "skills", run_command: "terminal" };
 const toolIcon = (name) => TOOL_ICON[name] || (/^(git|gh)_/.test(name || "") ? "git" : "settings");
 // Messages added since the chat was opened slide in; re-rendering an existing message never animates it again.
 const shown = { chatId: null, count: 0 };
@@ -382,8 +385,15 @@ function msgHTML(m, idx, isLast) {
   const undoRun = !m._live && (turn.runs || []).filter((r) => state.undoRuns.includes(r)).pop();
   const nChanged = undoRun ? (state.chat?.messages || []).filter((x) => x.runId === undoRun).length : 0;
   const undoBtn = undoRun ? `<span class="help">${nChanged} file change${nChanged === 1 ? "" : "s"} in this reply</span><button class="btn sm ghost" type="button" data-undo="${esc(undoRun)}" title="Put back the files this reply changed">${ic("undo", "sm")}Undo changes</button>` : "";
+  const goOn = m.stepLimit && isLast && !m._live && !busy() ? `<div class="plan-go"><button class="btn sm primary" type="button" data-continue>${ic("play", "sm")}Continue</button><span class="help">Carries on where it stopped. Change the limit in Settings &gt; Usage &amp; limits.</span></div>` : "";
   const planBtn = turn.plan && isLast && !m._live && !m.error && !busy() ? `<div class="plan-go"><button class="btn sm primary" type="button" data-carry-out>${ic("play", "sm")}Carry out this plan</button><span class="help">Or reply with changes to the plan first.</span></div>` : "";
-  return `<div class="msg assistant${isLast ? " last" : ""}${enter}" data-idx="${idx}"><div class="meta"><span>${esc(m.model || "")}</span>${stats}${m.wrapUp ? '<span class="wrapup-tag" title="Low balance: the model summarized its progress before pausing">wrap-up</span>' : ""}</div>${thinking}<div class="content ${m._live ? "cursor" : ""}">${body}</div>${m.notice ? `<div class="notice">${esc(m.notice)}</div>` : ""}${m.error ? `<div class="err">${linkify(m.error)}</div>` : ""}${planBtn}${undoBtn ? `<div class="reply-foot">${undoBtn}</div>` : ""}${m._live ? "" : `<div class="actions"><button class="icon-btn act-copy" type="button" title="Copy" aria-label="Copy">${ic("copy", "sm")}</button>${isLast ? `<button class="icon-btn act-regen" type="button" title="Regenerate" aria-label="Regenerate">${ic("redo", "sm")}</button>` : ""}</div>`}</div>`;
+  // The working line above the message box shows a reply in progress and the model picker names the model, so a
+  // reply shows nothing until text arrives, and names its model only when it isn't the chat's current one
+  const pending = m._live && !m.content && !m.thinking && !m.error && !m.notice;
+  const model = !m._live && m.model && m.model !== currentModel() ? `<span>${esc(m.model)}</span>` : "";
+  const wrap = m.wrapUp ? '<span class="wrapup-tag" title="Low balance: the model summarized its progress before pausing">wrap-up</span>' : "";
+  const meta = model || stats || wrap ? `<div class="meta">${model}${model ? stats : stats.replace("· ", "")}${wrap}</div>` : "";
+  return `<div class="msg assistant${isLast ? " last" : ""}${pending ? " pending" : ""}${enter}" data-idx="${idx}">${meta}${thinking}<div class="content">${body}</div>${m.notice ? `<div class="notice">${esc(m.notice)}</div>` : ""}${m.error ? `<div class="err">${linkify(m.error)}</div>` : ""}${goOn}${planBtn}${undoBtn ? `<div class="reply-foot">${undoBtn}</div>` : ""}${m._live ? "" : `<div class="actions"><button class="icon-btn act-copy" type="button" title="Copy" aria-label="Copy">${ic("copy", "sm")}</button>${isLast ? `<button class="icon-btn act-regen" type="button" title="Regenerate" aria-label="Regenerate">${ic("redo", "sm")}</button>` : ""}</div>`}</div>`;
 }
 // For each turn's answer: the replies (run IDs) that changed files in it, and whether it was asked in plan mode
 let turnMeta = {};
@@ -460,7 +470,8 @@ $("#scroller").addEventListener("keydown", (e) => { if (["PageUp", "ArrowUp", "H
 function scrollBottom(force) { const s = $("#scroller"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; }
 function updateSendBtn() {
   const b = $("#sendBtn");
-  const stopping = busy(); b.classList.toggle("stop", stopping);
+  const stopping = busy() && !$("#input").value.trim();  // while a reply runs, a typed message is sent to it; otherwise Stop
+  b.classList.toggle("stop", stopping);
   if (b.dataset.icon !== (stopping ? "stop" : "send")) { b.dataset.icon = stopping ? "stop" : "send"; b.innerHTML = ic(b.dataset.icon); }
   if (stopping) { b.title = "Stop"; b.setAttribute("aria-label", "Stop"); b.disabled = false; }
   else { b.title = "Send (Enter)"; b.setAttribute("aria-label", "Send"); b.disabled = !$("#input").value.trim() && !state.attachments.length && !state.documents.length; }
@@ -468,8 +479,20 @@ function updateSendBtn() {
 
 // Sending: the server saves the message and runs the reply
 function thinkOption() { const t = $("#thinkSel").value; return t === "default" ? null : t === "true" ? true : t === "false" ? false : t; }
+// A message typed while a reply runs goes to that reply, which reads it before its next step (runs.Engine.steer)
+async function steer(text) {
+  if (!text || !state.chat) return;
+  if (state.attachments.length || state.documents.length) { toast("Attachments can be sent when this reply finishes"); return; }
+  $("#input").value = ""; autoGrow(); updateSendBtn();
+  try {
+    const r = await api("/api/runs", { method: "POST", body: JSON.stringify({ chatId: state.chat.id, text, steer: true, think: thinkOption() }) });
+    toast(r.queued ? "Sent. The reply reads it before its next step." : "Sent");
+  } catch (e) { toast(e.message); if (!$("#input").value) { $("#input").value = text; autoGrow(); updateSendBtn(); } }
+}
 async function send(override) {
-  const text = override ?? $("#input").value.trim(); if (busy() || (!text && !state.attachments.length && !state.documents.length)) return;
+  const text = override ?? $("#input").value.trim();
+  if (busy()) { if (override === undefined && state.chat) steer(text); return; }
+  if (!text && !state.attachments.length && !state.documents.length) return;
   if (state.documents.some((d) => d.loading)) { toast("Wait for the attached documents to finish reading"); return; }
   const model = currentModel(); if (!model) { toast("Pick a cloud model first"); openModelMenu(true); return; }
   const images = state.attachments.slice(); const docs = state.documents.slice(); const truncateAt = state.editIndex;
@@ -477,8 +500,10 @@ async function send(override) {
   try {
     if (!state.chat) {
       const title = (text || docs[0]?.name || "Image").slice(0, 60).replace(/\s+/g, " ");
-      const chat = await api("/api/chats", { method: "POST", body: JSON.stringify({ title, model, folders: state.draftFolders, projectId: state.projectFilter || undefined }) });
-      state.draftFolders = []; state.chat = chat; shown.chatId = chat.id; shown.count = 0; setTitle(chat.title); updateChatMeta(chat); subscribe(chat.id);
+      const body = { title, model, folders: state.draftFolders, projectId: state.projectFilter || undefined };
+      if (state.draftMode) body.capabilities = { mode: state.draftMode };  // picked from the mode chip before the first message
+      const chat = await api("/api/chats", { method: "POST", body: JSON.stringify(body) });
+      state.draftFolders = []; state.draftMode = null; state.chat = chat; shown.chatId = chat.id; shown.count = 0; setTitle(chat.title); updateChatMeta(chat); subscribe(chat.id);
     }
     const chat = state.chat; state.runStarted = Date.now(); state.follow = true; setRunStatus("running"); scrollBottom(true);
     if (override === undefined) { $("#input").value = ""; autoGrow(); state.attachments = []; renderAttachments(); state.documents = []; renderDocs(); setPlan(false); }
@@ -622,18 +647,18 @@ async function addFiles(files) {
 }
 
 // Settings and updates
-const SET_TITLES = { secConn: "Connection", secLimits: "Usage & limits", secMemory: "Memory", secCmds: "Commands", secSkills: "Skills", secProjects: "Projects",
+const SET_TITLES = { secConn: "Connection", secDefaults: "Session defaults", secLimits: "Usage & limits", secMemory: "Memory", secCmds: "Commands", secSkills: "Skills", secProjects: "Projects",
   secSchedules: "Scheduled tasks", secActivity: "Activity", secTrash: "Trash", secUpdates: "App & updates" };
-const CONFIG_TABS = new Set(["secConn", "secLimits", "secMemory", "secCmds", "secUpdates"]);  // saved with "Save changes"
+const CONFIG_TABS = new Set(["secConn", "secDefaults", "secLimits", "secMemory", "secCmds", "secUpdates"]);  // saved with "Save changes"
 function openSettings(tab, opts) {
   const c = state.config; state.clearKey = false; state.updateUrl = ""; $("#apiKey").value = "";
   $("#apiKey").placeholder = c.hasApiKey ? `Saved ${c.apiKeyHint || "(from OLLAMA_API_KEY)"} - leave blank to keep` : "Paste key…";
   $("#clearKey").disabled = !c.hasApiKey; $("#versionLabel").textContent = `Open AY Desktop ${c.version || ""}`;
   $("#updateStatus").textContent = `Checks github.com/${c.repository || "arothm/OpenAYDesktop"}`; $("#openUpdate").hidden = true;
-  $("#dailyLimit").value = c.dailyTokenLimit || 0; $("#chatLimit").value = c.chatTokenLimit || 0; $("#maxRuns").value = c.maxConcurrentRuns || 4; $("#allowedCommands").value = (c.allowedCommands || []).join("\n"); $("#minBalance").value = c.minBalanceUsd ?? 1;
+  $("#dailyLimit").value = c.dailyTokenLimit || 0; $("#chatLimit").value = c.chatTokenLimit || 0; $("#maxRuns").value = c.maxConcurrentRuns || 4; $("#maxSteps").value = c.maxSteps ?? 100; $("#allowedCommands").value = (c.allowedCommands || []).join("\n"); $("#minBalance").value = c.minBalanceUsd ?? 1;
   $("#setVer").textContent = c.version ? "Version " + c.version : "";
   $("#keyState").className = "key-state" + (c.hasApiKey ? " ok" : ""); $("#keyState").textContent = c.hasApiKey ? `Saved ${c.apiKeyHint || "(from OLLAMA_API_KEY)"}` : "Not set";
-  renderSettingsBalance(); renderToday();
+  renderSettingsBalance(); renderToday(); fillDefaults();
   setBudgetButtons(c.contextBudget || "full");
   $("#autoUpdate").checked = c.autoUpdate !== false; $("#quickEntry").checked = c.quickEntry !== false;
   $("#quickEntry").closest(".perm").hidden = !window.openay?.isElectron;
@@ -707,10 +732,11 @@ async function checkUpdates() {
 async function saveSettings() {
   const budget = document.querySelector("#ctxBudget .primary")?.dataset.budget || "full";
   const body = { defaultModel: $("#defaultModel").value, dailyTokenLimit: Number($("#dailyLimit").value || 0),
-                 chatTokenLimit: Number($("#chatLimit").value || 0), maxConcurrentRuns: Number($("#maxRuns").value || 4), minBalanceUsd: Number($("#minBalance").value || 0),
+                 chatTokenLimit: Number($("#chatLimit").value || 0), maxConcurrentRuns: Number($("#maxRuns").value || 4), maxSteps: Number($("#maxSteps").value || 0), minBalanceUsd: Number($("#minBalance").value || 0),
                  allowedCommands: $("#allowedCommands").value.split(/\r?\n/).map((l) => l.trim()).filter(Boolean),
                  contextBudget: budget, autoUpdate: $("#autoUpdate").checked, quickEntry: $("#quickEntry").checked,
                  keepInTray: $("#keepInTray").checked, startAtLogin: $("#startAtLogin").checked };
+  if (state.defaultsLoaded) body.sessionDefaults = readDefaults();
   const key = $("#apiKey").value.trim(); if (key) body.apiKey = key;
   if (state.clearKey && !key) body.clearApiKey = true;
   try {
@@ -724,24 +750,70 @@ async function saveSettings() {
   } catch (e) { toast(e.message); }
 }
 
-// Session permissions and rename
+// Permission modes (capabilities.py): what asks first. The chip under the message box, Session settings,
+// Settings > Session defaults and projects all set the same two values: mode and web search.
+const MODE_NAMES = { manual: "Manual", auto: "Auto edits", bypass: "Bypass" };
+const MODE_ICONS = { manual: "shield", auto: "edit", bypass: "bolt" };
+function sessionDefaults() {
+  const d = state.config.sessionDefaults || {};
+  return { capabilities: { ...DEFAULT_CAPABILITIES, ...(d.capabilities || {}) }, skills: d.skills || [] };
+}
+function modeOf(caps) { return ["manual", "auto", "bypass"].includes(caps?.mode) ? caps.mode : caps?.editMode === "auto" ? "auto" : "manual"; }
+function currentMode() { return state.chat ? modeOf(state.chat.capabilities) : (state.draftMode || modeOf(sessionDefaults().capabilities)); }
+function setRadio(name, value) { document.querySelectorAll(`input[name="${name}"]`).forEach((r) => { r.checked = r.value === value; }); }
+function getRadio(name) { return document.querySelector(`input[name="${name}"]:checked`)?.value || "manual"; }
+function updateModeBtn() {
+  const m = currentMode(); const btn = $("#modeBtn");
+  btn.className = "meta-btn " + m; btn.querySelector("use").setAttribute("href", "#i-" + MODE_ICONS[m]); $("#modeLabel").textContent = MODE_NAMES[m];
+  document.querySelectorAll("#modeMenu [data-mode]").forEach((b) => b.classList.toggle("sel", b.dataset.mode === m));
+}
+$("#modeBtn").addEventListener("click", (e) => { e.stopPropagation(); updateModeBtn(); $("#modeMenu").classList.toggle("open"); });
+document.addEventListener("click", (e) => { if (!e.target.closest("#modeWrap")) $("#modeMenu").classList.remove("open"); });
+$("#modeMenu").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-mode]"); if (!b) return; $("#modeMenu").classList.remove("open");
+  const mode = b.dataset.mode;
+  if (!state.chat) { state.draftMode = mode; updateModeBtn(); toast(`${MODE_NAMES[mode]} for this new chat`); return; }
+  try { await savePermissions(state.chat, { capabilities: { mode } }); updateModeBtn(); toast(`${MODE_NAMES[mode]} for this chat`); } catch (err) { toast(err.message); }
+});
+
+// Settings > Session defaults: what new chats start with (server.session_defaults)
+function fillDefaults() {
+  const d = sessionDefaults(); state.defaultsLoaded = false;
+  setRadio("defMode", modeOf(d.capabilities)); document.querySelector('#secDefaults [data-cap="webSearch"]').checked = Boolean(d.capabilities.webSearch);
+  $("#defSkills").innerHTML = '<span class="help">Loading skills…</span>';
+  api("/api/skills").then((r) => {
+    const on = new Set(d.skills);
+    $("#defSkills").innerHTML = r.skills.map((s) => `<label class="skill-check"><span>${esc(s.name)}<span class="d">${esc(s.description)}</span></span><input type="checkbox" data-skill="${esc(s.id)}" ${on.has(s.id) ? "checked" : ""}></label>`).join("")
+      || '<span class="help">No skills yet. Add them in Skills.</span>';
+    state.defaultsLoaded = true;  // saved only once the skill list is known, so a failed load can't clear the default skills
+  }).catch((e) => { $("#defSkills").textContent = e.message; });
+}
+function readDefaults() {
+  return { capabilities: { mode: getRadio("defMode"), webSearch: document.querySelector('#secDefaults [data-cap="webSearch"]').checked },
+           skills: [...document.querySelectorAll("#defSkills [data-skill]")].filter((x) => x.checked).map((x) => x.dataset.skill) };
+}
+// "Use defaults" in Session settings fills in the defaults; nothing changes until Save
+function useSessionDefaults() {
+  const d = sessionDefaults();
+  setRadio("sessionMode", modeOf(d.capabilities)); $("#webSearch").checked = Boolean(d.capabilities.webSearch);
+  const on = new Set(d.skills); document.querySelectorAll("#sessionSkills [data-skill]").forEach((x) => { x.checked = on.has(x.dataset.skill); });
+  toast("Defaults filled in. Save to apply them to this chat.");
+}
+
+// Session settings: name, project, mode, web search, skills
 function openSession() {
   if (!state.chat) { toast("Start a session first, then save its first message"); return; }
-  const c = { ...DEFAULT_CAPABILITIES, ...(state.chat.capabilities || {}) };
-  const writable = chatFolders().some((f) => f.write);
-  state.sessionDraft = { id: state.chat.id, title: state.chat.title, capabilities: c };
-  $("#sessionName").value = state.chat.title || "Untitled"; $("#editMode").value = c.editMode;
-  $("#fileManage").checked = writable && c.fileManage; $("#deleteFiles").checked = writable && c.deleteFiles;
-  $("#fileManage").disabled = !writable; $("#deleteFiles").disabled = !writable; $("#modelControl").value = c.modelControl;
-  $("#webSearch").checked = Boolean(c.webSearch); $("#gitMode").value = c.git || "off";
-  $("#gitMode").disabled = Boolean(state.chat.parentId);
-  $("#commandsOn").checked = Boolean(c.commands) && writable && !state.chat.parentId; $("#commandsOn").disabled = !writable || Boolean(state.chat.parentId);
-  const isChild = Boolean(state.chat.parentId); $("#subtasks").checked = !isChild && Boolean(c.subtasks); $("#subtasks").disabled = isChild;
-  if (isChild) $("#subtasksHelp").textContent = "This chat is a subtask. Its permissions come from the chat that started it, and it can't start subtasks of its own.";
-  const u = state.chat.untrusted; $("#untrustedBox").hidden = !u;
-  if (u) $("#untrustedSources").textContent = "Since " + new Date(u.since).toLocaleString() + ". Read: " + (u.sources || []).join("; ");
-  if (!isChild) $("#subtasksHelp").textContent = "Helper chats that work on parts of a task at the same time and report back. Each gets this chat's folders and skills, at most its permissions, and a fixed model. With Git set to commit, a helper can work in its own branch (a Git worktree). Stopping this chat stops its helpers.";
-  $("#instructionsOn").checked = c.instructions !== false; $("#memoryOn").checked = c.memory !== false && !isChild; $("#memoryOn").disabled = isChild;
+  const c = state.chat.capabilities || {};
+  state.sessionDraft = { id: state.chat.id };
+  $("#sessionName").value = state.chat.title || "Untitled";
+  setRadio("sessionMode", modeOf(c)); $("#webSearch").checked = Boolean(c.webSearch);
+  $("#childHelp").hidden = !state.chat.parentId;
+  const u = state.chat.untrusted; $("#untrustedBox").hidden = !u || modeOf(c) === "bypass";
+  if (u) {
+    const n = (u.sources || []).length;
+    $("#untrustedCount").textContent = `Since ${new Date(u.since).toLocaleString()} · ${n} search${n === 1 ? "" : "es"} and page${n === 1 ? "" : "s"}`;
+    $("#untrustedSources").textContent = (u.sources || []).join("\n");
+  }
   $("#sessionProject").innerHTML = '<option value="">No project</option>' + state.projects.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("");
   $("#sessionProject").value = state.chat.projectId && state.projects.some((p) => p.id === state.chat.projectId) ? state.chat.projectId : "";
   $("#sessionSkills").innerHTML = '<span class="help">Loading skills…</span>';
@@ -753,16 +825,14 @@ function openSession() {
   $("#sessionBack").classList.add("open"); $("#sessionName").focus();
 }
 async function trustChat() {
-  if (!state.chat || !confirm("Trust this chat again?\n\nFile changes and model changes will follow your normal settings again, even though web content is still in the conversation.")) return;
+  if (!state.chat || !confirm("Trust this chat again?\n\nIn Auto edits, commands on your allowed list run without asking again, even though web content is still in the conversation.")) return;
   try { await api("/api/session/trust", { method: "POST", body: JSON.stringify({ chatId: state.chat.id }) }); delete state.chat.untrusted; updateUntrustedBadge(); $("#untrustedBox").hidden = true; toast("This chat is trusted again"); }
   catch (e) { toast(e.message); }
 }
 async function saveSession() {
   const draft = state.sessionDraft; if (!draft || !state.chat || draft.id !== state.chat.id) return;
   const title = $("#sessionName").value.trim();
-  const c = { editMode: $("#editMode").value, fileManage: $("#fileManage").checked,
-              deleteFiles: $("#deleteFiles").checked, modelControl: $("#modelControl").value, webSearch: $("#webSearch").checked, git: $("#gitMode").value, commands: $("#commandsOn").checked && !$("#commandsOn").disabled, subtasks: $("#subtasks").checked && !$("#subtasks").disabled,
-              instructions: $("#instructionsOn").checked, memory: $("#memoryOn").checked && !$("#memoryOn").disabled };
+  const c = { mode: getRadio("sessionMode"), webSearch: $("#webSearch").checked };
   const skillIds = [...document.querySelectorAll("#sessionSkills [data-skill]")].filter((x) => x.checked).map((x) => x.dataset.skill);
   try {
     if (title !== state.chat.title) {
@@ -770,7 +840,7 @@ async function saveSession() {
       state.chat.title = result.title; setTitle(result.title);
     }
     const changes = { capabilities: c, projectId: $("#sessionProject").value || null }; if (document.querySelector("#sessionSkills [data-skill]")) changes.skills = skillIds;
-    await savePermissions(state.chat, changes); await loadChats();
+    await savePermissions(state.chat, changes); await loadChats(); updateModeBtn();
     $("#sessionBack").classList.remove("open"); toast("Session settings saved");
   } catch (e) { toast(e.message); }
 }
@@ -978,10 +1048,10 @@ $("#folderList").addEventListener("click", (e) => {
   if (e.target.closest(".fdel")) { list.splice(i, 1); foldersChanged(); } else if (e.target.classList.contains("fw")) { list[i].write = e.target.checked; foldersChanged(); }
 });
 function autoGrow() { const t = $("#input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 240) + "px"; updateSendBtn(); }
-$("#input").addEventListener("input", autoGrow);
+$("#input").addEventListener("input", () => { autoGrow(); updateSendBtn(); });
 $("#input").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
 $("#input").addEventListener("paste", (e) => { const files = [...(e.clipboardData?.files || [])]; if (files.length) { e.preventDefault(); addFiles(files); } });
-$("#sendBtn").addEventListener("click", () => busy() ? stop() : send()); $("#attachBtn").addEventListener("click", () => $("#fileInput").click());
+$("#sendBtn").addEventListener("click", () => (busy() && !$("#input").value.trim()) ? stop() : send()); $("#attachBtn").addEventListener("click", () => $("#fileInput").click());
 $("#fileInput").addEventListener("change", (e) => { addFiles(e.target.files); e.target.value = ""; });
 $("#attachments").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) { state.attachments.splice(+b.dataset.i, 1); renderAttachments(); } });
 $("#docList").addEventListener("click", (e) => { const b = e.target.closest("[data-doc]"); if (b) { state.documents.splice(+b.dataset.doc, 1); renderDocs(); } });
@@ -1101,6 +1171,7 @@ $("#messages").addEventListener("click", async (e) => {
   if (cc) { await navigator.clipboard.writeText(cc.parentElement.querySelector("code").innerText); cc.textContent = "Copied"; setTimeout(() => (cc.textContent = "Copy"), 1200); return; }
   if (e.target.closest("[data-show-summary]")) { const box = e.target.closest(".summary-divider").nextElementSibling; box.hidden = !box.hidden; return; }
   if (e.target.closest("[data-carry-out]")) { send("Go ahead and carry out the plan."); return; }
+  if (e.target.closest("[data-continue]")) { send("Continue where you left off."); return; }
   const un = e.target.closest("[data-undo]"); if (un) { openUndo(un.dataset.undo); return; }
   const msgEl = e.target.closest(".msg"); if (!msgEl) return; const idx = +msgEl.dataset.idx; const m = state.chat?.messages[idx];
   if (e.target.closest(".act-copy")) { await navigator.clipboard.writeText(m.content); toast("Copied"); } else if (e.target.closest(".act-regen")) regenerate(); else if (e.target.closest(".act-edit")) editMessage(idx);
@@ -1114,6 +1185,7 @@ $("#previewLater").addEventListener("click", hideApprovalDialogs); $("#maLater")
 $("#previewDiff").addEventListener("click", () => { if (state.approval) { state.approval.mode = "diff"; openApprovalPreview(); } });
 $("#previewContent").addEventListener("click", () => { if (state.approval) { state.approval.mode = "content"; openApprovalPreview(); } });
 $("#settingsBtn").addEventListener("click", () => openSettings());
+$("#sessionDefaultsBtn").addEventListener("click", useSessionDefaults);
 $("#cancelSession").addEventListener("click", () => $("#sessionBack").classList.remove("open")); $("#saveSession").addEventListener("click", saveSession);
 $("#sessionBack").addEventListener("click", (e) => { if (e.target.id === "sessionBack") $("#sessionBack").classList.remove("open"); });
 $("#clearKey").addEventListener("click", () => { state.clearKey = true; $("#apiKey").value = ""; $("#apiKey").placeholder = "Saved key will be cleared when you Save"; $("#clearKey").disabled = true; });

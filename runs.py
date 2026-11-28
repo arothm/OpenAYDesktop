@@ -49,6 +49,7 @@ does afterwards is ignored.
 
 import collections
 import copy
+import itertools
 import json
 import os
 import secrets
@@ -68,10 +69,10 @@ import web
 
 ACTION_TITLES = {"create_folder": "Create a folder?", "copy_path": "Copy this item?", "move_path": "Move or rename this item?",
                  "delete_path": "Move this item to the trash?", "restore_path": "Restore this item from the trash?"}
-UNTRUSTED_WHY = ("This chat has read web content, which can contain text written to steer the model. "
-                 "So file changes in this chat need your approval each time.")
+MANUAL_WHY = "This chat is in Manual mode, so file operations ask first. Change the mode in Session settings."
 
-MAX_STEPS = 25
+MAX_STEER_CHARS = 100_000  # a message typed while a reply runs
+MAX_STEPS = 100  # model requests per reply when the config has no maxSteps (Settings > Usage & limits; 0 = no limit)
 APPROVAL_WAIT = 1800          # seconds an approval waits before it counts as denied
 EVENT_BUFFER = 5000
 MAX_IMAGES = 10
@@ -223,6 +224,26 @@ class Engine:
         run.thread.start()
         return run
 
+    def steer(self, chat_id, text):
+        """A message the user sent while a reply runs in this chat: the reply reads it before its next step.
+        Returns True when queued, False when no reply takes it (none is running, or it is just finishing)."""
+        text = str(text or "").strip()
+        if not text:
+            raise RunError("The message is empty.")
+        if len(text) > MAX_STEER_CHARS:
+            raise RunError("A message sent during a reply can be at most %d characters." % MAX_STEER_CHARS)
+        run = self.active(chat_id)
+        if run is None:
+            return False
+        with run.lock:
+            if run.inbox_closed:
+                return False
+            run.inbox.append({"user": text})
+        with run.news:  # wakes a reply that is waiting for its subtasks
+            run.news.notify_all()
+        run.publish({"type": "queued", "count": sum(1 for m in run.inbox if isinstance(m, dict))})
+        return True
+
     def running_count(self):
         return sum(1 for r in list(self.runs.values()) if r.alive)
 
@@ -304,7 +325,8 @@ class Run:
         self.news = threading.Condition()  # subtasks' messages and finishes wake this run when it waits for them
         self.updates = []          # messages from subtasks the model hasn't seen yet
         self.pending = {}          # subtask chat id -> title: subtasks whose final result the model hasn't seen
-        self.inbox = []            # messages from the parent, delivered before this run's next model step
+        self.inbox = []            # messages delivered before this run's next model step: text from the parent chat,
+                                   # or {"user": text} the user sent while this reply was running (Engine.steer)
         self.inbox_closed = False  # this reply is ending: new messages from the parent start a new reply instead
         self.question = None       # this subtask's question while it waits for the parent's answer
         self.sent = 0              # messages this reply sent to its parent or subtasks
@@ -536,7 +558,8 @@ class Run:
             if self.compact_only:
                 self.manual_compact()
                 return
-            for step in range(MAX_STEPS):
+            cfg = srv.load_config(); limit = int(cfg.get("maxSteps", MAX_STEPS) or 0)
+            for step in (range(limit) if limit else itertools.count()):
                 if self.cancelled.is_set() or not self.balance_gate():
                     break
                 self.read_inbox()
@@ -569,7 +592,8 @@ class Run:
                 self.save()
             else:
                 self.add({"role": "assistant", "content": "", "model": self.chat["model"],
-                          "error": "Stopped after %d tool steps. Send a message to continue." % MAX_STEPS})
+                          "error": "Paused after %d steps, the limit for one reply (Settings > Usage & limits). "
+                                   "Continue to carry on where it stopped." % limit, "stepLimit": True})
         except Exception as e:  # noqa: BLE001 - never leave a run stuck in "running"
             self.add({"role": "assistant", "content": "", "model": self.chat.get("model", ""), "error": "Unexpected error: %s" % e})
         finally:
@@ -1007,7 +1031,7 @@ class Run:
                 paused = [c for c in running if (self.child_run(c) or _DONE).status == "paused" and c not in self.paused_seen]
                 # every one still running is paused for the balance: waiting changes nothing, so this reply can pause too
                 all_paused = running and all((self.child_run(c) or _DONE).status == "paused" for c in running)
-                if not running or asked or paused or all_paused or (end is not None and time.time() >= end):
+                if not running or asked or paused or all_paused or self.user_waiting() or (end is not None and time.time() >= end):
                     break
                 self.news.wait(0.5)
             news, self.updates = self.updates, []
@@ -1079,11 +1103,20 @@ class Run:
                 self.engine.stop(cid)
 
     def read_inbox(self):
-        """Messages the parent sent while this subtask was working, as automatic messages before its next step."""
+        """Messages sent while this reply was working, added before its next step: the user's own (as their
+        messages), and the parent chat's (as automatic messages)."""
         with self.lock:
             msgs, self.inbox = self.inbox, []
-        for text in msgs:
-            self.add({"role": "user", "auto": True, "fromParent": True, "content": "[Message from the parent chat]\n" + text})
+        for item in msgs:
+            if isinstance(item, dict):
+                self.add({"role": "user", "content": item["user"], "sentWhileRunning": True})
+            else:
+                self.add({"role": "user", "auto": True, "fromParent": True, "content": "[Message from the parent chat]\n" + item})
+
+    def user_waiting(self):
+        """The user sent a message this reply hasn't read yet."""
+        with self.lock:
+            return any(isinstance(m, dict) for m in self.inbox)
 
     def _message_text(self, args):
         text = str(args.get("message") or "").strip()
@@ -1128,6 +1161,23 @@ class Run:
             raise Denied("Stopped before the parent chat answered.")
         return ("The parent chat didn't answer (its reply ended or it waited too long). Continue with your best judgement "
                 "and say in your final answer what you assumed.")
+
+    def set_subtask_mode(self, idx, args):
+        """The parent changes one of its subtasks' permission mode, never above its own (see capabilities.MODES)."""
+        srv = self.srv
+        pol = capabilities.policy(srv.saved_tool_config(self.chat_id))
+        if not pol["subtasks"]:
+            raise srv.ToolError("Subtasks are off for this session.")
+        mode = str(args.get("mode") or "").strip().lower()
+        if mode not in capabilities.MODES:
+            raise srv.ToolError("mode must be manual, auto or bypass.")
+        child_id, title = self.find_subtask(args.get("subtask"))
+        self.update(idx, display="%s: %s" % (title, mode), subtaskId=child_id)
+        if capabilities.MODES.index(mode) > capabilities.MODES.index(pol["mode"]):
+            raise srv.ToolError("A subtask can't have more permissions than this chat (%s)." % pol["mode"])
+        srv.update_permissions(child_id, {"capabilities": {"mode": mode}})
+        srv.refresh_running(child_id)  # its next tool call follows the new mode
+        return '"%s" is now in %s mode.' % (title, {"manual": "Manual approve", "auto": "Auto edits", "bypass": "Bypass permissions"}[mode])
 
     def find_subtask(self, ref):
         """A subtask chat of this chat, by id or title (this reply's subtasks first)."""
@@ -1201,6 +1251,8 @@ class Run:
             return "None of your subtasks is running or unread."
         reports, extra = self.collect(ids, timeout)
         parts = [reports[c][0] for c in ids] + ([extra] if extra else [])
+        if self.user_waiting():
+            parts.append("The user sent you a message (next). Read it before waiting again.")
         if self.cancelled.is_set():
             raise Denied("Stopped.")
         return "\n\n---\n\n".join(p for p in parts if p)
@@ -1288,6 +1340,8 @@ class Run:
                 out = self.message_parent(idx, args)
             elif name == "message_subtask":
                 out = self.message_subtask(idx, args)
+            elif name == "set_subtask_mode":
+                out = self.set_subtask_mode(idx, args)
             elif name == "wait_subtasks":
                 self.update(idx, display="Waiting for subtasks")
                 out = self.wait_subtasks(args)
@@ -1301,7 +1355,7 @@ class Run:
                 else:
                     scope = srv.memory_scope(chat, args.get("scope"))
                     self.update(idx, display=str(args.get("note") or "")[:200])
-                    if pol["untrusted"] or self.plan:  # a web page must not plant lasting instructions
+                    if pol["askMemory"] or self.plan:  # a web page must not plant lasting instructions
                         self.ask(idx, {"title": "Save this to memory?", "detail": str(args.get("note") or ""),
                                        "why": "This chat has read web content, so saving memory needs your approval."},
                                  "The user didn't allow saving this note.")
@@ -1310,23 +1364,26 @@ class Run:
                 chat = srv.saved_tool_config(self.chat_id)
                 plan = commands.prepare(chat, args, srv.load_config().get("allowedCommands") or [])
                 self.update(idx, display=plan["line"])
-                if not plan["allowedBy"] or capabilities.policy(chat)["untrusted"]:
-                    why = ("This chat has read web content, so every command needs your approval." if plan["allowedBy"] else
-                           "This command isn't on your allowed list (Settings). It runs with your Windows account and can reach anything you can.")
+                pol = capabilities.policy(chat)
+                if pol["mode"] != "bypass" and (not plan["allowedBy"] or pol["askEveryCommand"]):
+                    why = ("This command isn't on your allowed list (Settings > Commands). It runs with your Windows account and can reach anything you can."
+                           if not plan["allowedBy"] else "This chat is in Manual mode, so every command asks first." if pol["mode"] == "manual"
+                           else "This chat has read web content, so every command needs your approval.")
                     self.ask(idx, {"title": "Run this command?", "detail": "Folder: %s\nCommand: %s\nTime limit: %ds" % (plan["cwd"], plan["line"], plan["timeout"]),
                                    "why": why}, "The user didn't allow this command.")
                 out = commands.execute(plan, self.cancelled)
                 undo.record(srv.data_root(), "command", path=plan["line"])
             elif name in gittools.REVIEWED:  # commit / merge / push / pull request: the user approves each one
                 data, record = gittools.prepare(srv.saved_tool_config(self.chat_id), name, args)
-                self.ask(idx, data, "The user didn't approve this.")
+                if capabilities.policy(srv.saved_tool_config(self.chat_id))["askGit"]:  # Bypass: no approval
+                    self.ask(idx, data, "The user didn't approve this.")
                 out = gittools.execute(srv.saved_tool_config(self.chat_id), name, args, record)
                 undo.record(srv.data_root(), "git", path=name.replace("_", " "))
             else:
                 chat = srv.saved_tool_config(self.chat_id)
-                if name in capabilities.GATED_WHEN_UNTRUSTED and capabilities.policy(chat)["untrusted"]:
+                if name in capabilities.GATED_FILE_OPS and capabilities.policy(chat)["askFileOps"]:
                     detail = "\n".join("%s: %s" % (k, v) for k, v in args.items() if k in ("path", "source", "destination", "trash_id"))
-                    self.ask(idx, {"title": ACTION_TITLES.get(name, "Allow this action?"), "detail": detail, "why": UNTRUSTED_WHY},
+                    self.ask(idx, {"title": ACTION_TITLES.get(name, "Allow this action?"), "detail": detail, "why": MANUAL_WHY},
                              "The user denied this action.")
                     chat = srv.saved_tool_config(self.chat_id)  # permissions may have changed while waiting
                 out = srv.run_tool(chat, name, args)
@@ -1359,13 +1416,7 @@ class Run:
             out, urls = web.search(srv.cloud_post, args.get("query"), args.get("max_results", 5))
             source = 'search: "%s"' % str(args.get("query"))[:120]
         else:
-            url = web.valid_url(args.get("url"))
-            user_texts = [m.get("content") or "" for m in chat.get("messages") or [] if m.get("role") == "user"]
-            if not web.known_url(url, chat.get("webUrls") or [], user_texts):
-                self.ask(idx, {"title": "Open this web page?", "detail": url,
-                               "why": "This address didn't come from a web search or from your messages. A page address can carry "
-                                      "information out of this chat, so opening it needs your approval."},
-                         "The user didn't allow opening this page.")
+            url = web.valid_url(args.get("url"))  # web search on: any page opens without asking
             out, urls = web.fetch(srv.cloud_post, url)
             urls = [url]  # links found on the page stay unapproved
             source = "page: %s" % url[:200]

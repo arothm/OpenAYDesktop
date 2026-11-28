@@ -72,13 +72,13 @@ class SubtaskTests(SubtaskTestCase):
         self.assertIn("stopped", " ".join(m.get("content", "") for m in server.load_chat(cid)["messages"] if m["role"] == "tool"))
 
     def test_child_gets_at_most_the_parents_permissions(self):
-        cid = self.parent(editMode="auto", fileManage=True, webSearch=True, modelControl="allowed")
+        cid = self.parent(mode="auto", webSearch=True)
         server.update_permissions(cid, {"folders": [{"path": str(self.shared), "write": True}]})
         server.mark_untrusted(cid, "search: x", ["https://x.example"])
         child = server.load_chat(server.create_subtask_chat(cid, "Helper"))
         self.assertEqual(cid, child["parentId"]); self.assertEqual(server.load_chat(cid)["folders"], child["folders"])
         pol = capabilities.policy(child)
-        self.assertEqual(("review", "fixed", False, True), (pol["editMode"], pol["modelControl"], pol["subtasks"], pol["untrusted"]))
+        self.assertEqual(("auto", "fixed", False, True), (pol["editMode"], pol["modelControl"], pol["subtasks"], pol["untrusted"]))
         with self.assertRaises(server.ToolError): server.create_subtask_chat(child["id"], "Grandchild")
         names = {s["function"]["name"] for s in server.tool_specs(child)[0]}
         self.assertNotIn("start_subtask", names); self.assertNotIn("set_session_model", names)
@@ -94,10 +94,6 @@ class SubtaskTests(SubtaskTestCase):
         self.assertIn("subtask: Lookup", chat["untrusted"]["sources"])
 
     def test_subtasks_off_and_limits(self):
-        cid = self.chat()
-        self.script = [call("start_subtask", task="x", title="X"), say("ok")]
-        chat = self.run_to_end(cid)
-        self.assertTrue(chat["messages"][2]["isError"]); self.assertEqual([], [c for c in server.list_chats() if c["parentId"]])
         cid = self.parent()
         with mock.patch.object(runs, "MAX_SUBTASKS_PER_REPLY", 1):
             self.script = [stream_calls(("start_subtask", {"task": "one", "title": "1"}), ("start_subtask", {"task": "two", "title": "2"})), say("ok")]

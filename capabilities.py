@@ -7,19 +7,23 @@ import shutil
 import time
 import uuid
 
-# modelControl: "ask" = the user approves each switch (default), "allowed" = switch when the
-# user asks without a confirmation step, "fixed" = the session can't change its model.
-# webSearch: the session may search the web and read pages (off by default).
-# subtasks: the session may start helper chats that run in parallel and report back (off by default).
-# git: "off" | "read" | "commit" | "push" (see gittools.py).
-# instructions: read AGENTS.md / CLAUDE.md / .openay/instructions.md from shared folders (on by default).
-# memory: use and save memory notes (see projects.py; on by default).
-DEFAULT_POLICY = {"editMode": "review", "fileManage": False, "deleteFiles": False, "modelControl": "ask", "webSearch": False,
-                  "subtasks": False, "git": "off", "commands": False, "instructions": True, "memory": True}
+# A chat stores two settings (Session settings); everything else follows from them:
+#   mode: what needs the user's approval
+#     "manual" - every file write, file operation (create, copy, move, delete, restore), command, commit, push
+#                and model change asks first
+#     "auto"   - file writes and file operations happen without asking; commands not on the allowed list,
+#                commits, pushes and model changes ask. After the chat reads web content, every command asks.
+#     "bypass" - nothing asks, web content or not
+#   webSearch: the chat may search the web and open pages (any address, without asking)
+# Every top-level chat can use files (in folders with Allow edits), Git up to push, commands (in folders with
+# Allow edits), subtasks, instruction files and memory. A subtask gets read-only Git, no commands, no subtasks,
+# no memory and a fixed model.
+DEFAULT_POLICY = {"mode": "manual", "webSearch": False}
+MODES = ("manual", "auto", "bypass")
 GIT_MODES = ("off", "read", "commit", "push")
 EDIT_MODES = {"review", "auto"}
-# After a session has read untrusted content (web pages), these need the user's approval each time.
-GATED_WHEN_UNTRUSTED = {"create_folder", "copy_path", "move_path", "delete_path", "restore_path"}
+# File operations that ask first in Manual mode (file writes have their own review).
+GATED_FILE_OPS = {"create_folder", "copy_path", "move_path", "delete_path", "restore_path"}
 MODEL_MODES = {"allowed", "ask", "fixed"}
 MAX_COPY_BYTES = 500_000_000
 
@@ -28,47 +32,58 @@ class CapabilityError(Exception):
     pass
 
 
-def policy(chat):
-    """Backward-compatible policy: existing write grants map to review editing only.
+def mode_of(saved):
+    """The chat's mode. Chats saved before modes existed: auto-edit maps to Auto, anything else to Manual."""
+    saved = saved if isinstance(saved, dict) else {}
+    if saved.get("mode") in MODES:
+        return saved["mode"]
+    return "auto" if saved.get("editMode") == "auto" else "manual"
 
-    Anything not explicitly saved falls back to DEFAULT_POLICY, so older chats never gain
-    file management or deletion just because a folder allows edits.
+
+def policy(chat):
+    """What this chat may do and what asks first, from its mode and web search setting (see the top of this file).
+
+    Keys: mode, webSearch, editMode ("review" = every write asks), fileManage, deleteFiles, git, commands,
+    subtasks, instructions, memory, modelControl ("ask" | "allowed" | "fixed"), untrusted (read web content),
+    askFileOps (file operations ask), askEveryCommand (even allowed-list commands ask), askGit (commits and pushes
+    ask), askMemory (saving memory asks).
     """
     writable = any(isinstance(f, dict) and f.get("write") for f in chat.get("folders") or [])
-    p = dict(DEFAULT_POLICY)
-    saved = chat.get("capabilities")
-    if isinstance(saved, dict):
-        p.update({k: saved[k] for k in DEFAULT_POLICY if k in saved})
-    if p["editMode"] not in EDIT_MODES:
-        p["editMode"] = "review"
-    if p["modelControl"] not in MODEL_MODES:
-        p["modelControl"] = "ask"
-    p["fileManage"] = bool(p["fileManage"]) and writable
-    p["deleteFiles"] = bool(p["deleteFiles"]) and writable
-    p["webSearch"] = bool(p["webSearch"])
-    p["commands"] = bool(p["commands"]) and writable and not chat.get("parentId")  # needs a writable folder; never in subtasks
-    if p["git"] not in GIT_MODES:
-        p["git"] = "off"
-    p["subtasks"] = bool(p["subtasks"]) and not chat.get("parentId")  # one level only: subtasks can't start subtasks
-    p["instructions"] = bool(p["instructions"])
-    p["memory"] = bool(p["memory"]) and not chat.get("parentId")  # helpers neither read nor save memory
-    # Untrusted content (web pages) can carry instructions aimed at the model. Once a session has
-    # read some, nothing that changes files or the model happens without the user's approval.
-    p["untrusted"] = bool(chat.get("untrusted"))
-    if p["untrusted"]:
-        p["editMode"] = "review"
-        if p["modelControl"] == "allowed":
-            p["modelControl"] = "ask"
-    return p
+    saved = chat.get("capabilities") if isinstance(chat.get("capabilities"), dict) else {}
+    child = bool(chat.get("parentId"))
+    mode = mode_of(saved)
+    untrusted = bool(chat.get("untrusted"))
+    bypass = mode == "bypass"
+    return {
+        "mode": mode, "webSearch": bool(saved.get("webSearch")), "untrusted": untrusted,
+        "editMode": "review" if mode == "manual" else "auto",
+        "fileManage": writable, "deleteFiles": writable,
+        "git": "read" if child else "push",  # subtasks never commit or push
+        "commands": writable and not child,  # needs a writable folder; never in subtasks
+        "subtasks": not child,  # one level only
+        "instructions": True,
+        "memory": not child,  # helpers neither read nor save memory
+        "modelControl": "fixed" if child else ("allowed" if bypass else "ask"),
+        "askFileOps": mode == "manual",
+        # Manual: every command. Auto: commands off the allowed list, and all of them once web content was read.
+        "askEveryCommand": mode == "manual" or (mode == "auto" and untrusted),
+        "askGit": not bypass,
+        "askMemory": untrusted and not bypass,  # a web page must not plant lasting instructions
+    }
+
+
+def stored(saved, changes=None):
+    """The two settings a chat stores, from what it had (any older format) and validated changes."""
+    saved = saved if isinstance(saved, dict) else {}
+    changes = changes or {}
+    mode = mode_of(changes) if ("mode" in changes or "editMode" in changes) else mode_of(saved)
+    return {"mode": mode, "webSearch": bool(changes.get("webSearch", saved.get("webSearch", False)))}
 
 
 def child_capabilities(parent):
-    """A subtask gets at most its parent's effective permissions, a fixed model, and no subtasks of its own."""
+    """A subtask starts with its parent's mode and web search (its other limits come from policy)."""
     p = policy(parent)
-    return {"editMode": p["editMode"], "fileManage": p["fileManage"], "deleteFiles": p["deleteFiles"],
-            "modelControl": "fixed", "webSearch": p["webSearch"], "subtasks": False,
-            "git": "read" if p["git"] != "off" else "off", "commands": False,  # subtasks never commit, push or run commands
-            "instructions": p["instructions"], "memory": False}
+    return {"mode": p["mode"], "webSearch": p["webSearch"]}
 
 
 def grants(chat):
@@ -118,7 +133,7 @@ def require(chat, capability):
     if not policy(chat).get(capability):
         names = {"fileManage": "file/folder creation, copy, move and rename",
                  "deleteFiles": "recoverable deletion"}
-        raise CapabilityError("This session does not allow %s. Enable it in Session permissions." % names.get(capability, capability))
+        raise CapabilityError("This session can't do %s: share a folder with Allow edits first." % names.get(capability, capability))
 
 
 def destination(chat, raw):
@@ -347,7 +362,10 @@ def clean_capabilities(value):
     if not isinstance(value, dict):
         raise CapabilityError("capabilities must be an object")
     out = {}
-    if "editMode" in value:
+    if "mode" in value:
+        if value["mode"] not in MODES: raise CapabilityError("Unknown mode.")
+        out["mode"] = value["mode"]
+    if "editMode" in value:  # older chats, projects and settings; see mode_of
         if value["editMode"] not in EDIT_MODES: raise CapabilityError("Unknown edit mode.")
         out["editMode"] = value["editMode"]
     if "modelControl" in value:

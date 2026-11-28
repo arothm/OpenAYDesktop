@@ -118,12 +118,10 @@ class LoopTests(RunTestCase):
         self.assertEqual("plain answer", chat["messages"][-1]["content"]); self.assertIn("doesn't support tools", chat["messages"][-1]["notice"])
 
     def test_tools_and_note_follow_the_session_policy(self):
-        c = server.create_chat({"model": "m1", "folders": []}); server.update_permissions(c["id"], {"capabilities": {"modelControl": "fixed", "memory": False}})
+        c = server.create_chat({"model": "m1", "folders": []})
         self.script = [say("hi")]; self.run_to_end(c["id"])
-        self.assertNotIn("tools", self.requests[-1])
-        c = server.create_chat({"model": "m1", "folders": []}); server.update_permissions(c["id"], {"capabilities": {"memory": False}})
-        self.script = [say("hi")]; self.run_to_end(c["id"])
-        self.assertEqual(["set_session_model"], [t["function"]["name"] for t in self.requests[-1]["tools"]])
+        names = {t["function"]["name"] for t in self.requests[-1]["tools"]}
+        self.assertIn("set_session_model", names); self.assertFalse({"read_file", "write_file", "run_command", "web_search"} & names)
         self.assertIn("explicitly asks", self.requests[-1]["messages"][0]["content"])
 
     def test_model_cannot_reach_outside_shared_folders(self):

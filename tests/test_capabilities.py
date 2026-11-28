@@ -34,11 +34,12 @@ class TempChatsMixin:
         self.shared = self.base / "shared"; self.shared.mkdir()
         self.readonly = self.base / "readonly"; self.readonly.mkdir()
         self.outside = self.base / "outside"; self.outside.mkdir()
+        self._old_config = server.CONFIG_PATH; server.CONFIG_PATH = str(self.base / "data" / "config.json")  # never the real settings
         server._approvals.clear(); server._model_approvals.clear()
 
     def tearDown(self):
         server._approvals.clear(); server._model_approvals.clear()
-        server.CHATS_DIR = self._old_chats
+        server.CHATS_DIR = self._old_chats; server.CONFIG_PATH = self._old_config
         self.temp.cleanup()
 
     def make_chat(self, chat_id="c1", caps=None, write=True, **extra):
@@ -52,10 +53,24 @@ class TempChatsMixin:
 
 
 class PolicyTests(unittest.TestCase):
-    def test_defaults_are_conservative(self):
+    def test_defaults_are_manual(self):
         p = capabilities.policy({"folders": []})
-        self.assertEqual({"editMode": "review", "fileManage": False, "deleteFiles": False, "modelControl": "ask",
-                          "webSearch": False, "subtasks": False, "git": "off", "commands": False, "instructions": True, "memory": True, "untrusted": False}, p)
+        self.assertEqual({"mode": "manual", "editMode": "review", "fileManage": False, "deleteFiles": False, "modelControl": "ask",
+                          "webSearch": False, "subtasks": True, "git": "push", "commands": False, "instructions": True, "memory": True,
+                          "untrusted": False, "askFileOps": True, "askEveryCommand": True, "askGit": True, "askMemory": False}, p)
+
+    def test_modes(self):
+        auto = capabilities.policy({"capabilities": {"mode": "auto"}})
+        self.assertEqual(("auto", False, False, True, "ask"), (auto["editMode"], auto["askFileOps"], auto["askEveryCommand"], auto["askGit"], auto["modelControl"]))
+        bypass = capabilities.policy({"capabilities": {"mode": "bypass"}, "untrusted": {"since": 1, "sources": []}})
+        self.assertEqual(("auto", False, False, False, False, "allowed"),
+                         (bypass["editMode"], bypass["askFileOps"], bypass["askEveryCommand"], bypass["askGit"], bypass["askMemory"], bypass["modelControl"]))
+        self.assertEqual("auto", capabilities.policy({"capabilities": {"editMode": "auto", "git": "off"}})["mode"])  # chats saved before modes
+
+    def test_subtasks_have_fixed_limits(self):
+        p = capabilities.policy({"parentId": "p", "capabilities": {"mode": "bypass"}, "folders": [{"path": tempfile.gettempdir(), "write": True}]})
+        self.assertEqual(("read", False, False, False, "fixed"), (p["git"], p["commands"], p["subtasks"], p["memory"], p["modelControl"]))
+        self.assertEqual({"mode": "bypass", "webSearch": False}, capabilities.child_capabilities({"capabilities": {"mode": "bypass"}}))
 
     def test_invalid_saved_values_fall_back_to_safe_defaults(self):
         p = capabilities.policy({"capabilities": {"editMode": "yolo", "modelControl": "whatever"}})
@@ -76,7 +91,7 @@ class FileOperationTests(TempChatsMixin, unittest.TestCase):
         with self.assertRaises(server.ToolError): server.run_tool(chat, "create_folder", {"path": str(target)})
 
     def test_operations_refused_when_disabled_or_read_only_or_outside(self):
-        chat = self.make_chat(caps=dict(FULL, fileManage=False))
+        chat = self.make_chat(write=False)  # no folder with Allow edits
         with self.assertRaises(server.ToolError): server.run_tool(chat, "create_folder", {"path": str(self.shared / "x")})
         chat = self.make_chat()
         with self.assertRaises(server.ToolError): server.run_tool(chat, "create_folder", {"path": str(self.readonly / "x")})
@@ -124,11 +139,11 @@ class FileOperationTests(TempChatsMixin, unittest.TestCase):
         names = lambda chat: {s["function"]["name"] for s in server.tool_specs(chat)[0]}  # noqa: E731
         full = names(self.make_chat())
         self.assertTrue({"write_file", "create_folder", "delete_path", "set_session_model"} <= full)
-        limited = names(self.make_chat(caps={"editMode": "review", "modelControl": "fixed"}))
-        self.assertIn("read_file", limited)
-        self.assertFalse({"create_folder", "delete_path", "set_session_model"} & limited)
-        self.assertEqual({"set_session_model", "save_memory"}, names({"folders": [], "capabilities": {"modelControl": "ask"}}))
-        self.assertEqual({"set_session_model"}, names({"folders": [], "capabilities": {"modelControl": "ask", "memory": False}}))
+        read_only = names(self.make_chat(write=False))
+        self.assertIn("read_file", read_only); self.assertFalse({"create_folder", "delete_path", "run_command"} & read_only)
+        child = names(self.make_chat(parentId="p"))
+        self.assertIn("create_folder", child); self.assertFalse({"set_session_model", "save_memory", "start_subtask", "run_command", "git_commit"} & child)
+        self.assertTrue({"set_session_model", "save_memory", "start_subtask"} <= names({"folders": [], "capabilities": {}}))
 
 
 class ModelSwitchTests(TempChatsMixin, unittest.TestCase):
@@ -164,10 +179,10 @@ class ModelSwitchTests(TempChatsMixin, unittest.TestCase):
         self.assertTrue(self.switch("model-b", r["approvalToken"])["needsApproval"])
         self.assertEqual("model-a", server.load_chat("c1")["model"])
 
-    def test_allowed_mode_switches_immediately_and_fixed_refuses(self):
-        self.make_chat(caps=dict(FULL, modelControl="allowed"))
+    def test_bypass_switches_immediately_and_subtasks_refuse(self):
+        self.make_chat(caps={"mode": "bypass"})
         self.assertFalse(self.switch("model-b")["needsApproval"]); self.assertEqual("model-b", server.load_chat("c1")["model"])
-        self.make_chat(caps=dict(FULL, modelControl="fixed"))
+        self.make_chat(parentId="p")
         with self.assertRaises(server.ToolError): self.switch("model-b")
 
     def test_unknown_model_and_same_model(self):
@@ -176,10 +191,9 @@ class ModelSwitchTests(TempChatsMixin, unittest.TestCase):
         self.assertIn("already uses", self.switch("model-a")["content"])
 
     def test_refuses_non_vision_model_when_chat_has_images_and_warns_without_tools(self):
-        self.make_chat(caps=dict(FULL, modelControl="allowed"),
-                       messages=[{"role": "user", "content": "look", "images": ["aGk="]}])
+        self.make_chat(caps={"mode": "bypass"}, messages=[{"role": "user", "content": "look", "images": ["aGk="]}])
         with self.assertRaises(server.ToolError): self.switch("text-only")
-        self.make_chat(caps=dict(FULL, modelControl="allowed"))
+        self.make_chat(caps={"mode": "bypass"})
         done = self.switch("text-only")
         self.assertIn("doesn't support tools", done["content"]); self.assertEqual("text-only", server.load_chat("c1")["model"])
 
@@ -312,15 +326,16 @@ class ServerOwnedSettingsHTTPTests(TempChatsMixin, unittest.TestCase):
 
     def test_permissions_endpoint_validates_and_updates(self):
         self.make_chat(caps={"editMode": "review", "modelControl": "ask"})
-        status, body = self.call("POST", "/api/session/permissions", {"chatId": "c1", "capabilities": {"editMode": "yolo"}})
+        status, body = self.call("POST", "/api/session/permissions", {"chatId": "c1", "capabilities": {"mode": "yolo"}})
         self.assertEqual(400, status)
         status, body = self.call("POST", "/api/session/permissions", {"chatId": "c1", "folders": [{"path": "bad\x01path"}]})
         self.assertEqual(400, status)
-        status, body = self.call("POST", "/api/session/permissions", {"chatId": "c1", "capabilities": {"editMode": "auto", "fileManage": True},
+        status, body = self.call("POST", "/api/session/permissions", {"chatId": "c1", "capabilities": {"mode": "auto", "webSearch": True},
                                                                        "folders": [{"path": str(self.shared), "write": True}, {"path": str(self.shared), "write": False}]})
         self.assertEqual(200, status); self.assertEqual(1, len(body["folders"]))
-        self.assertTrue(body["policy"]["fileManage"]); self.assertEqual("auto", server.load_chat("c1")["capabilities"]["editMode"])
-        self.assertEqual("ask", server.load_chat("c1")["capabilities"]["modelControl"])  # untouched keys are kept
+        self.assertTrue(body["policy"]["fileManage"]); self.assertEqual({"mode": "auto", "webSearch": True}, server.load_chat("c1")["capabilities"])
+        self.call("POST", "/api/session/permissions", {"chatId": "c1", "capabilities": {"webSearch": False}})
+        self.assertEqual({"mode": "auto", "webSearch": False}, server.load_chat("c1")["capabilities"])  # the mode is kept
         self.assertEqual(400, self.call("POST", "/api/session/permissions", {"chatId": "missing", "folders": []})[0])
 
     def test_unexpected_errors_return_json_500(self):

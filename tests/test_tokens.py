@@ -61,13 +61,11 @@ class BudgetTests(unittest.TestCase):
         self.assertNotIn("attachments", api)
 
     def test_tool_definitions_are_short(self):
-        cfg = {"folders": [{"path": str(Path(__file__).parent), "write": True}], "capabilities": {
-            "editMode": "auto", "fileManage": True, "deleteFiles": True, "webSearch": True, "subtasks": True, "git": "push", "commands": True,
-            "memory": False}}
+        cfg = {"folders": [{"path": str(Path(__file__).parent), "write": True}], "capabilities": {"mode": "auto", "webSearch": True}}
         with mock.patch.object(server, "load_config", return_value={"allowedCommands": ["npm test"]}):
             specs, _ = server.tool_specs(cfg)
             plan, _ = server.tool_specs(cfg, plan=True)
-        self.assertLess(len(json.dumps(specs)), 9_000)  # 1.11 sent 10,400 characters for the same tools minus git_merge
+        self.assertLess(len(json.dumps(specs)), 10_500)  # every tool a chat can have; 1.11 sent 10,400 characters for fewer
         self.assertTrue({s["function"]["name"] for s in plan} <= server.READ_ONLY_TOOLS)
         self.assertNotIn("write_file", {s["function"]["name"] for s in plan})
 
@@ -132,9 +130,7 @@ class MemoryAndProjectTests(RunTestCase):
         cid = self.chat(); self.script = [say("ok")]; self.run_to_end(cid)
         system = self.requests[-1]["messages"][0]["content"]
         self.assertIn("Always run the tests with -q.", system); self.assertIn("prefers short answers", system)
-        server.update_permissions(cid, {"capabilities": {"instructions": False, "memory": False}})
-        self.script = [say("ok")]; self.run_to_end(cid)
-        self.assertNotIn("Always run the tests", json.dumps(self.requests[-1])); self.assertNotIn("save_memory", json.dumps(self.requests[-1]))
+        self.assertIn("save_memory", json.dumps(self.requests[-1]))
 
     def test_save_memory_writes_a_note_and_asks_in_untrusted_chats(self):
         cid = self.chat(); self.script = [call("save_memory", note="Codename is BLUEBIRD"), say("saved")]

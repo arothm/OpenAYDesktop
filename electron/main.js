@@ -35,7 +35,10 @@ let serverLog = "";
 let pythonUsed = "";
 const background = { keepInTray: false, startAtLogin: false, told: false };
 
-if (!app.requestSingleInstanceLock()) {
+// The smoke test runs beside an installed copy that may be open (or in the tray): its own profile, and no
+// single-instance lock, which would otherwise make it quit before reporting anything
+if (SMOKE) app.setPath("userData", path.join(app.getPath("temp"), "open-ay-desktop-smoke"));
+if (!SMOKE && !app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on("second-instance", () => showWindow());

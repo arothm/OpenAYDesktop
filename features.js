@@ -41,8 +41,7 @@ async function editProject(id) {
   proj.current = id; const p = state.projects.find((x) => x.id === id) || { name: "", instructions: "", folders: [], capabilities: {}, skills: [] };
   $("#projName").value = p.name; $("#projInstructions").value = p.instructions || ""; proj.folders = (p.folders || []).map((f) => ({ ...f }));
   const c = p.capabilities || {};
-  $("#projAuto").checked = c.editMode === "auto"; $("#projWeb").checked = Boolean(c.webSearch); $("#projCmds").checked = Boolean(c.commands);
-  $("#projFiles").checked = Boolean(c.fileManage); $("#projGit").value = c.git || "off";
+  $("#projMode").value = c.mode || (c.editMode ? modeOf(c) : ""); $("#projWeb").checked = Boolean(c.webSearch);
   $("#projDelete").disabled = !id; $("#projNewChat").disabled = !id; $("#projMemory").value = ""; $("#projMemory").disabled = !id;
   $("#projMemory").placeholder = id ? "- Ships on Fridays" : "Save the project first";
   renderProjFolders(); renderProjectList();
@@ -69,8 +68,7 @@ $("#projectList").addEventListener("click", (e) => { const b = e.target.closest(
 $("#projectNew").addEventListener("click", () => { editProject(null); $("#projName").focus(); });
 $("#projSave").addEventListener("click", async () => {
   const body = { id: proj.current || undefined, name: $("#projName").value, instructions: $("#projInstructions").value, folders: proj.folders,
-    capabilities: { editMode: $("#projAuto").checked ? "auto" : "review", webSearch: $("#projWeb").checked, commands: $("#projCmds").checked,
-                    fileManage: $("#projFiles").checked, deleteFiles: $("#projFiles").checked, git: $("#projGit").value },
+    capabilities: $("#projMode").value ? { mode: $("#projMode").value, webSearch: $("#projWeb").checked } : ($("#projWeb").checked ? { webSearch: true } : {}),
     skills: [...document.querySelectorAll("#projSkills [data-skill]")].filter((x) => x.checked).map((x) => x.dataset.skill) };
   try {
     const saved = await api("/api/projects", { method: "POST", body: JSON.stringify(body) });
