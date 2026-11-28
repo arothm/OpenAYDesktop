@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It runs as an **Electron** desktop app, with a local Python 3 server (standard library only) doing the work. It can also still open in an Edge or Chrome app window without Electron. There is no frontend framework or build step for the interface itself.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.17.0
+- **Version:** 1.17.1
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -108,7 +108,7 @@ Every chat has two settings, in **Session settings** (the menu on the chat's nam
 
 Every chat can use files (in folders with **Allow edits**), Git up to push, commands (in folders with **Allow edits**), subtasks, instruction files and memory; the mode decides what asks first. Deleted items always go to the app's trash in `data/trash/`, and edited files keep their earlier version there, so changes can be undone in every mode. A subtask always has read-only Git, no commands, no subtasks of its own and a fixed model.
 
-**Settings > Session defaults** sets the mode, web search and skills every new chat starts with. Existing chats keep theirs. A project's mode and web search take precedence for chats in that project; a subtask starts with its parent chat's mode, and the parent's model can change it with `set_subtask_mode`, never above its own mode. **Use defaults** in Session settings fills in the defaults for one chat.
+**Settings > Session defaults** sets the mode, web search and skills every new chat starts with. Existing chats keep theirs. A project's mode takes precedence for chats in that project (web search always follows the defaults or the chat's own setting); a subtask starts with its parent chat's mode, and the parent's model can change it with `set_subtask_mode`, never above its own mode. **Use defaults** in Session settings fills in the defaults for one chat.
 
 A chat's folders, permissions and name are **server-owned**. Normal chat saves from the window can't change them, even from an outdated copy. They change only through the validated `/api/session/permissions` and `/api/session/rename` endpoints. Chats saved before modes existed get **Auto edits** if they had auto-edit on, and **Manual approve** otherwise.
 
@@ -123,7 +123,7 @@ The model is told to cite the sources it uses as clickable Markdown links.
 
 Web pages are written by strangers and can contain text aimed at steering the model. The app protects against that in four ways:
 - **Results are marked as data.** Everything from the web is wrapped in clear "untrusted content" markers, which a page can't fake, and the model is told never to follow instructions inside them.
-- **The chat is marked.** The first time a chat reads web content, a **⚠ Web content** badge appears in the header. From then on, in **Auto edits**, every command (even one on your allowed list) and every memory note asks first. **Manual approve** already asks for those, and **Bypass permissions** never asks.
+- **The chat is marked.** Once a chat reads web content (its Session settings list what it read), from then on in **Auto edits**, every command (even one on your allowed list) and every memory note asks first. **Manual approve** already asks for those, and **Bypass permissions** never asks.
 - **You decide when to trust it again.** In Session settings, the notice lists what the chat read, and **Trust this chat again** clears the mark. The web content stays in the conversation.
 
 With web search on, the chat opens any page without asking. A page address can carry information out of the chat (file contents written into a link, say), and the model could put private information into a search query; it's told not to, but the app can't check it. Turn on web search only for chats where that's acceptable.
@@ -132,7 +132,8 @@ With web search on, the chat opens any page without asking. A page address can c
 A skill is a set of instructions you write once and turn on per chat, for example how to review code or the style to write in. Open **Settings > Skills** to:
 - create, edit or delete skills;
 - import a Markdown file. An optional `name:` and `description:` header between `---` lines is read;
-- import a **skill folder** in the open Agent Skills format, the same skills Claude, Codex, Cursor and others use. Use **Import folder** for a folder with a `SKILL.md`, or **Import file** for a `.skill` or `.zip` package.
+- import a **skill folder** in the open Agent Skills format, the same skills Claude, Codex, Cursor and others use. Use **Import folder** for a folder with a `SKILL.md`, or **Import file** for a `.skill` or `.zip` package;
+- import from **GitHub**: paste the link to a public repository that holds one skill, or to a skill's folder in a repository with several (for example `https://github.com/owner/repo/tree/main/skills/name`). **Update from GitHub** downloads it again later.
 
 Turn skills on for a chat in its Session settings. Enabled skills are added to the chat's system instructions on every request, up to 30,000 characters in total and 20,000 per written skill. A skill never changes what the chat is allowed to do. Written skills are Markdown files in `data/skills/`; skill folders are copied to `data/skills/<name>/`.
 
@@ -195,6 +196,7 @@ The model can hand self-contained pieces of work to helper chats with `start_sub
   - `message_subtask`: the parent answers a question, or sends a follow-up that the subtask reads before its next step. A subtask that has already finished continues with the message as a new reply, so the parent can ask for more without starting over.
   - `wait_subtasks`: the parent waits for results and messages.
 - **Managing them.** The parent's model can also:
+  - `read_subtask`: read the latest messages of a subtask's chat (20 by default, up to 60, long tool output shortened), while it runs or after;
   - `rename_subtask`: rename a subtask, without asking;
   - `set_subtask_mode`: change its permission mode, never above the parent's own;
   - `delete_subtask`: delete a subtask and its messages, stopping it first if it's running. Outside **Bypass permissions** you approve each deletion; the files it changed stay as they are.
@@ -245,18 +247,21 @@ Each reply runs on the app's local server (`runs.py`): the model answers, calls 
 Ollama Cloud bills per token, and input it has seen before at the start of a request ("cached input") costs far less, often about a tenth. So the app keeps the start of every request the same from step to step and turn to turn: instructions and tools first, then the history, and anything that changes per request at the end. Ollama reports how much was cached; hover the token count under the message box to see it.
 
 Before each request the server fits the conversation into the **context budget** (Settings > Usage & context):
-- **Full** (default) uses the model's whole window. **Balanced** (64k tokens) and **Economy** (32k) send less per request; they suit models without cached-input pricing.
+- **Full** (default) uses the model's whole window. **Large** (200k tokens) suits models with 1-million-token windows: long replies are summarized far sooner, so each request stays smaller. **Balanced** (64k tokens) and **Economy** (32k) send less per request; they suit models without cached-input pricing.
 - Everything sent counts: messages, tool definitions and instructions.
 - Tool results from earlier turns are shortened, and the model can call the tool again.
 - Past the budget, the older turns are replaced by a summary the chat's model writes, kept until the next one. Your own earlier messages stay next to it, shortened and in order, so details you gave aren't lost. A "View summary" divider shows where it starts. If a summary can't be made, the oldest turns are left out instead.
 - A file is read up to 800 lines (about 28,000 characters) at a time, with a note saying where to continue. A single very long line (minified code, a one-line JSON file) is cut at that length.
+- **Lighter history.** The chat keeps everything, but requests leave out what the model no longer needs: the text of write and edit calls older than the last 3 tool steps (it's in the file, which the model can read again), and older reads of a file that was read or changed again later. Stale reads are left out in batches of at least 20,000 tokens, so the start of the request changes rarely and Ollama's cache keeps working.
+- **At most 25 tool calls run per step.** A model that asks for more in one response (a runaway loop) gets the first 25 and a note asking for the rest in its next step.
+- **Whole-repository diffs** longer than about 12,000 characters come back as a per-file summary; the model asks for the files it needs.
 - **Compact** (under the message box) summarizes the older part of the chat now, keeping the latest messages word for word, so the next requests are smaller.
 - Pictures are shrunk to at most 1600 pixels on the long side before sending. Models that bill by resolution use far fewer tokens: one test screenshot went from 5,069 to 1,579 tokens with the same answer.
 
 The row under the message box shows the chat's folders, Git level, a context gauge (tokens in the last request out of the model's window), **Compact**, the tokens this chat sent and received, and the model. Today's totals are in Settings > Usage & limits (kept in `data/usage.json` for 90 days).
 
 ## Projects and memory
-- **Projects** (the switcher under the search box, or Manage projects) group chats. A project has folders, a starting mode and web search setting, skills, written instructions and its own memory. New chats in the project start with all of them.
+- **Projects** (the switcher under the search box, or Manage projects) group chats. A project has folders, a starting mode, skills, written instructions and its own memory. New chats in the project start with all of them.
 - **Memory**: notes chats can use later. Global memory (Settings > Memory) applies everywhere; project memory only in that project. Ask the model to remember something and it saves a note; you can edit or delete notes at any time. In Manual approve and Auto edits, a chat that has read web content asks you before saving, so a web page can't plant lasting instructions.
 - **Instruction files**: `AGENTS.md`, `CLAUDE.md` or `.openay/instructions.md` at the top of a shared folder are followed by the chat. They can't change permissions.
 

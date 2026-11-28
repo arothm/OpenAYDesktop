@@ -42,7 +42,7 @@ import skills
 import web
 
 APP_NAME = "Open AY Desktop"
-APP_VERSION = "1.17.0"
+APP_VERSION = "1.17.1"
 APP_SLUG = "open-ay-desktop"
 REPOSITORY = "arothm/OpenAYDesktop"
 RELEASES_URL = "https://github.com/%s/releases/latest" % REPOSITORY
@@ -343,6 +343,7 @@ def create_chat(body):
         chat["folders"] = [dict(f) for f in project.get("folders") or []] + [f for f in folders if os.path.normcase(f["path"]) not in known]
         try: pc = capabilities.clean_capabilities(project.get("capabilities") or {})
         except capabilities.CapabilityError: pc = {}
+        pc = {k: v for k, v in pc.items() if k in ("mode", "editMode")}  # a project sets only the mode; web search is per chat
         chat["capabilities"] = capabilities.stored(chat["capabilities"], pc)  # a project without a mode keeps the default one
         project_skills = skills.valid_ids(skills_root(), project.get("skills") or [])
         chat["skills"] = list(dict.fromkeys(defaults["skills"] + project_skills))  # default skills plus the project's
@@ -643,7 +644,7 @@ REVIEWED_TOOLS = ("write_file", "edit_file")
 
 
 READ_ONLY_TOOLS = {"list_directory", "read_file", "search_files", "web_search", "web_fetch", "git_status", "git_diff", "git_log",
-                   "git_show", "git_branches", "gh_pr_list", "read_memory", "read_skill_file"}
+                   "git_show", "git_branches", "gh_pr_list", "read_memory", "read_skill_file", "read_subtask"}
 
 
 def tool_specs(cfg, plan=False):
@@ -726,6 +727,8 @@ def tool_specs(cfg, plan=False):
         specs.append(fn("set_subtask_mode", "Change a subtask's permission mode: manual (asks the user before every change), auto (edits files "
                         "without asking) or bypass (asks nothing). At most this chat's own mode (%s)." % pol["mode"],
                         {"subtask": s, "mode": {"type": "string", "enum": list(capabilities.MODES)}}, ["subtask", "mode"]))
+        specs.append(fn("read_subtask", "Read the latest messages of one of this chat's subtasks (its work so far, tool results shortened).",
+                        {"subtask": s, "last": {"type": "integer", "description": "How many recent messages, default 20, at most 60"}}, ["subtask"]))
         specs.append(fn("rename_subtask", "Rename one of this chat's subtasks (id or title).", {"subtask": s, "title": s}, ["subtask", "title"]))
         specs.append(fn("delete_subtask", "Delete one of this chat's subtasks and its messages, stopping it if it runs. Only when the user asks."
                         + ("" if pol["mode"] == "bypass" else " The user approves it first."), {"subtask": s}, ["subtask"]))
@@ -1493,7 +1496,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True})
         elif p == "/api/skills/import":  # a skill folder, from a folder path or a .skill/.zip file (base64)
             try:
-                if body.get("path"): s = skills.import_folder(skills_root(), body["path"], body.get("replace") is True)
+                if body.get("github"): s = skills.import_github(skills_root(), body["github"], body.get("replace") is True)
+                elif body.get("path"): s = skills.import_folder(skills_root(), body["path"], body.get("replace") is True)
                 else:
                     try: data = base64.b64decode(str(body.get("zip") or ""), validate=True)
                     except ValueError: return self._json({"error": "The file couldn't be read."}, 400)

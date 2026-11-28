@@ -770,3 +770,7 @@ details.help summary { cursor: pointer; margin: 4px 0; }
 .diag-table .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .diag-table tr:last-child td { border-bottom: 0; }
 #secDiag .page-bar select { width: auto; }
+
+/* 1.17.1 skills from GitHub */
+.gh-import { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; padding: 0 20px 12px; }
+.gh-import .help { grid-column: 1 / -1; margin: 0; }

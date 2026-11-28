@@ -36,6 +36,7 @@ MODES = ["off", "read", "commit", "push"]
 READ_TOOLS = {"git_status", "git_diff", "git_log", "git_show", "git_branches", "gh_pr_list"}
 REVIEWED = {"git_commit": "commit", "git_merge": "commit", "git_push": "push", "gh_pr_create": "push"}
 MAX_OUT = 30_000  # one Git result; diffs longer than this are cut (the model can ask for one path)
+DIFF_SUMMARY_CHARS = 12_000  # a whole-repository diff longer than this comes back as a per-file summary
 NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]{0,99}$")            # remote / branch names
 REV = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/~^@{}-]{0,99}$")       # commit-ish
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -203,6 +204,9 @@ def git_diff(chat, repo="", staged=False, path="", **_):
     top = repo_root(chat, repo)
     args = ["diff", "--no-ext-diff", "--no-textconv", "--stat", "--patch"] + (["--cached"] if staged else [])
     out = run(top, *args, "--", *rel_paths(chat, top, path or None))
+    if not path and len(out) > DIFF_SUMMARY_CHARS:  # big: the per-file summary; the model asks for the files it needs
+        stat = run(top, "diff", "--no-ext-diff", "--stat=200", *(["--cached"] if staged else []))
+        return clip(stat + "\n\nThe full diff is %d characters. Call git_diff with path for the changes in one file or folder." % len(out))
     return clip(out) or "No %s changes." % ("staged" if staged else "unstaged")
 
 

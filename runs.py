@@ -71,6 +71,11 @@ ACTION_TITLES = {"create_folder": "Create a folder?", "copy_path": "Copy this it
                  "delete_path": "Move this item to the trash?", "restore_path": "Restore this item from the trash?"}
 MANUAL_WHY = "This chat is in Manual mode, so file operations ask first. Change the mode in Session settings."
 
+MAX_TOOL_CALLS_PER_STEP = 25  # more in one model response is a runaway loop (1.17 diagnostics: one step asked for 3,481)
+KEEP_WRITES = 3               # the newest assistant steps whose write/edit arguments are sent in full
+STUB_ARG_CHARS = 300          # older write/edit arguments longer than this are replaced by a short note
+STALE_READ_BATCH = 20_000     # superseded file reads are left out in batches of at least this many tokens (each batch
+                              # changes an old message once, so Ollama's cache of the request start is rebuilt rarely)
 MAX_STEER_CHARS = 100_000  # a message typed while a reply runs
 MAX_STEPS = 100  # model requests per reply when the config has no maxSteps (Settings > Usage & limits; 0 = no limit)
 APPROVAL_WAIT = 1800          # seconds an approval waits before it counts as denied
@@ -81,6 +86,9 @@ MAX_SUBTASKS_PER_REPLY = 6
 MAX_DOCUMENTS = 10
 CHANGING_TOOLS = {"write_file", "edit_file", "create_folder", "copy_path", "move_path", "delete_path", "restore_path"}
 SUBTASK_RESULT_CHARS = 20_000
+READ_SUBTASK_MESSAGES = 20    # read_subtask: messages returned by default (at most READ_SUBTASK_MAX)
+READ_SUBTASK_MAX = 60
+READ_SUBTASK_CHARS = 24_000   # read_subtask: characters returned at most
 MAX_SUBTASK_MESSAGE = 8_000   # characters in one message between a parent and a subtask
 MAX_MESSAGES = 30             # messages one reply can send to its parent or subtasks
 QUESTION_WAIT = 1800          # seconds a subtask waits for the parent's answer
@@ -582,8 +590,16 @@ class Run:
                             continue
                         self.inbox_closed = True
                     break
+                calls = reply["tool_calls"]
+                if len(calls) > MAX_TOOL_CALLS_PER_STEP:  # a runaway response: run the first ones, tell the model
+                    self.update(idx, tool_calls=calls[:MAX_TOOL_CALLS_PER_STEP])
+                    srv.diag("tool_cap", model=self.chat["model"], requested=len(calls), ran=MAX_TOOL_CALLS_PER_STEP)
+                    skipped = len(calls) - MAX_TOOL_CALLS_PER_STEP
+                    calls = calls[:MAX_TOOL_CALLS_PER_STEP]
+                else:
+                    skipped = 0
                 started = []  # subtasks requested in this step run at the same time
-                for call in reply["tool_calls"]:
+                for call in calls:
                     if self.cancelled.is_set():
                         break
                     name, args = parse_call(call)
@@ -595,6 +611,10 @@ class Run:
                         self.run_tool_call(call)
                 if started:
                     self.finish_subtasks(started)
+                if skipped:
+                    self.add({"role": "user", "auto": True, "content": "[Only the first %d of the %d tool calls in your last step ran; %d were "
+                              "skipped. Ask for the ones you still need in your next step, a few at a time.]"
+                              % (MAX_TOOL_CALLS_PER_STEP, MAX_TOOL_CALLS_PER_STEP + skipped, skipped)})
                 self.save()
             else:
                 self.add({"role": "assistant", "content": "", "model": self.chat["model"],
@@ -694,9 +714,10 @@ class Run:
         overhead = (len(note) + len(json.dumps(specs))) // context_budget.CHARS_PER_TOKEN if (note or specs) else 0
         context_tokens = srv.model_info(model).get("context_length")
         budget_name = srv.load_config().get("contextBudget")
+        self.mark_stale_reads()
         for attempt in range(2):
             with self.lock:
-                history = [m for m in copy.deepcopy(self.chat["messages"]) if not m.get("_live")]
+                history = lighten([m for m in copy.deepcopy(self.chat["messages"]) if not m.get("_live")])
                 compaction = copy.deepcopy(self.chat.get("compaction"))
             msgs, info = context_budget.build(history, context_tokens, budget_name, overhead, compaction)
             if not info["needsCompaction"] or attempt or self.compaction_failed:
@@ -716,6 +737,33 @@ class Run:
             msgs.append({"role": "system", "content": WRAP_UP_NOTE})
         self.publish(dict(info, type="context"))
         return body, info
+
+    def mark_stale_reads(self):
+        """Mark file reads that a later read or change of the same file replaced, once enough have piled up
+        (STALE_READ_BATCH): lighten() then sends a one-line note instead of their old content. The mark is saved, so
+        the request stays the same from then on and Ollama's cache of it keeps working."""
+        with self.lock:
+            msgs = self.chat["messages"]
+            later, stale = set(), []
+            for m in reversed(msgs):
+                if m.get("role") != "tool" or m.get("_running"):
+                    continue
+                name, path = m.get("tool_name"), _norm_path(m.get("target") or m.get("display"))
+                if not path:
+                    continue
+                if name == "read_file":
+                    if path in later and not m.get("stale") and not m.get("isError"):
+                        stale.append(m)
+                    later.add(path)
+                elif name in FILE_CHANGES:
+                    later.add(path)
+            size = sum(len(str(m.get("content") or "")) for m in stale) // context_budget.CHARS_PER_TOKEN
+            if size < STALE_READ_BATCH:
+                return
+            for m in stale:
+                m["stale"] = True
+        self.srv.diag("stale_reads", model=self.chat.get("model"), reads=len(stale), tokens=size)
+        self.save()
 
     # ------------------------------------------------------------ compaction (see context_budget.py)
     def compact(self, model, history, compaction, context_tokens, budget_name, overhead, keep_budget=None):
@@ -874,7 +922,9 @@ class Run:
         self.srv.diag("step", model=model, subtask=self.parent is not None, plan=self.plan, step=self.steps,
                       promptTokens=int(final.get("prompt_eval_count") or 0), outputTokens=int(final.get("eval_count") or 0),
                       cachedTokens=int(final.get("prompt_eval_cached_count") or 0), thinkingTokens=thinking // context_budget.CHARS_PER_TOKEN,
-                      evalMs=int((final.get("eval_duration") or 0) / 1e6), loadMs=int((final.get("load_duration") or 0) / 1e6),
+                      evalMs=int((final.get("eval_duration") or 0) / 1e6) or (  # Ollama Cloud sends no timings: estimate
+                          int((done - self.first_token) * 1000) if self.first_token else 0),
+                      loadMs=int((final.get("load_duration") or 0) / 1e6),
                       promptEvalMs=int((final.get("prompt_eval_duration") or 0) / 1e6), requestMs=int((done - sent_at) * 1000),
                       ttftMs=int((self.first_token - sent_at) * 1000) if self.first_token else 0, toolCalls=len(tool_calls or []),
                       contextWindow=int(info.get("contextTokens") or 0), budget=info.get("budget"), retries=retries,
@@ -1245,6 +1295,35 @@ class Run:
         srv.refresh_running(child_id)  # its next tool call follows the new mode
         return '"%s" is now in %s mode.' % (title, {"manual": "Manual approve", "auto": "Auto edits", "bypass": "Bypass permissions"}[mode])
 
+    def read_subtask(self, idx, args):
+        """The parent reads the latest part of one of its subtasks' chats (its live copy while it runs)."""
+        srv = self.srv
+        if not capabilities.policy(srv.saved_tool_config(self.chat_id))["subtasks"]:
+            raise srv.ToolError("Subtasks are off for this session.")
+        child_id, title = self.find_subtask(args.get("subtask"))
+        try:
+            last = max(1, min(READ_SUBTASK_MAX, int(args.get("last") or READ_SUBTASK_MESSAGES)))
+        except (TypeError, ValueError):
+            last = READ_SUBTASK_MESSAGES
+        run = self.engine.active(child_id)
+        if run is not None:
+            with run.lock:
+                msgs = [m for m in copy.deepcopy(run.chat["messages"]) if not m.get("_live")]
+                untrusted = bool(run.chat.get("untrusted"))
+        else:
+            chat = srv.load_chat(child_id)
+            msgs, untrusted = chat.get("messages") or [], bool(chat.get("untrusted"))
+        shown = [m for m in msgs if m.get("role") != "system"]
+        part = shown[-last:]
+        text = context_budget.transcript(part, tool_chars=800, message_chars=3_000)
+        if len(text) > READ_SUBTASK_CHARS:
+            text = "[... earlier part cut]\n" + text[-READ_SUBTASK_CHARS:]
+        self.update(idx, display="%s (last %d)" % (title, len(part)), subtaskId=child_id)
+        if untrusted:  # what it read can carry untrusted content into this chat
+            self.absorb_untrusted(child_id)
+        state = "still running" if run is not None else "finished"
+        return 'Subtask "%s" (id %s, %s): the last %d of its %d messages.\n\n%s' % (title, child_id, state, len(part), len(shown), text or "(no messages yet)")
+
     def rename_subtask(self, idx, args):
         """The parent renames one of its subtasks (no approval: it changes only the chat's name)."""
         srv = self.srv
@@ -1450,6 +1529,8 @@ class Run:
                 out = self.set_subtask_mode(idx, args)
             elif name == "rename_subtask":
                 out = self.rename_subtask(idx, args)
+            elif name == "read_subtask":
+                out = self.read_subtask(idx, args)
             elif name == "delete_subtask":
                 out = self.delete_subtask(idx, args)
             elif name == "wait_subtasks":
@@ -1542,6 +1623,48 @@ class Run:
             self.chat["untrusted"] = flag
             self.publish({"type": "untrusted", "untrusted": flag})
         return out
+
+
+FILE_CHANGES = {"write_file", "edit_file", "copy_path", "move_path", "delete_path", "restore_path"}
+STUBBED_ARGS = {"write_file": ("content",), "edit_file": ("old_text", "new_text")}
+
+
+def _norm_path(p):
+    p = str(p or "").strip().strip('"')
+    if " → " in p:  # copy/move: where the file is now
+        p = p.split(" → ")[-1]
+    return os.path.normcase(os.path.normpath(p)) if p else ""
+
+
+def lighten(history):
+    """The history as sent to the model (the chat itself keeps everything):
+    - write/edit calls older than the newest KEEP_WRITES tool steps carry a short note instead of the file text,
+      which is in the file (and the model can read it again);
+    - file reads marked stale (Run.mark_stale_reads) carry a note instead of their old content.
+    A message changes only once, as it ages, so the start of the request stays the same for Ollama's cache."""
+    steps = [i for i, m in enumerate(history) if m.get("role") == "assistant" and m.get("tool_calls")]
+    old = set(steps[:-KEEP_WRITES]) if len(steps) > KEEP_WRITES else set()
+    for i in old:
+        m = history[i]
+        calls = []
+        for call in m["tool_calls"]:
+            fn = (call or {}).get("function") or {}
+            args = fn.get("arguments")
+            keys = STUBBED_ARGS.get(fn.get("name"), ())
+            if isinstance(args, dict) and any(len(str(args.get(k) or "")) > STUB_ARG_CHARS for k in keys):
+                args = dict(args)
+                for k in keys:
+                    v = str(args.get(k) or "")
+                    if len(v) > STUB_ARG_CHARS:
+                        args[k] = "[%d characters, sent earlier; read the file to see its current text]" % len(v)
+                call = dict(call, function=dict(fn, arguments=args))
+            calls.append(call)
+        history[i] = dict(m, tool_calls=calls)
+    for i, m in enumerate(history):
+        if m.get("role") == "tool" and m.get("stale"):
+            history[i] = dict(m, content="[An older read of %s, left out: the file was read or changed again later in this chat.]"
+                              % (m.get("display") or "this file"))
+    return history
 
 
 def parse_call(call):

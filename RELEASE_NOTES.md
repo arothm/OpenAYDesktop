@@ -1,3 +1,27 @@
+# Open AY Desktop 1.17.1
+
+Fixes from the first diagnostics report, and three requests.
+
+## Fewer tokens (from the diagnostics report)
+- **At most 25 tool calls per step.** One subtask asked for 3,481 tool calls in a single response, a runaway loop that used about a fifth of an hour's tokens. Now the first 25 run and the model is told to ask for the rest in its next step.
+- **Lighter history.** Requests no longer resend the full text of older write and edit calls (the file has it), or older reads of a file that was read or changed again. Together these were most of every request. The chat itself keeps everything, and Ollama's cache keeps working.
+- **Large context budget (200k)** in Settings > Usage & limits, for models with 1-million-token windows: long replies are summarized far sooner, so requests stay smaller. Full stays the default.
+- **Big diffs come back as a summary** per file; the model asks for the files it needs.
+- **Diagnostics** now estimate tokens per second (Ollama Cloud sends no timings), and record capped steps and left-out reads.
+
+## New
+- **`read_subtask`:** the main chat can read the latest messages of a subtask's chat, while it runs or after.
+- **Skills from GitHub:** Settings > Skills > **From GitHub**: paste a public repository's link, or a skill folder's link in a repository with several; **Update from GitHub** downloads it again.
+
+## Removed
+- The **Web content** badge in the header, and the **Web search** switch in project settings (a project now sets only the mode).
+
+## Verification
+- 232 automated tests (16 new).
+- The packaged-app smoke test.
+
+---
+
 # Open AY Desktop 1.17.0
 
 ## New: Settings > Diagnostics

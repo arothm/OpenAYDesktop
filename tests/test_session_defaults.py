@@ -52,7 +52,7 @@ class SessionDefaultsTests(RunTestCase):
         project = projects.save_project(server.data_root(), {"name": "P", "capabilities": {"mode": "auto", "webSearch": False}},
                                         capabilities.clean_folders, capabilities.clean_capabilities, lambda ids: ids)
         c = server.create_chat({"model": "m1", "projectId": project["id"]})
-        self.assertEqual({"mode": "auto", "webSearch": False}, c["capabilities"])
+        self.assertEqual({"mode": "auto", "webSearch": True}, c["capabilities"])  # the project sets the mode; web search follows the defaults
 
     def test_subtasks_still_get_at_most_the_parents_permissions(self):
         self.use_defaults({"capabilities": {"webSearch": True, "mode": "auto"}})

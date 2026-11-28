@@ -217,7 +217,7 @@ function setRunStatus(status) {
 // The working line above the message box: what the reply is doing now, and for how long
 const TOOL_DOING = { read_file: "Reading", list_directory: "Looking in", search_files: "Searching files", write_file: "Writing", edit_file: "Editing",
   create_folder: "Creating a folder", copy_path: "Copying", move_path: "Moving", delete_path: "Moving to the trash", restore_path: "Restoring",
-  web_search: "Searching the web", web_fetch: "Reading", run_command: "Running", start_subtask: "Running subtask", message_subtask: "Messaging a subtask", set_subtask_mode: "Changing a subtask's mode", rename_subtask: "Renaming a subtask", delete_subtask: "Deleting a subtask",
+  web_search: "Searching the web", web_fetch: "Reading", run_command: "Running", start_subtask: "Running subtask", message_subtask: "Messaging a subtask", set_subtask_mode: "Changing a subtask's mode", rename_subtask: "Renaming a subtask", read_subtask: "Reading a subtask", delete_subtask: "Deleting a subtask",
   wait_subtasks: "Waiting for subtasks", message_parent: "Messaging the parent chat", read_skill_file: "Reading skill file", read_memory: "Reading memory",
   save_memory: "Saving to memory", set_session_model: "Switching model", git_commit: "Committing", git_push: "Pushing", git_merge: "Merging", gh_pr_create: "Opening a pull request" };
 const baseName = (p) => String(p || "").split(/[\\/]/).filter(Boolean).pop() || String(p || "");
@@ -338,8 +338,8 @@ async function deleteChat(id) {
 }
 
 // Rendering
-const TOOL_LABEL = { list_directory: "Listed folder", read_file: "Read file", search_files: "Searched files", write_file: "Wrote file", edit_file: "Edited file", create_folder: "Created folder", copy_path: "Copied item", move_path: "Moved/renamed item", delete_path: "Moved to trash", restore_path: "Restored item", set_session_model: "Changed model", web_search: "Searched the web", web_fetch: "Read web page", start_subtask: "Subtask", message_subtask: "Messaged subtask", set_subtask_mode: "Changed subtask mode", rename_subtask: "Renamed subtask", delete_subtask: "Deleted subtask", wait_subtasks: "Waited for subtasks", message_parent: "Messaged parent chat", read_skill_file: "Read skill file", git_status: "Git status", git_diff: "Git diff", git_log: "Git log", git_show: "Git show", git_branches: "Git branches", git_commit: "Git commit", git_push: "Git push", gh_pr_list: "Pull requests", gh_pr_create: "Opened pull request", run_command: "Ran command" };
-const TOOL_ICON = { list_directory: "folder", read_file: "file", search_files: "search", write_file: "edit", edit_file: "edit", create_folder: "folder", copy_path: "copy", move_path: "file", delete_path: "trash", restore_path: "restore", set_session_model: "model", web_search: "globe", web_fetch: "globe", start_subtask: "subtask", message_subtask: "subtask", set_subtask_mode: "shield", rename_subtask: "edit", delete_subtask: "trash", wait_subtasks: "subtask", message_parent: "subtask", read_skill_file: "skills", run_command: "terminal" };
+const TOOL_LABEL = { list_directory: "Listed folder", read_file: "Read file", search_files: "Searched files", write_file: "Wrote file", edit_file: "Edited file", create_folder: "Created folder", copy_path: "Copied item", move_path: "Moved/renamed item", delete_path: "Moved to trash", restore_path: "Restored item", set_session_model: "Changed model", web_search: "Searched the web", web_fetch: "Read web page", start_subtask: "Subtask", message_subtask: "Messaged subtask", set_subtask_mode: "Changed subtask mode", rename_subtask: "Renamed subtask", read_subtask: "Read subtask", delete_subtask: "Deleted subtask", wait_subtasks: "Waited for subtasks", message_parent: "Messaged parent chat", read_skill_file: "Read skill file", git_status: "Git status", git_diff: "Git diff", git_log: "Git log", git_show: "Git show", git_branches: "Git branches", git_commit: "Git commit", git_push: "Git push", gh_pr_list: "Pull requests", gh_pr_create: "Opened pull request", run_command: "Ran command" };
+const TOOL_ICON = { list_directory: "folder", read_file: "file", search_files: "search", write_file: "edit", edit_file: "edit", create_folder: "folder", copy_path: "copy", move_path: "file", delete_path: "trash", restore_path: "restore", set_session_model: "model", web_search: "globe", web_fetch: "globe", start_subtask: "subtask", message_subtask: "subtask", set_subtask_mode: "shield", rename_subtask: "edit", read_subtask: "eye", delete_subtask: "trash", wait_subtasks: "subtask", message_parent: "subtask", read_skill_file: "skills", run_command: "terminal" };
 const toolIcon = (name) => TOOL_ICON[name] || (/^(git|gh)_/.test(name || "") ? "git" : "settings");
 // Messages added since the chat was opened slide in; re-rendering an existing message never animates it again.
 const shown = { chatId: null, count: 0 };
@@ -602,7 +602,8 @@ function decideActionApproval(approved) {
   const pending = state.actionApproval; if (!pending || pending.decided) return; pending.decided = true; state.actionApproval = null; $("#actionApproveBack").classList.remove("open");
   answerApproval(pending, approved);
 }
-function updateUntrustedBadge() { $("#untrustedBadge").hidden = !state.chat?.untrusted; }
+// Reading web content no longer shows a header badge (permission modes decide what asks); Session settings still lists it
+function updateUntrustedBadge() {}
 function answerApproval(pending, approved) {
   api("/api/runs/approve", { method: "POST", body: JSON.stringify({ chatId: pending.chatId, approvalId: pending.id, approve: Boolean(approved) }) }).catch((e) => toast(e.message));
 }
@@ -961,8 +962,8 @@ function renderSkillPackage(s) {
   const box = $("#skillPkg"); box.hidden = !s.folder; if (!s.folder) { box.innerHTML = ""; return; }
   const files = s.files || [];
   box.innerHTML = `<div class="pkg-row">${ic("folder")}<div class="pkg-text"><b>Skill folder</b> with ${files.length} other file${files.length === 1 ? "" : "s"}. The model reads them when the instructions call for them; scripts run only with Run commands.
-      <div class="help">${s.source ? `Imported from <span class="mono">${esc(s.source)}</span>. Edits you make here are replaced by Update from folder.` : "Imported from a .skill or .zip file. Import it again to update it."}</div></div>
-      ${s.source ? `<button class="btn sm" id="skillUpdate" type="button">${ic("redo", "sm")}Update from folder</button>` : ""}</div>
+      <div class="help">${s.source ? `Imported from <span class="mono">${esc(s.source)}</span>. Edits you make here are replaced by Update.` : "Imported from a .skill or .zip file. Import it again to update it."}</div></div>
+      ${s.source ? `<button class="btn sm" id="skillUpdate" type="button">${ic("redo", "sm")}${/^https?:\/\/(www\.)?github\.com\//i.test(s.source) ? "Update from GitHub" : "Update from folder"}</button>` : ""}</div>
     ${files.length ? `<details class="pkg-files"><summary>Show files</summary><div class="mono">${files.map((f) => `<div><span>${esc(f.path)}</span><span>${humanBytes(f.size)}</span></div>`).join("")}</div></details>` : ""}`;
 }
 async function importSkillPackage(body, label) {
@@ -1000,14 +1001,25 @@ function importSkill(file) {
 $("#skillsList").addEventListener("click", (e) => { const b = e.target.closest("[data-skill-id]"); if (b) editSkill(b.dataset.skillId); });
 $("#skillNew").addEventListener("click", () => editSkill(null)); $("#skillSave").addEventListener("click", saveSkill); $("#skillDelete").addEventListener("click", deleteSkill);
 $("#skillImport").addEventListener("click", () => $("#skillFile").click()); $("#skillImportFolder").addEventListener("click", importSkillFolder);
+// From GitHub: a link to a public repository, or to a skill's folder in one (skills.import_github)
+$("#skillImportGithub").addEventListener("click", () => { const box = $("#ghImport"); box.hidden = !box.hidden; if (!box.hidden) $("#ghUrl").focus(); });
+$("#ghCancel").addEventListener("click", () => { $("#ghImport").hidden = true; $("#ghUrl").value = ""; });
+async function importFromGithub() {
+  const url = $("#ghUrl").value.trim(); if (!url) { $("#ghUrl").focus(); return; }
+  const b = $("#ghGo"); b.disabled = true; b.textContent = "Downloading…";
+  try { await importSkillPackage({ github: url }, "the skill from GitHub"); $("#ghImport").hidden = true; $("#ghUrl").value = ""; }
+  catch (e) { toast(e.message); }
+  finally { b.disabled = false; b.textContent = "Import"; }
+}
+$("#ghGo").addEventListener("click", importFromGithub);
+$("#ghUrl").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); importFromGithub(); } });
 $("#skillPkg").addEventListener("click", async (e) => {
   if (!e.target.closest("#skillUpdate") || !skillsUi.current) return;
-  try { const s = await api("/api/skills/update", { method: "POST", body: JSON.stringify({ id: skillsUi.current }) }); await loadSkills(); await editSkill(s.id); toast("Updated from the folder"); }
+  try { const s = await api("/api/skills/update", { method: "POST", body: JSON.stringify({ id: skillsUi.current }) }); await loadSkills(); await editSkill(s.id); toast("Updated"); }
   catch (err) { toast(err.message); }
 }); $("#skillBody").addEventListener("input", updateSkillCount);
 $("#skillFile").addEventListener("change", (e) => { if (e.target.files[0]) importSkill(e.target.files[0]); e.target.value = ""; });
 $("#trustBtn").addEventListener("click", trustChat);
-$("#untrustedBadge").addEventListener("click", openSession);
 
 // Folder access
 function chatFolders() { return state.chat ? (state.chat.folders ||= []) : state.draftFolders; }

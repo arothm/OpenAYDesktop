@@ -11,8 +11,8 @@ Two kinds live in data/skills:
 
 * A skill folder (the open Agent Skills format) is a folder <id>/ with a SKILL.md in the same format plus
   any other files: reference documents, scripts, templates. It is imported from a folder or a .skill/.zip
-  file and copied into data/skills, so the original can move or change without breaking chats. When it came
-  from a folder, that folder is remembered so "Update from folder" can copy it again.
+  file or a GitHub link, and copied into data/skills, so the original can move or change without breaking chats.
+  When it came from a folder or GitHub, that is remembered so "Update" can copy it again.
 
 A skill's instructions are added to the chat's system instructions. A skill folder's other files are read
 on demand with the read_skill_file tool, and its scripts run only through run_command, which keeps its
@@ -26,6 +26,8 @@ import re
 import shutil
 import stat
 import time
+import urllib.error
+import urllib.request
 import zipfile
 
 SKILL_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -41,6 +43,9 @@ SKILL_FILE = "SKILL.md"
 SOURCE_FILE = ".openay-skill.json"  # where a folder skill came from; not part of the skill
 SKIP_DIRS = {".git", ".svn", ".hg", "node_modules", "__pycache__", ".venv", "venv", ".idea", ".vs", ".vscode"}
 PLACEHOLDERS = ("<skill-dir>", "{baseDir}")  # written in SKILL.md files to mean "this skill's folder"
+# https://github.com/owner/repo, .../tree/<branch>/<folder>, .../blob/<branch>/<folder>/SKILL.md
+GITHUB_URL = re.compile(r"^https?://(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?:/(tree|blob)/([^?#]+?))?/?(?:[?#].*)?$")
+MAX_DOWNLOAD = 60_000_000  # a repository archive
 
 
 class SkillError(Exception):
@@ -318,19 +323,33 @@ def import_folder(root, src, replace=False, skill_id=None):
     return _install(root, files, os.path.basename(top), top, replace, skill_id)
 
 
-def import_zip(root, data, filename="skill.zip", replace=False):
-    """Install a skill from a .skill or .zip file (SKILL.md at the top or in one folder)."""
+def import_zip(root, data, filename="skill.zip", replace=False, within=None, source="", skill_id=None, name=None):
+    """Install a skill from a .skill or .zip file (SKILL.md at the top or in one folder).
+    within: for a repository archive, the folder inside the repository to import (under the archive's top folder)."""
     try:
         z = zipfile.ZipFile(io.BytesIO(data))
     except (zipfile.BadZipFile, ValueError):
         raise SkillError("%s isn't a .skill or .zip file." % filename)
     with z:
         infos = [i for i in z.infolist() if not i.is_dir()]
+        top = ""
+        if within is not None:  # GitHub archives hold everything in one "<repo>-<branch>/" folder
+            names = [i.filename.replace("\\", "/") for i in infos]
+            first = names[0].split("/")[0] if names else ""
+            top = first + "/" if first and all(n.startswith(first + "/") for n in names) else ""
+            scope = top + (within.strip("/") + "/" if within.strip("/") else "")
+            infos = [i for i in infos if i.filename.replace("\\", "/").startswith(scope)]
+            if not infos:
+                raise SkillError("There's no folder %s in %s." % (within.strip("/"), filename))
         tops = sorted({i.filename.replace("\\", "/")[:-len(SKILL_FILE)] for i in infos
                        if i.filename.replace("\\", "/").split("/")[-1] == SKILL_FILE}, key=lambda p: (p.count("/"), p))
         if not tops:
             raise SkillError("No SKILL.md found in %s." % filename)
         if len(tops) > 1 and tops[0].count("/") == tops[1].count("/"):
+            if within is not None:
+                found = [t.rstrip("/").split("/")[-1] for t in tops if t.count("/") == tops[0].count("/")]
+                raise SkillError("%s holds %d skills (%s%s). Open the one you want on GitHub and paste the address of its folder."
+                                 % (filename, len(found), ", ".join(found[:8]), ", …" if len(found) > 8 else ""))
             raise SkillError("%s holds several skills. Import them one at a time." % filename)
         prefix = tops[0]
         files, total = {}, 0
@@ -353,8 +372,60 @@ def import_zip(root, data, filename="skill.zip", replace=False):
             if len(content) > info.file_size or len(content) > MAX_PACKAGE_BYTES:
                 raise SkillError("%s is damaged." % filename)
             files[rel] = content
-    base = prefix.rstrip("/").split("/")[-1] if prefix else re.sub(r"\.(skill|zip)$", "", os.path.basename(filename), flags=re.I)
-    return _install(root, files, base, "", replace)
+    base = (name if prefix == top and name else prefix.rstrip("/").split("/")[-1] if prefix
+            else re.sub(r"\.(skill|zip)$", "", os.path.basename(filename), flags=re.I))
+    return _install(root, files, base, source, replace, skill_id)
+
+
+class _NotFound(Exception):
+    pass
+
+
+def _download(url):
+    """GET a public GitHub archive (following redirects); _NotFound for a 404."""
+    req = urllib.request.Request(url, headers={"User-Agent": "OpenAYDesktop"})
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            data = r.read(MAX_DOWNLOAD + 1)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise _NotFound(url)
+        raise SkillError("GitHub answered %d %s." % (e.code, e.reason))
+    except (urllib.error.URLError, OSError) as e:
+        raise SkillError("Couldn't reach GitHub: %s" % getattr(e, "reason", e))
+    if len(data) > MAX_DOWNLOAD:
+        raise SkillError("That repository is too big to download (more than %d MB)." % (MAX_DOWNLOAD // 1_000_000))
+    return data
+
+
+def parse_github(url):
+    """(owner, repo, parts after tree/ or blob/) from a GitHub link; parts start with the branch, which may hold "/"."""
+    m = GITHUB_URL.match(str(url or "").strip())
+    if not m:
+        raise SkillError("Paste a GitHub link, like https://github.com/owner/repo or https://github.com/owner/repo/tree/main/skills/name.")
+    owner, repo, kind, rest = m.groups()
+    parts = [p for p in (rest or "").split("/") if p]
+    if kind == "blob" and parts and parts[-1] == SKILL_FILE:
+        parts = parts[:-1]
+    if any(p in (".", "..") for p in parts):
+        raise SkillError("That GitHub link isn't valid.")
+    return owner, repo, parts
+
+
+def import_github(root, url, replace=False, skill_id=None, download=None):
+    """Install a skill from a public GitHub repository: the whole repository (one skill) or a folder in it."""
+    owner, repo, parts = parse_github(url)
+    download = download or _download
+    # A branch name can contain "/": try the shortest split first (main/skills/x -> branch "main", folder "skills/x").
+    tries = [("HEAD", [])] if not parts else [("/".join(parts[:n]), parts[n:]) for n in range(1, min(len(parts), 4) + 1)]
+    for ref, path in tries:
+        try:
+            data = download("https://github.com/%s/%s/archive/%s.zip" % (owner, repo, ref))
+        except _NotFound:
+            continue
+        return import_zip(root, data, "%s/%s" % (owner, repo), replace, within="/".join(path), source=str(url).strip(),
+                          skill_id=skill_id, name=repo)
+    raise SkillError("GitHub has no public repository or branch at that address. Private repositories can't be imported.")
 
 
 def _install(root, files, folder_name, source, replace, skill_id=None):
@@ -399,7 +470,9 @@ def _install(root, files, folder_name, source, replace, skill_id=None):
 def update_from_source(root, skill_id):
     src = _source(root, skill_id).get("source") if is_folder(root, skill_id) else None
     if not src:
-        raise SkillError("This skill wasn't imported from a folder. Import its .skill file again instead.")
+        raise SkillError("This skill wasn't imported from a folder or GitHub. Import its .skill file again instead.")
+    if GITHUB_URL.match(src):
+        return import_github(root, src, replace=True, skill_id=skill_id)
     if not os.path.isdir(src):
         raise SkillError("The folder it came from is gone: %s" % src)
     return import_folder(root, src, replace=True, skill_id=skill_id)

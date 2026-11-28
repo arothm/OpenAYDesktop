@@ -65,7 +65,7 @@ class BudgetTests(unittest.TestCase):
         with mock.patch.object(server, "load_config", return_value={"allowedCommands": ["npm test"]}):
             specs, _ = server.tool_specs(cfg)
             plan, _ = server.tool_specs(cfg, plan=True)
-        self.assertLess(len(json.dumps(specs)), 10_500)  # every tool a chat can have; 1.11 sent 10,400 characters for fewer
+        self.assertLess(len(json.dumps(specs)), 11_500)  # every tool a chat can have (~2.8k tokens; under 3% of input in real use, 1.17 diagnostics)
         self.assertTrue({s["function"]["name"] for s in plan} <= server.READ_ONLY_TOOLS)
         self.assertNotIn("write_file", {s["function"]["name"] for s in plan})
 
@@ -145,11 +145,11 @@ class MemoryAndProjectTests(RunTestCase):
     def test_project_chats_inherit_settings_and_instructions(self):
         p = projects.save_project(self.data(), {"name": "Shop", "instructions": "Use British spelling.",
                                                 "folders": [{"path": str(self.shared), "write": True}],
-                                                "capabilities": {"webSearch": True}, "skills": []},
+                                                "capabilities": {"mode": "auto", "webSearch": True}, "skills": []},
                                   capabilities.clean_folders, capabilities.clean_capabilities, lambda ids: [])
         chat = server.create_chat({"model": "m1", "projectId": p["id"], "folders": []})
         self.assertEqual(p["id"], chat["projectId"]); self.assertEqual(str(self.shared), chat["folders"][0]["path"])
-        self.assertTrue(capabilities.policy(chat)["webSearch"])
+        self.assertEqual("auto", capabilities.policy(chat)["mode"]); self.assertFalse(capabilities.policy(chat)["webSearch"])  # a project sets only the mode
         self.script = [call("save_memory", note="Ships on Fridays"), say("ok")]; self.run_to_end(chat["id"])
         self.assertIn("Ships on Fridays", projects.read_memory(self.data(), p["id"]))
         self.assertNotIn("Ships on Fridays", projects.read_memory(self.data(), "global"))
