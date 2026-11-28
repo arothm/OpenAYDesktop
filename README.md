@@ -3,7 +3,7 @@
 A lightweight desktop chat app for **Ollama Cloud**. It runs as an **Electron** desktop app, with a local Python 3 server (standard library only) doing the work. It can also still open in an Edge or Chrome app window without Electron. There is no frontend framework or build step for the interface itself.
 
 - **Application:** Open AY Desktop
-- **Version:** 1.16.1
+- **Version:** 1.17.0
 - **Repository:** https://github.com/arothm/OpenAYDesktop
 - **Ollama connection:** direct to https://ollama.com, using an Ollama API key
 
@@ -218,6 +218,18 @@ If the balance can't be read, for example because Ollama changes its API, replie
 ## Activity
 **Settings > Activity** lists every running reply across all chats, subtasks included. For each one it shows the status (running, waiting for you, wrapping up, paused, or a subtask asking its parent), model, time, steps and tokens, with **Open** and **Stop** buttons. Below that are the most recently finished replies and how they ended (done, stopped, or error).
 
+## Diagnostics
+**Settings > Diagnostics** shows how the app behaves on your PC, from anonymous measurements it keeps in `data/diagnostics/` (one file per day, kept 90 days):
+- **Replies:** steps per reply, tokens per reply, the share of input served from Ollama's cache, typical reply time and wait for the first token, and outcomes (finished, stopped, step limit, errors), retries and messages sent while a reply ran.
+- **Where input tokens go:** instructions, tool definitions, your messages, the model's earlier replies, tool results and summaries, estimated for every request.
+- **Models:** steps, input, output and thinking tokens, tokens per second, first-token time and errors.
+- **Tools:** calls, median and slowest times, how many tokens their results added, errors and denials.
+- **Approvals** (asked, allowed, typical wait), **summaries** of older messages, and **window** redraw times.
+
+**Export report** saves it all as a JSON file you can review or share. **Clear** deletes it, and **Record diagnostics** turns recording off.
+
+What's recorded is numbers, true/false and short names from fixed sets (tool and model names, modes, outcomes, error types). Never stored: message text, file names or paths, folder names, web addresses, search queries, command text, chat names or IDs, or keys; `diagnostics.py` drops any other text, whatever is passed to it. Nothing is sent anywhere.
+
 ## Replies run on the server
 Each reply runs on the app's local server (`runs.py`): the model answers, calls tools, gets their results, and continues, up to the step limit (Settings > Usage & limits, 100 by default). The window shows it live through an event stream. As a result:
 - **Switching chats or closing the window doesn't stop a reply.** Reopen the chat to see where it got to. The background server keeps running while any reply is in progress.
@@ -268,7 +280,7 @@ The installed app checks GitHub Releases at start and every 6 hours (Settings > 
 - **Sidebar:** New chat, search, the project switcher, your sessions (subtasks under their parent), and at the bottom the Ollama balance and Settings.
 - **Top:** the chat's name, with a menu (rename, session settings, terminal and preview, delete), and **Export** on the right.
 - **Message box:** attach (paperclip), mode (**Act** or **Plan**), dictation (microphone) and send. Above it, the working line while a reply runs; under it, folders, the permission mode, the context gauge, **Compact**, tokens and the model.
-- **Settings** has one page per tab: Connection, Session defaults, Usage & limits, Memory, Commands, Skills, Projects, Scheduled tasks, Activity, Trash, and App & updates.
+- **Settings** has one page per tab: Connection, Session defaults, Usage & limits, Memory, Commands, Skills, Projects, Scheduled tasks, Activity, Diagnostics, Trash, and App & updates.
 
 ## Features
 Streaming replies, Markdown and code highlighting, collapsible thinking/reasoning panels, image and document attachments, stop, regenerate, edit-and-resend, full-text search, projects, memory, plan mode, undo, scheduled tasks, a terminal and preview panel, export, and server-approved folder tools.
@@ -305,6 +317,7 @@ On the first request for each asset, the server downloads its fixed HTTPS URL in
 - `documents.py` — text from PDF, Word, Excel, PowerPoint and text files.
 - `scheduler.py` — scheduled tasks.
 - `worktrees.py` — isolated subtasks in Git worktrees.
+- `diagnostics.py` — local anonymous diagnostics: the event recorder (numbers and fixed names only) and the summary for Settings > Diagnostics.
 - `capabilities.py` — session permission policy, file management, trash and versions.
 - `session_actions.py` — session renaming.
 - `web.py` — web search and page reading, with untrusted-content markers.

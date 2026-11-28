@@ -290,3 +290,68 @@ function insertText(text) {
 if (window.openay?.onQuickEntry) window.openay.onQuickEntry(() => { $(".back.open")?.classList.remove("open"); newChat(); $("#input").focus(); });
 
 loadProjects();
+
+// ---------------------------------------------------------------- Settings > Diagnostics (diagnostics.py)
+const fmtN = (n) => (n || 0).toLocaleString();
+async function showDiagnostics() {
+  $("#diagOn").checked = state.config.diagnostics !== false;
+  const days = $("#diagDays").value; const body = $("#diagBody"); body.innerHTML = '<div class="help">Loading…</div>';
+  let d; try { d = await api("/api/diagnostics?days=" + days); } catch (e) { body.innerHTML = `<div class="menu-note">${esc(e.message)}</div>`; return; }
+  if (!d.events) { body.innerHTML = '<div class="empty-note">Nothing recorded yet. Diagnostics start with the next reply.</div>'; return; }
+  const t = d.totals;
+  const stat = (v, l, title) => `<div class="stat"${title ? ` title="${esc(title)}"` : ""}><div class="v">${v}</div><div class="l">${l}</div></div>`;
+  const secs = (s) => s >= 60 ? `${Math.floor(s / 60)}m ${Math.round(s % 60)}s` : `${s}s`;
+  const outcomes = Object.entries(t.outcomes || {}).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${esc(DIAG_OUTCOMES[k] || k)} ${fmtN(v)}`).join(" · ");
+  // Where input tokens go: one bar per part, longest first (single hue; labels carry identity)
+  const parts = Object.entries(d.requestParts || {}).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+  const partTotal = parts.reduce((s, [, v]) => s + v, 0) || 1;
+  const partRows = parts.map(([k, v]) => `<div class="hbar-row"><span class="hbar-l">${esc(DIAG_PARTS[k] || k)}</span><span class="hbar"><i data-pct="${(v / partTotal * 100).toFixed(1)}"></i></span><span class="hbar-v">${kTokens(v)} · ${Math.round(v / partTotal * 100)}%</span></div>`).join("");
+  // Tokens per day: single series, hover for the value
+  // one slot per day of the period, ending today, so quiet days show as gaps
+  const iso = (dt) => `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+  const daily = [...Array(Number(days))].map((_, i) => { const dt = new Date(); dt.setDate(dt.getDate() - (Number(days) - 1 - i)); const k = iso(dt);
+    return [k, d.daily?.[k] || { replies: 0, promptTokens: 0, outputTokens: 0 }]; });
+  const maxDay = Math.max(1, ...daily.map(([, x]) => x.promptTokens + x.outputTokens));
+  const dayBars = daily.map(([day, x]) => { const v = x.promptTokens + x.outputTokens;
+    return `<span class="vbar" title="${esc(day)}: ${fmtN(v)} tokens, ${x.replies} repl${x.replies === 1 ? "y" : "ies"}"><i data-pct="${v ? Math.max(2, v / maxDay * 100).toFixed(1) : 0}"></i></span>`; }).join("");
+  const table = (head, rows) => rows.length ? `<table class="diag-table"><thead><tr>${head.map((h, i) => `<th${i ? ' class="num"' : ""}>${h}</th>`).join("")}</tr></thead><tbody>${rows.map((r) => `<tr>${r.map((c, i) => `<td${i ? ' class="num"' : ""}>${c}</td>`).join("")}</tr>`).join("")}</tbody></table>` : '<div class="help">None yet.</div>';
+  const models = Object.entries(d.models || {}).sort((a, b) => b[1].steps - a[1].steps).map(([m, x]) => [esc(m), fmtN(x.replies), fmtN(x.steps), kTokens(x.promptTokens), kTokens(x.outputTokens), kTokens(x.thinkingTokens), x.tokensPerSecond || "–", x.firstTokenSecondsMedian ? x.firstTokenSecondsMedian + "s" : "–", fmtN(x.errorReplies)]);
+  const tools = Object.entries(d.tools || {}).sort((a, b) => b[1].resultTokens - a[1].resultTokens).map(([n, x]) => [esc(n), fmtN(x.calls), x.msMedian + " ms", x.msP90 + " ms", kTokens(x.resultTokensAvg), kTokens(x.resultTokens), fmtN(x.errors), fmtN(x.denied)]);
+  const approvals = Object.entries(d.approvals || {}).sort((a, b) => b[1].asked - a[1].asked).map(([n, x]) => [esc(n), fmtN(x.asked), fmtN(x.allowed), fmtN(x.asked - x.allowed), secs(x.waitSecondsMedian)]);
+  const c = d.compaction || {}; const w = d.window || {};
+  const retries = Object.entries(t.retries || {}).map(([k, v]) => `${esc(k)} ×${v}`).join(", ") || "none";
+  const errors = Object.entries(t.errors || {}).map(([k, v]) => `${esc(k)} ×${v}`).join(", ") || "none";
+  body.innerHTML = `<div class="stat-grid inline diag-stats">
+      ${stat(fmtN(t.replies), "Replies" + (t.subtaskReplies ? ` (+${fmtN(t.subtaskReplies)} subtask)` : ""))}
+      ${stat(t.stepsPerReply, "Steps per reply")}${stat(kTokens(t.tokensPerReply), "Tokens per reply")}
+      ${stat(Math.round(t.cachedShare * 100) + "%", "Input from cache", "Cached input is billed at a much lower rate")}
+      ${stat(secs(t.replySecondsMedian), "Typical reply time", `90% of replies finish within ${secs(t.replySecondsP90)}`)}
+      ${stat(t.firstTokenSecondsMedian + "s", "Typical wait for first token")}
+    </div>
+    <div class="help diag-line">Outcomes: ${outcomes || "–"} · Paused at the step limit: ${fmtN(t.stepLimitHits)} · Retries: ${retries} · Messages sent while a reply ran: ${fmtN(t.messagesWhileRunning)} · Errors: ${errors}</div>
+    <div class="card"><div class="card-t">Where input tokens go</div><div class="help">Estimated from the size of each part of every request. Total sent: ${kTokens(t.promptTokens)}, of which ${kTokens(t.cachedTokens)} came from the cache.</div><div class="hbars">${partRows}</div></div>
+    <div class="card"><div class="card-t">Tokens per day</div><div class="vbars" role="img" aria-label="Tokens sent and received per day">${dayBars}</div><div class="vbar-axis"><span>${esc(daily[0]?.[0] || "")}</span><span>max ${kTokens(maxDay)}</span><span>${esc(daily.at(-1)?.[0] || "")}</span></div></div>
+    <div class="card"><div class="card-t">Models</div>${table(["Model", "Replies", "Steps", "Input", "Output", "Thinking", "Tokens/s", "First token", "Errors"], models)}</div>
+    <div class="card"><div class="card-t">Tools</div><div class="help">Sorted by how many tokens their results added to later requests.</div>${table(["Tool", "Calls", "Median", "Slowest 10%", "Result avg", "Result total", "Errors", "Denied"], tools)}</div>
+    <div class="card"><div class="card-t">Approvals</div>${table(["For", "Asked", "Allowed", "Denied", "Typical wait"], approvals)}</div>
+    <div class="card"><div class="card-t">Summaries and the window</div><div class="help">Summaries of older messages: ${fmtN(c.count)} (${fmtN(c.manual)} from Compact, ${fmtN(c.failed)} failed), ${kTokens(c.tokensIn)} summarized into ${kTokens(c.tokensOut)}.<br>Chat redraws: ${fmtN(w.renders)}, ${w.renderMsAvg} ms on average, slowest ${Math.round(w.renderMsMax)} ms; frames that blocked the window for over 50 ms: ${fmtN(w.longFrames)}.</div></div>`;
+  body.querySelectorAll("[data-pct]").forEach((el) => el.style.setProperty("--pct", el.dataset.pct + "%"));  // the page's CSP blocks inline styles
+}
+const DIAG_OUTCOMES = { done: "finished", stopped: "stopped", stepLimit: "step limit", tokenLimit: "token limit", noKey: "no API key", unreachable: "Ollama unreachable", broken: "connection dropped", unexpected: "unexpected error", modelError: "Ollama error" };
+const DIAG_PARTS = { systemTokens: "Instructions (system prompt, skills, memory)", toolSpecTokens: "Tool definitions", assistantTokens: "Model's earlier replies and tool calls",
+  toolResultTokens: "Tool results", userTokens: "Your messages", summaryTokens: "Summary of older messages" };
+$("#diagDays").addEventListener("change", showDiagnostics);
+$("#diagOn").addEventListener("change", async (e) => {
+  try { state.config = await api("/api/config", { method: "POST", body: JSON.stringify({ diagnostics: e.target.checked }) }); toast(e.target.checked ? "Recording diagnostics" : "Diagnostics recording is off"); }
+  catch (err) { toast(err.message); e.target.checked = !e.target.checked; }
+});
+$("#diagClear").addEventListener("click", async () => {
+  if (!confirm("Delete all recorded diagnostics? This can't be undone.")) return;
+  try { const r = await api("/api/diagnostics/clear", { method: "POST", body: "{}" }); toast(`Cleared ${r.removed} day${r.removed === 1 ? "" : "s"} of diagnostics`); showDiagnostics(); } catch (e) { toast(e.message); }
+});
+$("#diagExport").addEventListener("click", async () => {
+  let report; try { report = await api("/api/diagnostics/export?days=" + $("#diagDays").value); } catch (e) { toast(e.message); return; }
+  const text = JSON.stringify(report, null, 1); const name = "open-ay-diagnostics-" + new Date().toISOString().slice(0, 10);
+  if (window.openay?.saveText) { const where = await window.openay.saveText(name, text, "json"); if (where) toast("Saved to " + where); return; }
+  const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([text], { type: "application/json" })); a.download = name + ".json"; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+});

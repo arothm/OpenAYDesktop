@@ -6,7 +6,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("openay", {
   isElectron: true,
   pickFolder: () => ipcRenderer.invoke("pick-folder"),
-  saveText: (name, text) => ipcRenderer.invoke("save-text", String(name), String(text)),
+  saveText: (name, text, ext) => ipcRenderer.invoke("save-text", String(name), String(text), ext === "json" ? "json" : "md"),
   dictate: () => ipcRenderer.invoke("dictate"),
   setQuickEntry: (on) => ipcRenderer.invoke("quick-entry", Boolean(on)),
   setBackground: (opts) => ipcRenderer.invoke("background", { keepInTray: Boolean(opts.keepInTray), startAtLogin: Boolean(opts.startAtLogin) }),

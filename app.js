@@ -415,7 +415,19 @@ const SUGGESTIONS = [
   ["globe", "Research a topic", "Search the web, with sources", "Research this and cite your sources: "],
   ["terminal", "Fix failing tests", "Run tests, edit, run again", "Run the tests in the shared folder, fix what fails, and run them again."],
 ];
-function renderMessages() {
+const uiStats = { renders: 0, renderMs: 0, maxMs: 0, maxMessages: 0, longFrames: 0 };
+function timeRender(fn, count) {
+  const t = performance.now(); fn(); const ms = performance.now() - t;
+  uiStats.renders++; uiStats.renderMs += ms; if (ms > uiStats.maxMs) { uiStats.maxMs = ms; uiStats.maxMessages = count; }
+}
+try { new PerformanceObserver((list) => { uiStats.longFrames += list.getEntries().length; }).observe({ type: "longtask", buffered: false }); } catch { /* not supported */ }
+setInterval(() => {
+  if (!uiStats.renders || state.config?.diagnostics === false) return;
+  const body = JSON.stringify(uiStats); Object.assign(uiStats, { renders: 0, renderMs: 0, maxMs: 0, maxMessages: 0, longFrames: 0 });
+  api("/api/diagnostics/ui", { method: "POST", body }).catch(() => {});
+}, 60000);
+function renderMessages() { timeRender(renderAllMessages, state.chat?.messages?.length || 0); }
+function renderAllMessages() {
   const box = $("#messages"); const msgs = state.chat?.messages || [];
   const id = state.chat?.id || null; if (shown.chatId !== id) { shown.chatId = id; shown.count = msgs.length; shown.times = {}; }
   if (!msgs.filter((m) => m.role !== "system").length) {
@@ -648,7 +660,7 @@ async function addFiles(files) {
 
 // Settings and updates
 const SET_TITLES = { secConn: "Connection", secDefaults: "Session defaults", secLimits: "Usage & limits", secMemory: "Memory", secCmds: "Commands", secSkills: "Skills", secProjects: "Projects",
-  secSchedules: "Scheduled tasks", secActivity: "Activity", secTrash: "Trash", secUpdates: "App & updates" };
+  secSchedules: "Scheduled tasks", secActivity: "Activity", secDiag: "Diagnostics", secTrash: "Trash", secUpdates: "App & updates" };
 const CONFIG_TABS = new Set(["secConn", "secDefaults", "secLimits", "secMemory", "secCmds", "secUpdates"]);  // saved with "Save changes"
 function openSettings(tab, opts) {
   const c = state.config; state.clearKey = false; state.updateUrl = ""; $("#apiKey").value = "";
@@ -711,6 +723,7 @@ function showSettingsSection(id, opts = {}) {
   else if (id === "secSchedules") showSchedules();
   else if (id === "secActivity") { renderActivity.seen = false; renderActivity(); activityTimer = setInterval(renderActivity, 2000); }
   else if (id === "secTrash") renderTrash();
+  else if (id === "secDiag") showDiagnostics();
 }
 document.querySelector(".set-nav").addEventListener("click", (e) => { const b = e.target.closest("[data-sec]"); if (b) showSettingsSection(b.dataset.sec); });
 function populateDefaultModels() {

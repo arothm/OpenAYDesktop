@@ -51,7 +51,7 @@ async function start() {
     const r = await dialog.showOpenDialog(win, { title: "Choose a folder to share with this chat", properties: ["openDirectory"] });
     return r.canceled ? "" : r.filePaths[0];
   });
-  ipcMain.handle("save-text", (_e, name, text) => saveText(name, text));
+  ipcMain.handle("save-text", (_e, name, text, ext) => saveText(name, text, ext));
   ipcMain.handle("dictate", () => dictate());
   ipcMain.handle("quick-entry", (_e, on) => setQuickEntry(Boolean(on)));
   ipcMain.handle("update-check", () => updates.check(true));
@@ -351,10 +351,11 @@ function dictate() {
   });
 }
 
-async function saveText(name, text) {
+async function saveText(name, text, ext) {
   const safe = String(name || "chat").replace(/[\\/:*?"<>|]+/g, " ").trim().slice(0, 120) || "chat";
-  const r = await dialog.showSaveDialog(win, { title: "Export chat", defaultPath: path.join(app.getPath("documents"), safe + ".md"),
-                                               filters: [{ name: "Markdown", extensions: ["md"] }] });
+  const json = ext === "json";  // a diagnostics report; otherwise an exported chat
+  const r = await dialog.showSaveDialog(win, { title: json ? "Export diagnostics" : "Export chat", defaultPath: path.join(app.getPath("documents"), safe + (json ? ".json" : ".md")),
+                                               filters: [json ? { name: "JSON", extensions: ["json"] } : { name: "Markdown", extensions: ["md"] }] });
   if (r.canceled || !r.filePath) return "";
   await fs.promises.writeFile(r.filePath, String(text || ""), "utf8");
   return r.filePath;

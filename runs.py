@@ -314,6 +314,9 @@ class Run:
         self.steps = 0
         self.tokens = 0
         self.outcome = None
+        self.d = {"prompt": 0, "output": 0, "cached": 0, "toolCalls": 0, "retries": 0, "steered": 0}  # for diagnostics
+        self.current_tool = None   # the tool being run, so an approval knows what it was for (diagnostics)
+        self.first_token = None    # when this step's first text, thinking or tool call arrived
         self.pause = None          # {"balance", "minimumUsd"} while waiting for the balance
         self.wrapping_up = False
         self.lock = threading.RLock()
@@ -533,6 +536,7 @@ class Run:
             return True
 
     def wait_approval(self, kind, data):
+        asked_at = time.time()
         a = {"id": secrets.token_hex(8), "kind": kind, "data": data, "event": threading.Event(), "result": False}
         with self.lock:
             self.approval = a
@@ -544,6 +548,8 @@ class Run:
             self.publish({"type": "approval_done", "id": a["id"]})
         if not self.cancelled.is_set():
             self.set_status("running")
+        self.srv.diag("approval", what=self.current_tool or kind, approval=kind, allowed=bool(a["result"]) and not self.cancelled.is_set(),
+                      stopped=self.cancelled.is_set(), waitMs=int((time.time() - asked_at) * 1000))
         return a["result"] and not self.cancelled.is_set()
 
     # ------------------------------------------------------------ the loop
@@ -595,6 +601,7 @@ class Run:
                           "error": "Paused after %d steps, the limit for one reply (Settings > Usage & limits). "
                                    "Continue to carry on where it stopped." % limit, "stepLimit": True})
         except Exception as e:  # noqa: BLE001 - never leave a run stuck in "running"
+            srv.diag("error", where="reply", type=type(e).__name__)
             self.add({"role": "assistant", "content": "", "model": self.chat.get("model", ""), "error": "Unexpected error: %s" % e})
         finally:
             with self.lock:
@@ -630,6 +637,8 @@ class Run:
             self.approval = None
             if detach:
                 self.detached = True  # from here on, the stuck thread's writes are ignored
+        if not self.compact_only:
+            self.diag_reply(last)
         channel = self.engine.channel(self.chat_id)
         if detach:
             with self.lock:
@@ -645,6 +654,23 @@ class Run:
             if self.parent is not None:  # a parent waiting for this subtask wakes up
                 with self.parent.news:
                     self.parent.news.notify_all()
+
+    def diag_reply(self, last):
+        """Diagnostics: one line per finished reply (numbers and fixed names only; see diagnostics.py)."""
+        err = str(last.get("error") or "")
+        outcome = ("stepLimit" if last.get("stepLimit") else self.outcome if self.outcome != "error" else
+                   "tokenLimit" if "token limit" in err else "noKey" if "API key" in err else
+                   "unreachable" if "reach Ollama" in err else "broken" if "ended before" in err else
+                   "unexpected" if err.startswith("Unexpected") else "modelError")
+        try:
+            mode = capabilities.policy(self.srv.saved_tool_config(self.chat_id))["mode"]
+        except Exception:  # noqa: BLE001 - the chat may be gone
+            mode = None
+        self.srv.diag("reply", model=self.chat.get("model"), mode=mode, plan=self.plan, subtask=self.parent is not None,
+                      steps=self.steps, ms=int((time.time() - self.started) * 1000), outcome=outcome,
+                      promptTokens=self.d["prompt"], outputTokens=self.d["output"], cachedTokens=self.d["cached"],
+                      toolCalls=self.d["toolCalls"], retries=self.d["retries"], subtasks=len(self.children),
+                      steered=self.d["steered"], wrapUp=self.wrapping_up)
 
     def build_request(self, model):
         """The request for one model step. Its start (instructions, tools, summary, history) stays the same
@@ -709,6 +735,7 @@ class Run:
         window = int(context_tokens or context_budget.DEFAULT_CONTEXT)
         chunk_chars = max(8_000, int(min(window, 200_000) * context_budget.CHARS_PER_TOKEN * 0.6))
         self.publish({"type": "compacting", "active": True})
+        t0, ok = time.time(), False
         try:
             for at in range(0, max(1, len(text)), chunk_chars):
                 if self.cancelled.is_set():
@@ -719,10 +746,14 @@ class Run:
                 self.chat["compaction"] = record
                 self.publish({"type": "compaction", "compaction": copy.deepcopy(record)})
             self.save()
+            ok = True
         except Exception:  # noqa: BLE001 - the request still goes out, with the oldest turns left out
             self.compaction_failed = True
         finally:
             self.publish({"type": "compacting", "active": False})
+            srv.diag("compaction", model=model, manual=keep_budget is not None, ok=ok, ms=int((time.time() - t0) * 1000),
+                     messages=split - start, inTokens=len(text) // context_budget.CHARS_PER_TOKEN,
+                     outTokens=len(summary or "") // context_budget.CHARS_PER_TOKEN if ok else 0)
 
     def manual_compact(self):
         """The user pressed Compact: summarize everything but the latest messages now, so later requests are smaller."""
@@ -773,6 +804,7 @@ class Run:
         attempt = 0
         while True:
             body, info = self.build_request(model)
+            sent_at = time.time(); self.first_token = None
             try:
                 r = srv.upstream("/api/chat", body)
             except urllib.error.HTTPError as e:
@@ -782,13 +814,15 @@ class Run:
                     self.update(idx, notice="This model doesn't support tools, so folder access is off for this reply.")
                     continue
                 if e.code in RETRY_CODES and self.retry_wait(idx, attempt, "Ollama Cloud answered %d (%s)" % (e.code, msg[:120])):
-                    attempt += 1
+                    attempt += 1; self.d["retries"] += 1
+                    srv.diag("retry", model=model, code=e.code, attempt=attempt)
                     continue
                 self.update(idx, error=msg, _live=None, thinking=None, notice=None)
                 return
             except Exception as e:  # noqa: BLE001
                 if not self.cancelled.is_set() and self.retry_wait(idx, attempt, "Couldn't reach Ollama Cloud (%s)" % e):
-                    attempt += 1
+                    attempt += 1; self.d["retries"] += 1
+                    srv.diag("retry", model=model, code="network", attempt=attempt)
                     continue
                 self.update(idx, error="Could not reach Ollama Cloud: %s" % e, _live=None, thinking=None, notice=None)
                 return
@@ -796,7 +830,8 @@ class Run:
             if broken and not self.cancelled.is_set() and not tool_calls:
                 # The connection ended before the reply finished: start this step again from the beginning.
                 if self.retry_wait(idx, attempt, "The connection to Ollama ended before the reply finished", reset=True):
-                    attempt += 1
+                    attempt += 1; self.d["retries"] += 1
+                    srv.diag("retry", model=model, code="broken", attempt=attempt)
                     continue
                 error = "The connection to Ollama ended before the reply finished. Send a message to continue."
             break
@@ -806,6 +841,7 @@ class Run:
         stats = []
         if final:
             stats.append(self.record_usage(final, info))
+            self.diag_step(model, body, info, final, sent_at, tool_calls, idx, attempt)
         if self.cancelled.is_set():
             stats.append("stopped")
         if error:
@@ -818,6 +854,32 @@ class Run:
             if not self.chat["messages"][idx].get("thinking"):
                 fields["thinking"] = None
         self.update(idx, **fields)
+
+    def diag_step(self, model, body, info, final, sent_at, tool_calls, idx, retries):
+        """Diagnostics: one line per model request, with where its input tokens went (estimated from characters)."""
+        parts = {"systemTokens": 0, "summaryTokens": 0, "userTokens": 0, "assistantTokens": 0, "toolResultTokens": 0}
+        for m in body.get("messages") or []:
+            role, text = m.get("role"), str(m.get("content") or "")
+            size = len(text) + (len(json.dumps(m["tool_calls"])) if m.get("tool_calls") else 0)
+            if role == "system":
+                key = "summaryTokens" if text.startswith(context_budget.SUMMARY_PREFIX) else "systemTokens"
+            else:
+                key = {"user": "userTokens", "assistant": "assistantTokens", "tool": "toolResultTokens"}.get(role, "userTokens")
+            parts[key] += size
+        parts = {k: v // context_budget.CHARS_PER_TOKEN for k, v in parts.items()}
+        parts["toolSpecTokens"] = len(json.dumps(body.get("tools") or [])) // context_budget.CHARS_PER_TOKEN if body.get("tools") else 0
+        with self.lock:
+            thinking = len(self.chat["messages"][idx].get("thinking") or "") if idx < len(self.chat["messages"]) else 0
+        done = time.time()
+        self.srv.diag("step", model=model, subtask=self.parent is not None, plan=self.plan, step=self.steps,
+                      promptTokens=int(final.get("prompt_eval_count") or 0), outputTokens=int(final.get("eval_count") or 0),
+                      cachedTokens=int(final.get("prompt_eval_cached_count") or 0), thinkingTokens=thinking // context_budget.CHARS_PER_TOKEN,
+                      evalMs=int((final.get("eval_duration") or 0) / 1e6), loadMs=int((final.get("load_duration") or 0) / 1e6),
+                      promptEvalMs=int((final.get("prompt_eval_duration") or 0) / 1e6), requestMs=int((done - sent_at) * 1000),
+                      ttftMs=int((self.first_token - sent_at) * 1000) if self.first_token else 0, toolCalls=len(tool_calls or []),
+                      contextWindow=int(info.get("contextTokens") or 0), budget=info.get("budget"), retries=retries,
+                      omittedMessages=int(info.get("omittedMessages") or 0), summarizedMessages=int(info.get("summarizedMessages") or 0),
+                      clippedToolResults=int(info.get("clippedToolResults") or 0), wrapUp=self.wrapping_up, **parts)
 
     def read_stream(self, idx, r):
         """Stream one model response into message idx. Returns (tool calls, final chunk, error, broken):
@@ -843,6 +905,8 @@ class Run:
                         break
                     msg = j.get("message") or {}
                     content, thinking = msg.get("content") or "", msg.get("thinking") or ""
+                    if (content or thinking or msg.get("tool_calls")) and self.first_token is None:
+                        self.first_token = time.time()
                     if content or thinking:
                         self.delta(idx, content, thinking)
                     if msg.get("tool_calls"):
@@ -881,6 +945,7 @@ class Run:
             u["requests"] += 1
             if cached: u["cachedTokens"] = u.get("cachedTokens", 0) + cached
             self.tokens += prompt + output
+            self.d["prompt"] += prompt; self.d["output"] += output; self.d["cached"] += cached
             session = dict(u)
         return session, self.srv.record_daily_usage(prompt, output, cached)
 
@@ -1109,6 +1174,7 @@ class Run:
             msgs, self.inbox = self.inbox, []
         for item in msgs:
             if isinstance(item, dict):
+                self.d["steered"] += 1
                 self.add({"role": "user", "content": item["user"], "sentWhileRunning": True})
             else:
                 self.add({"role": "user", "auto": True, "fromParent": True, "content": "[Message from the parent chat]\n" + item})
@@ -1337,6 +1403,8 @@ class Run:
         if name in ("copy_path", "move_path") and args.get("destination"):  # where the file is now (for Preview)
             message.update(display="%s → %s" % (args.get("source") or "", args["destination"]), target=str(args["destination"]))
         idx = self.add(message)
+        started, denied = time.time(), False
+        self.current_tool = name; self.d["toolCalls"] += 1
         undo.set_context(self.chat_id, self.run_id)  # file changes made now are journaled for "Undo this reply"
         gittools.set_cancel(self.cancelled)  # Git calls end as soon as Stop is pressed
         try:
@@ -1434,12 +1502,19 @@ class Run:
             else:
                 self.update(idx, content=out, _running=None)
         except Denied as e:
+            denied = True
             self.update(idx, content=str(e), isError=True, _running=None)
         except (srv.ToolError, web.WebError, gittools.GitError, commands.CommandError, projects.ProjectError, ValueError, OSError) as e:
             self.update(idx, content="Error: %s" % e, isError=True, _running=None)
         finally:
             undo.set_context(None, None)
             gittools.set_cancel(None)
+            self.current_tool = None
+            with self.lock:
+                m = self.chat["messages"][idx] if idx < len(self.chat["messages"]) else {}
+                size, failed = len(str(m.get("content") or "")), bool(m.get("isError"))
+            srv.diag("tool", name=name, ms=int((time.time() - started) * 1000), resultTokens=size // context_budget.CHARS_PER_TOKEN,
+                     error=failed and not denied, denied=denied, plan=self.plan, subtask=self.parent is not None)
 
     def ask(self, idx, data, denied_text):
         """Ask the user to approve a gated action; raises Denied unless they allow it."""

@@ -1,3 +1,22 @@
+# Open AY Desktop 1.17.0
+
+## New: Settings > Diagnostics
+The app now keeps anonymous measurements on your PC, so improvements can be based on how it's really used:
+- **Replies:** steps and tokens per reply, the share of input served from Ollama's cache, reply time, wait for the first token, outcomes, retries.
+- **Where input tokens go:** instructions, tool definitions, your messages, earlier replies, tool results and summaries.
+- **Models:** tokens, thinking, speed, first-token time and errors.
+- **Tools:** calls, times, how many tokens their results added, errors and denials.
+- **Approvals, summaries and window redraw times.**
+
+**Export report** saves it as a JSON file you can review or share; **Clear** deletes it; **Record diagnostics** turns it off. Only numbers and short fixed names are stored (tool and model names, modes, outcomes): never your messages, files, folders, web addresses, commands or chat names. Nothing is sent anywhere. Data is kept 90 days.
+
+## Verification
+- 216 automated tests (6 new), including one that checks a reply's text and file path never reach the diagnostics files.
+- A live check in the window with a fake model: the Diagnostics page, its charts and tables, the export and the on/off switch.
+- The packaged-app smoke test.
+
+---
+
 # Open AY Desktop 1.16.1
 
 ## New

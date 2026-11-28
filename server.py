@@ -26,6 +26,7 @@ if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
 import capabilities  # noqa: E402
 import commands  # noqa: E402
 import context_budget  # noqa: E402
+import diagnostics  # noqa: E402
 import gittools  # noqa: E402
 import projects  # noqa: E402
 import undo  # noqa: E402
@@ -41,7 +42,7 @@ import skills
 import web
 
 APP_NAME = "Open AY Desktop"
-APP_VERSION = "1.16.1"
+APP_VERSION = "1.17.0"
 APP_SLUG = "open-ay-desktop"
 REPOSITORY = "arothm/OpenAYDesktop"
 RELEASES_URL = "https://github.com/%s/releases/latest" % REPOSITORY
@@ -62,7 +63,8 @@ DEFAULT_CONFIG = {"apiKey": "", "defaultModel": "", "think": "default",
                   "contextBudget": "full",  # see context_budget.BUDGETS
                   "autoUpdate": True, "quickEntry": True,
                   "keepInTray": False, "startAtLogin": False,  # Electron: keep running in the tray / start with Windows
-                  "sessionDefaults": {}}  # what new chats start with: {"capabilities": {...}, "skills": [...]}; see session_defaults
+                  "sessionDefaults": {},
+                  "diagnostics": True}  # record anonymous diagnostics on this PC (Settings > Diagnostics; never sent anywhere)  # what new chats start with: {"capabilities": {...}, "skills": [...]}; see session_defaults
 LIMIT_RANGES = {"dailyTokenLimit": (0, 10_000_000_000), "chatTokenLimit": (0, 10_000_000_000), "maxConcurrentRuns": (1, 20), "maxSteps": (0, 10_000)}
 VENDOR_FILES = {
     "marked.min.js": {"url": "https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js", "type": "application/javascript; charset=utf-8"},
@@ -276,6 +278,21 @@ def cloud_post(path, body):
         with upstream(path, body, timeout=60) as r: return json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e: raise web.WebError(http_error_text(e))
     except (OSError, ValueError) as e: raise web.WebError("Could not reach Ollama's web service: %s" % e)
+
+
+def diag(_event, **fields):
+    """Record a diagnostics event (diagnostics.py keeps only numbers and fixed names) unless turned off in Settings.
+    Never raises, so a reply never fails because of diagnostics."""
+    try:
+        if load_config().get("diagnostics", True) is False: return
+        diagnostics.record(data_root(), _event, fields)
+    except Exception: pass  # noqa: BLE001
+
+
+def app_info():
+    import platform
+    return {"version": APP_VERSION, "windows": platform.release(), "build": platform.version().split(".")[-1],
+            "python": platform.python_version()}
 
 
 def session_defaults(cfg=None):
@@ -1275,6 +1292,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
         except Exception as e:  # noqa: BLE001
+            diag("error", where="server", type=type(e).__name__)
             try: self._json({"error": "Internal error: %s" % e}, 500)
             except OSError: pass
 
@@ -1309,6 +1327,12 @@ class Handler(BaseHTTPRequestHandler):
             low, info, minimum = balance_low()
             self._json({"balance": info or balance(), "minimumUsd": minimum, "low": low})
         elif p == "/api/skills": self._json({"skills": skills.list_all(skills_root())})
+        elif p in ("/api/diagnostics", "/api/diagnostics/export"):
+            q = parse_qs(urlsplit(self.path).query)
+            try: days = max(1, min(diagnostics.KEEP_DAYS, int((q.get("days") or ["30"])[0])))
+            except ValueError: days = 30
+            if p.endswith("/export"): self._json(diagnostics.report(data_root(), days, app_info()))
+            else: self._json(dict(diagnostics.summary(data_root(), days), enabled=load_config().get("diagnostics", True) is not False))
         elif p.startswith("/api/skills/"):
             try: self._json(skills.get(skills_root(), p[len("/api/skills/"):]))
             except skills.SkillError as e: self._json({"error": str(e)}, 404)
@@ -1408,7 +1432,7 @@ class Handler(BaseHTTPRequestHandler):
                 if "contextBudget" in body:
                     if body["contextBudget"] not in context_budget.BUDGETS: return self._json({"error": "Unknown context budget."}, 400)
                     cfg["contextBudget"] = body["contextBudget"]
-                for k in ("autoUpdate", "quickEntry", "keepInTray", "startAtLogin"):
+                for k in ("autoUpdate", "quickEntry", "keepInTray", "startAtLogin", "diagnostics"):
                     if k in body:
                         if not isinstance(body[k], bool): return self._json({"error": "%s must be true or false." % k}, 400)
                         cfg[k] = body[k]
@@ -1458,6 +1482,15 @@ class Handler(BaseHTTPRequestHandler):
                 refresh_running(chat_id)
                 self._json({"content": result, "title": chat["title"]})
             except (OSError, ValueError) as e: self._json({"error": str(e)}, 400)
+        elif p == "/api/diagnostics/clear":
+            self._json({"removed": diagnostics.clear(data_root())})
+        elif p == "/api/diagnostics/ui":  # the window's redraw timings, sent once a minute
+            def num(k):
+                v = body.get(k)
+                return v if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v < 1e9 else 0
+            diag("ui", renders=int(num("renders")), renderMs=round(num("renderMs"), 1), maxMs=round(num("maxMs"), 1),
+                 maxMessages=int(num("maxMessages")), longFrames=int(num("longFrames")))
+            self._json({"ok": True})
         elif p == "/api/skills/import":  # a skill folder, from a folder path or a .skill/.zip file (base64)
             try:
                 if body.get("path"): s = skills.import_folder(skills_root(), body["path"], body.get("replace") is True)
@@ -1634,6 +1667,7 @@ def main():
         if not args.stay:
             global _last_ping
             _last_ping = time.time() + 30; threading.Thread(target=watchdog, args=(httpd, 180), daemon=True).start()
+    diag("app", **app_info())
     if sys.stdout: print("%s %s running at %s" % (APP_NAME, APP_VERSION, url), flush=True)
     httpd.serve_forever()
 
